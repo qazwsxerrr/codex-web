@@ -1,0 +1,24 @@
+{
+  "name": "codex-math-web-v4",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "A lightweight Codex App Server web client with Markdown, KaTeX, model controls, status, and slash commands.",
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check public/app.js && node --check public/icons.js && node --check public/math-renderer.js && node --check public/slash-input.js && node --check public/slash-commands.js && node --check public/status-data.js && node --check public/mcp-data.js && node --check public/thread-list-data.js && node --check public/diff-data.js && node --check public/composer-input.js && node --check public/thread-items.js && node --check public/session-state.js && node --check public/turn-activity.js",
+    "test": "node --test test/*.test.mjs",
+    "protocol": "codex app-server generate-ts --out protocol --experimental"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dompurify": "^3.2.6",
+    "express": "^5.1.0",
+    "katex": "^0.16.22",
+    "lucide": "1.24.0",
+    "marked": "^16.2.1",
+    "ws": "^8.18.3"
+  }
+}

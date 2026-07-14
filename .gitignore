@@ -1,0 +1,10 @@
+node_modules/
+protocol/
+test/
+plan/
+references/
+.codex/
+doc/
+AGENTS.md
+Codex_Web_UI_draw-ui_implementation_plan.md
+npm-debug.log*
