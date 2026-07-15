@@ -150,3 +150,36 @@ export function visibleDiffRows(rows, page = 1, pageSize = 400, threshold = 800)
   const end = Math.min(rows.length, Math.max(1, page) * pageSize);
   return { rows: rows.slice(0, end), hasMore: end < rows.length };
 }
+
+export function selectDiffPreviewRows(rows, options = {}) {
+  const source = Array.isArray(rows) ? rows : [];
+  const limit = Math.max(1, Number(options.limit) || 12);
+  const context = Math.max(0, Number(options.context) || 2);
+  if (source.length <= limit) return source;
+  const changed = source
+    .map((row, index) => ({ row, index }))
+    .filter(({ row }) => row?.type === "addition" || row?.type === "deletion");
+  const priority = new Map();
+  const seeds = changed.length ? changed : source.map((row, index) => ({ row, index })).slice(0, 1);
+  for (const { index } of seeds) {
+    for (let offset = -context; offset <= context; offset += 1) {
+      const candidate = index + offset;
+      if (candidate < 0 || candidate >= source.length) continue;
+      const row = source[candidate];
+      const score = row.type === "addition" || row.type === "deletion" ? 0 : Math.abs(offset) + 1;
+      priority.set(candidate, Math.min(priority.get(candidate) ?? Infinity, score));
+    }
+  }
+  const selected = [...priority.entries()]
+    .sort(([leftIndex, leftScore], [rightIndex, rightScore]) => leftScore - rightScore || leftIndex - rightIndex)
+    .slice(0, limit)
+    .map(([index]) => index)
+    .sort((left, right) => left - right);
+  if (selected.length < limit) {
+    for (let index = 0; index < source.length && selected.length < limit; index += 1) {
+      if (!selected.includes(index)) selected.push(index);
+    }
+    selected.sort((left, right) => left - right);
+  }
+  return selected.map((index) => source[index]);
+}

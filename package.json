@@ -6,7 +6,7 @@
   "description": "A lightweight Codex App Server web client with Markdown, KaTeX, model controls, status, and slash commands.",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check public/app.js && node --check public/icons.js && node --check public/math-renderer.js && node --check public/slash-input.js && node --check public/slash-commands.js && node --check public/status-data.js && node --check public/mcp-data.js && node --check public/thread-list-data.js && node --check public/diff-data.js && node --check public/composer-input.js && node --check public/thread-items.js && node --check public/session-state.js && node --check public/turn-activity.js",
+    "check": "node --check server.mjs && node --check public/app.js && node --check public/icons.js && node --check public/math-renderer.js && node --check public/slash-input.js && node --check public/slash-commands.js && node --check public/status-data.js && node --check public/mcp-data.js && node --check public/thread-list-data.js && node --check public/diff-data.js && node --check public/command-presentation.js && node --check public/conversation-blocks.js && node --check public/composer-input.js && node --check public/thread-items.js && node --check public/session-state.js && node --check public/turn-activity.js",
     "test": "node --test test/*.test.mjs",
     "protocol": "codex app-server generate-ts --out protocol --experimental"
   },

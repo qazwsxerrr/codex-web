@@ -1,14 +1,16 @@
 import DOMPurify from "/vendor/dompurify/dist/purify.es.mjs";
 import katex from "/vendor/katex/dist/katex.mjs";
 import { marked } from "/vendor/marked/lib/marked.esm.js";
-import { extractMath, renderMathSlots } from "/math-renderer.js";
+import { extractMath, findStableMarkdownBoundary, renderMathSlots } from "/math-renderer.js";
 import { guardianEventFromNotification, prioritizeSlashMatches, resolveSlashSelection } from "/slash-input.js";
 import { slashAliases, slashCommands } from "/slash-commands.js";
 import { codexVersion, formatCompactNumber, providerStatus, threadTokenStats, unwrapConfig } from "/status-data.js";
 import { formatMcpInventory, normalizeMcpInventory } from "/mcp-data.js";
 import { filterThreads, formatThreadTime, groupThreads, mergeThreadPages, threadTitle } from "/thread-list-data.js";
 import { composeUserInput, displayInput, makeMention, MAX_IMAGES, validateImage } from "/composer-input.js";
-import { diffRowMarker, normalizeFileChanges, visibleDiffRows } from "/diff-data.js";
+import { diffRowMarker, normalizeFileChanges, selectDiffPreviewRows, visibleDiffRows } from "/diff-data.js";
+import { countOutputLines, normalizeToolStatus, presentCommand, tailOutputLines } from "/command-presentation.js";
+import { buildConversationBlocks, commandGroupId, isGroupableReadonlyCommand, mergeCachedTools } from "/conversation-blocks.js";
 import { normalizeThread } from "/thread-items.js";
 import { createSessionSettings, navigateThread, pushThreadNavigation, resolveReasoningEffort, shouldFollowScroll } from "/session-state.js";
 import { formatActivityDuration, isActiveTurnStatus, resolveTurnDurationMs, timestampToMs } from "/turn-activity.js";
@@ -84,6 +86,7 @@ const sessionPanel = $("#sessionPanel");
 const outlineCount = $("#outlineCount");
 const conversationOutline = $("#conversationOutline");
 const outlineBottomButton = $("#outlineBottomButton");
+const mathRenderCache = new Map();
 
 const state = {
   ready: false,
@@ -110,6 +113,8 @@ const state = {
   viewRenderTimers: new Map(),
   pendingScrollFrame: null,
   threadUiSaveTimer: null,
+  lastSavedThreadUi: null,
+  commandDurationTimer: null,
   approvals: [],
   latestGuardianDenial: null,
   mcpStartupStatuses: {},
@@ -124,6 +129,12 @@ const state = {
   threadView: normalizeThread({}),
   commandItems: new Map(),
   changeItems: new Map(),
+  commandObservedStartMs: new Map(),
+  conversationOrder: [],
+  toolCacheItems: new Map(),
+  toolCacheSequence: 0,
+  toolCacheSaveTimer: null,
+  lastSavedToolCache: null,
   turnDiff: "",
   currentTurn: null,
   activityMode: "idle",
@@ -148,7 +159,14 @@ const state = {
   threadUi: null,
   expandedFileChanges: new Set(),
   expandedDiffFiles: new Set(),
+  expandedCommands: new Set(),
+  collapsedCommands: new Set(),
+  expandedCommandGroups: new Set(),
+  expandedMcpTools: new Set(),
+  expandedCommandOutputs: new Set(),
   outlineObserver: null,
+  outlineNodes: new Map(),
+  activeOutlineNode: null,
   activeOutlineMessageId: null,
 };
 
@@ -243,9 +261,15 @@ function shortPath(value) {
 
 function copySelectOptions(source, target) {
   const value = source.value;
+  const signature = `${source.disabled}|${value}|${[...source.options].map((option) => `${option.value}:${option.textContent}:${option.disabled}`).join("\u001f")}`;
+  if (target.dataset.optionsSignature === signature) {
+    target.disabled = source.disabled;
+    return;
+  }
   target.replaceChildren(...[...source.options].map((option) => option.cloneNode(true)));
   target.value = value;
   target.disabled = source.disabled;
+  target.dataset.optionsSignature = signature;
 }
 
 function modelId(model) {
@@ -448,6 +472,15 @@ function renderContextSummary(context = contextStats()) {
   contextSummary.title = full;
 }
 
+function renderContextUsage(context = contextStats()) {
+  renderContextSummary(context);
+  const usedPercent = context.usedPercent ?? 0;
+  contextMeterFill.style.width = `${Math.min(100, Math.max(0, usedPercent))}%`;
+  contextDetail.textContent = context.windowSize
+    ? `${formatNumber(context.contextUsed)} used · ${formatNumber(Math.max(0, context.windowSize - context.contextUsed))} remaining · ${formatNumber(context.windowSize)} limit`
+    : "Usage unavailable";
+}
+
 function currentModelLabel() {
   return state.threadMeta.model || modelSelect.value || "unknown-model";
 }
@@ -481,34 +514,49 @@ function stopActivityTimer() {
 function renderTurnActivity() {
   if (!turnActivity) return;
   const mode = state.activityMode;
-  turnActivity.replaceChildren();
-  turnActivity.className = `turn-activity${mode === "idle" ? " hidden" : ` ${mode}`}`;
-  if (mode === "idle") return;
-
-  const symbol = document.createElement("span");
-  symbol.className = "activity-symbol";
-  symbol.setAttribute("aria-hidden", "true");
-  const label = document.createElement("strong");
-  label.className = "activity-label";
-  const detail = document.createElement("span");
-  detail.className = "activity-detail";
-
+  let labelText = "";
+  let detailText = "";
+  let ariaLabel = "";
   if (mode === "working") {
     const elapsed = Math.max(0, Date.now() - (state.activityStartedAtMs || Date.now()));
-    symbol.textContent = "●";
-    label.textContent = "Working";
-    detail.textContent = `(${formatActivityDuration(elapsed)} • Esc to interrupt)`;
-    turnActivity.setAttribute("aria-label", `Working for ${formatActivityDuration(elapsed)}`);
-  } else {
-    symbol.textContent = "─";
+    const duration = formatActivityDuration(elapsed);
+    labelText = "Working";
+    detailText = `(${duration} • Esc to interrupt)`;
+    ariaLabel = `Working for ${duration}`;
+  } else if (mode !== "idle") {
     const duration = formatActivityDuration(state.activityDurationMs);
-    label.textContent = duration ? `Worked for ${duration}` : "Worked";
+    labelText = duration ? `Worked for ${duration}` : "Worked";
     if (state.activityStatus && !["completed", "complete", "idle"].includes(String(state.activityStatus).toLowerCase())) {
-      detail.textContent = `(${state.activityStatus})`;
+      detailText = `(${state.activityStatus})`;
     }
-    turnActivity.setAttribute("aria-label", label.textContent);
+    ariaLabel = labelText;
   }
-  turnActivity.append(symbol, label, detail);
+  const renderKey = `${mode}|${labelText}|${detailText}|${ariaLabel}`;
+  if (turnActivity.dataset.renderKey === renderKey) return;
+  turnActivity.dataset.renderKey = renderKey;
+  turnActivity.className = `turn-activity${mode === "idle" ? " hidden" : ` ${mode}`}`;
+  if (mode === "idle") {
+    turnActivity.removeAttribute("aria-label");
+    return;
+  }
+  let symbol = turnActivity.querySelector(".activity-symbol");
+  let label = turnActivity.querySelector(".activity-label");
+  let detail = turnActivity.querySelector(".activity-detail");
+  if (!symbol || !label || !detail) {
+    turnActivity.replaceChildren();
+    symbol = document.createElement("span");
+    symbol.className = "activity-symbol";
+    symbol.setAttribute("aria-hidden", "true");
+    label = document.createElement("strong");
+    label.className = "activity-label";
+    detail = document.createElement("span");
+    detail.className = "activity-detail";
+    turnActivity.append(symbol, label, detail);
+  }
+  symbol.textContent = mode === "working" ? "●" : "─";
+  label.textContent = labelText;
+  detail.textContent = detailText;
+  turnActivity.setAttribute("aria-label", ariaLabel);
 }
 
 function setTurnActivityWorking(startedAt = null) {
@@ -587,7 +635,7 @@ function updateControls() {
   renderTurnActivity();
 
   const context = contextStats();
-  renderContextSummary(context);
+  renderContextUsage(context);
 
   threadLabel.textContent = hasThread ? `Thread: ${state.threadId}` : "No active thread";
   state.sessionSettings = createSessionSettings(state.threadMeta, {
@@ -608,17 +656,12 @@ function updateControls() {
   inspectorThreadId.textContent = state.threadId || "No active thread";
   const provider = providerStatus(state.config, state.threadMeta.modelProvider);
   providerSummary.textContent = provider.name;
-  const usedPercent = context.usedPercent ?? 0;
-  contextMeterFill.style.width = `${Math.min(100, Math.max(0, usedPercent))}%`;
-  contextDetail.textContent = context.windowSize
-    ? `${formatNumber(context.contextUsed)} used · ${formatNumber(Math.max(0, context.windowSize - context.contextUsed))} remaining · ${formatNumber(context.windowSize)} limit`
-    : "Usage unavailable";
   const initials = accountLabel().split(/[@\s._-]/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "?";
   $("#accountButton").textContent = initials;
   const navIndex = state.navigation.index;
   $("#backThreadButton").disabled = navIndex <= 0 || state.running;
   $("#forwardThreadButton").disabled = navIndex < 0 || navIndex >= state.navigation.items.length - 1 || state.running;
-  renderThreadList();
+  syncThreadListControls();
 }
 
 function createThreadUiState() {
@@ -627,12 +670,92 @@ function createThreadUiState() {
     activeOutlineMessageId: null,
     expandedFileChanges: [],
     expandedDiffFiles: [],
+    expandedCommands: [],
+    collapsedCommands: [],
+    expandedCommandGroups: [],
+    expandedMcpTools: [],
+    expandedCommandOutputs: [],
     scrollTop: 0,
   };
 }
 
 function threadUiStorageKey(threadId) {
   return `codexThreadUi:${threadId}`;
+}
+
+function threadToolStorageKey(threadId) {
+  return `codexThreadTools:${threadId}`;
+}
+
+function readThreadToolCache(threadId) {
+  if (!threadId) return [];
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(threadToolStorageKey(threadId)) || "null");
+    const entries = Array.isArray(stored?.items) ? stored.items : [];
+    return entries.filter((entry) => ["commandExecution", "fileChange", "mcpToolCall"].includes(entry?.item?.type) && entry.item.id);
+  } catch {
+    return [];
+  }
+}
+
+function cacheToolItem(item, record, options = {}) {
+  if (options.live === false || !state.threadId || !item?.id) return;
+  const existing = state.toolCacheItems.get(item.id);
+  const previous = record?.orderEntry?.previousItemId ?? existing?.previousItemId ?? null;
+  const turnId = options.turnId ?? record?.orderEntry?.turnId ?? item.turnId ?? state.activeTurnId ?? null;
+  state.toolCacheItems.set(item.id, {
+    item: { ...item },
+    turnId,
+    previousItemId: previous,
+    sequence: existing?.sequence ?? record?.orderEntry?.sequence ?? state.toolCacheSequence++,
+  });
+  scheduleToolCacheSave();
+}
+
+function saveToolCache() {
+  if (!state.threadId) return;
+  if (state.toolCacheSaveTimer !== null) {
+    clearTimeout(state.toolCacheSaveTimer);
+    state.toolCacheSaveTimer = null;
+  }
+  const entries = [...state.toolCacheItems.values()].sort((left, right) => left.sequence - right.sequence);
+  if (!entries.length && sessionStorage.getItem(threadToolStorageKey(state.threadId))) return;
+  let payload;
+  try {
+    payload = JSON.stringify({ version: 1, items: entries });
+  } catch {
+    payload = "";
+  }
+  if (!payload) return;
+  if (state.lastSavedToolCache === payload) return;
+  try {
+    sessionStorage.setItem(threadToolStorageKey(state.threadId), payload);
+    state.lastSavedToolCache = payload;
+  } catch {
+    // Keep the UI usable when a command emits more output than sessionStorage allows.
+    const compact = entries.map((entry) => ({
+      ...entry,
+      item: entry.item?.aggregatedOutput
+        ? { ...entry.item, aggregatedOutput: tailOutputLines(entry.item.aggregatedOutput, 200).join("\n") }
+        : entry.item,
+    }));
+    try {
+      const compactPayload = JSON.stringify({ version: 1, truncated: true, items: compact });
+      sessionStorage.setItem(threadToolStorageKey(state.threadId), compactPayload);
+      state.lastSavedToolCache = compactPayload;
+    } catch {
+      // Storage is optional; the live DOM and Commands view still retain the full item.
+    }
+  }
+}
+
+function scheduleToolCacheSave() {
+  if (!state.threadId) return;
+  if (state.toolCacheSaveTimer !== null) return;
+  state.toolCacheSaveTimer = setTimeout(() => {
+    state.toolCacheSaveTimer = null;
+    saveToolCache();
+  }, 180);
 }
 
 function readThreadUi(threadId) {
@@ -645,6 +768,11 @@ function readThreadUi(threadId) {
       ...(stored && typeof stored === "object" ? stored : {}),
       expandedFileChanges: Array.isArray(stored?.expandedFileChanges) ? stored.expandedFileChanges : [],
       expandedDiffFiles: Array.isArray(stored?.expandedDiffFiles) ? stored.expandedDiffFiles : [],
+      expandedCommands: Array.isArray(stored?.expandedCommands) ? stored.expandedCommands : [],
+      collapsedCommands: Array.isArray(stored?.collapsedCommands) ? stored.collapsedCommands : [],
+      expandedCommandGroups: Array.isArray(stored?.expandedCommandGroups) ? stored.expandedCommandGroups : [],
+      expandedMcpTools: Array.isArray(stored?.expandedMcpTools) ? stored.expandedMcpTools : [],
+      expandedCommandOutputs: Array.isArray(stored?.expandedCommandOutputs) ? stored.expandedCommandOutputs : [],
     };
   } catch {
     return fallback;
@@ -658,14 +786,23 @@ function saveThreadUi() {
     state.threadUiSaveTimer = null;
   }
   const ui = state.threadUi || createThreadUiState();
-  state.threadUi = {
+  const nextUi = {
     ...ui,
     activeOutlineMessageId: state.activeOutlineMessageId,
     expandedFileChanges: [...state.expandedFileChanges],
     expandedDiffFiles: [...state.expandedDiffFiles],
+    expandedCommands: [...state.expandedCommands],
+    collapsedCommands: [...state.collapsedCommands],
+    expandedCommandGroups: [...state.expandedCommandGroups],
+    expandedMcpTools: [...state.expandedMcpTools],
+    expandedCommandOutputs: [...state.expandedCommandOutputs],
     scrollTop: chat.scrollTop,
   };
-  sessionStorage.setItem(threadUiStorageKey(state.threadId), JSON.stringify(state.threadUi));
+  const serialized = JSON.stringify(nextUi);
+  state.threadUi = nextUi;
+  if (state.lastSavedThreadUi === serialized) return;
+  state.lastSavedThreadUi = serialized;
+  sessionStorage.setItem(threadUiStorageKey(state.threadId), serialized);
   sessionStorage.setItem(`codexScroll:${state.threadId}`, String(chat.scrollTop));
 }
 
@@ -680,8 +817,14 @@ function scheduleThreadUiSave() {
 
 function activateThreadUi(threadId) {
   state.threadUi = readThreadUi(threadId);
+  state.lastSavedThreadUi = null;
   state.expandedFileChanges = new Set(state.threadUi.expandedFileChanges);
   state.expandedDiffFiles = new Set(state.threadUi.expandedDiffFiles);
+  state.expandedCommands = new Set(state.threadUi.expandedCommands);
+  state.collapsedCommands = new Set(state.threadUi.collapsedCommands);
+  state.expandedCommandGroups = new Set(state.threadUi.expandedCommandGroups);
+  state.expandedMcpTools = new Set(state.threadUi.expandedMcpTools);
+  state.expandedCommandOutputs = new Set(state.threadUi.expandedCommandOutputs);
   state.activeOutlineMessageId = state.threadUi.activeOutlineMessageId || null;
   setInspectorTab(state.threadUi.rightPanelTab || "outline", false);
 }
@@ -707,12 +850,14 @@ function outlineSummary(text) {
 }
 
 function setActiveOutlineMessage(messageId, persist = true) {
-  state.activeOutlineMessageId = messageId || null;
-  for (const item of conversationOutline.querySelectorAll(".outline-item")) {
-    const active = item.dataset.messageId === state.activeOutlineMessageId;
-    item.classList.toggle("active", active);
-    item.setAttribute("aria-current", active ? "true" : "false");
-  }
+  const nextId = messageId || null;
+  if (state.activeOutlineMessageId === nextId && state.activeOutlineNode?.isConnected) return;
+  state.activeOutlineNode?.classList.remove("active");
+  state.activeOutlineNode?.setAttribute("aria-current", "false");
+  state.activeOutlineMessageId = nextId;
+  state.activeOutlineNode = state.outlineNodes.get(nextId) || null;
+  state.activeOutlineNode?.classList.add("active");
+  state.activeOutlineNode?.setAttribute("aria-current", "true");
   if (persist) scheduleThreadUiSave();
 }
 
@@ -735,6 +880,8 @@ function observeOutlineMessages() {
 
 function renderConversationOutline() {
   conversationOutline.replaceChildren();
+  state.outlineNodes.clear();
+  state.activeOutlineNode = null;
   const messages = [...state.messageNodes.values()].filter((record) => record.role === "user");
   outlineCount.textContent = `${messages.length} 条`;
   if (!messages.length) {
@@ -750,7 +897,7 @@ function renderConversationOutline() {
     button.type = "button";
     button.className = "outline-item";
     button.dataset.messageId = record.id;
-    button.setAttribute("aria-current", record.id === state.activeOutlineMessageId ? "true" : "false");
+    button.setAttribute("aria-current", "false");
     const number = document.createElement("span");
     number.className = "outline-number";
     number.textContent = String(index + 1);
@@ -764,6 +911,7 @@ function renderConversationOutline() {
       setActiveOutlineMessage(record.id);
     });
     conversationOutline.append(button);
+    state.outlineNodes.set(record.id, button);
   });
   setActiveOutlineMessage(state.activeOutlineMessageId || messages[0].id, false);
   observeOutlineMessages();
@@ -796,6 +944,7 @@ function renderThreadList() {
       for (const thread of group.threads) {
         const button = document.createElement("button");
         button.type = "button";
+        button.dataset.threadId = thread.id;
         button.className = `thread-item${thread.id === state.threadId ? " active" : ""}`;
         button.disabled = state.running;
         button.title = `${threadTitle(thread, 500)}\n${thread.cwd || thread.id}`;
@@ -826,6 +975,15 @@ function renderThreadList() {
       ? "Refreshing..."
       : `${state.threads.length} recent`;
   loadMoreThreadsButton.classList.toggle("hidden", !state.threadListCursor);
+}
+
+function syncThreadListControls() {
+  for (const button of threadList.querySelectorAll(".thread-item")) {
+    const active = button.dataset.threadId === state.threadId;
+    button.disabled = state.running;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", String(active));
+  }
 }
 
 function applyThreadList(result, append = false, error = null) {
@@ -867,6 +1025,7 @@ function scrollToBottom(force = false) {
 }
 
 function addSystemMessage(text, kind = "info") {
+  state.conversationOrder.push({ kind: "barrier", turnId: state.activeTurnId ?? null });
   const node = document.createElement("div");
   node.className = `system-message system-${kind}`;
   node.textContent = text;
@@ -881,15 +1040,64 @@ function renderMarkdown(node, raw) {
     USE_PROFILES: { html: true },
     ADD_ATTR: ["data-codex-math"],
   });
-  renderMathSlots(node, extracted.formulas, katex);
+  renderMathSlots(node, extracted.formulas, katex, mathRenderCache);
+}
+
+function clearStreamingTail(record) {
+  for (const node of record.streamTailNodes || []) node.remove();
+  record.streamTailNodes = [];
+}
+
+function renderStreamingMessage(record) {
+  const raw = record.raw;
+  const stableEnd = findStableMarkdownBoundary(raw, record.streamPrefixLength);
+  if (stableEnd > record.streamPrefixLength) {
+    clearStreamingTail(record);
+    const segment = document.createElement("div");
+    renderMarkdown(segment, raw.slice(record.streamPrefixLength, stableEnd));
+    record.content.append(...segment.childNodes);
+    record.streamPrefixLength = stableEnd;
+  }
+
+  clearStreamingTail(record);
+  const tail = raw.slice(record.streamPrefixLength);
+  if (tail) {
+    const node = document.createElement("div");
+    node.className = "streaming-tail";
+    node.textContent = tail;
+    record.content.append(node);
+    record.streamTailNodes = [node];
+  }
+  record.streamNeedsFinalRender = Boolean(tail);
+  record.renderedRaw = raw;
+}
+
+function resetStreamingMessage(record) {
+  clearStreamingTail(record);
+  record.streaming = false;
+  record.streamPrefixLength = 0;
+  record.streamNeedsFinalRender = false;
+}
+
+function renderCompletedMessage(record, raw) {
+  const needsFullRender = record.renderedRaw !== raw || record.streamNeedsFinalRender;
+  if (needsFullRender) {
+    clearStreamingTail(record);
+    renderMarkdown(record.content, raw);
+  }
+  resetStreamingMessage(record);
+  record.renderedRaw = raw;
 }
 
 function scheduleRender(record) {
   if (state.renderTimers.has(record.id)) return;
   const timer = setTimeout(() => {
-    renderMarkdown(record.content, record.raw);
-    record.renderedRaw = record.raw;
     state.renderTimers.delete(record.id);
+    if (record.streaming) renderStreamingMessage(record);
+    else if (record.renderedRaw !== record.raw) {
+      renderMarkdown(record.content, record.raw);
+      record.renderedRaw = record.raw;
+    }
     scrollToBottom();
   }, 80);
   state.renderTimers.set(record.id, timer);
@@ -932,9 +1140,22 @@ function ensureMessage(id, role, meta = {}) {
   chat.append(article);
   renderIcons(head);
 
-  record = { id, role, raw: "", article, content, time };
+  record = {
+    id,
+    role,
+    raw: "",
+    renderedRaw: "",
+    article,
+    content,
+    time,
+    streaming: false,
+    streamPrefixLength: 0,
+    streamNeedsFinalRender: false,
+    streamTailNodes: [],
+  };
   state.messageNodes.set(id, record);
-  if (role === "user") renderConversationOutline();
+  if (meta.live !== false) state.conversationOrder.push({ kind: "barrier", id, turnId: meta.turnId ?? state.activeTurnId ?? null });
+  if (role === "user" && !meta.deferOutline) renderConversationOutline();
   return record;
 }
 
@@ -943,6 +1164,7 @@ function addLocalUserMessage(input) {
   const record = ensureMessage(id, "user");
   record.raw = Array.isArray(input) ? displayInput(input) : String(input || "");
   renderMarkdown(record.content, record.raw);
+  record.renderedRaw = record.raw;
   renderConversationOutline();
   scrollToBottom(true);
 }
@@ -950,13 +1172,13 @@ function addLocalUserMessage(input) {
 function toolTitle(item) {
   switch (item.type) {
     case "commandExecution":
-      return `Command / ${item.status || "inProgress"} / ${item.command || ""}`;
+      return presentCommand(item).summary;
     case "fileChange":
-      return `File change / ${item.status || "inProgress"}`;
+      return "Changed files";
     case "mcpToolCall":
-      return `MCP / ${item.server || ""}/${item.tool || ""} / ${item.status || ""}`;
+      return `MCP · ${item.server || "server"} / ${item.tool || "tool"}`;
     default:
-      return `${item.type || "tool"} / ${item.status || ""}`;
+      return item.type || "Tool event";
   }
 }
 
@@ -987,15 +1209,394 @@ function setFileChangeExpanded(record, item, expanded) {
   saveThreadUi();
 }
 
-function ensureTool(item) {
+function toolDurationMs(item, record) {
+  const explicit = item?.durationMs;
+  if (explicit !== null && explicit !== undefined && explicit !== "" && Number.isFinite(Number(explicit))) return Number(explicit);
+  if (Number.isFinite(record?.observedDurationMs)) return record.observedDurationMs;
+  const started = state.commandObservedStartMs.get(item?.id);
+  if (!Number.isFinite(started)) return undefined;
+  const finished = record?.finishedAtMs || Date.now();
+  return Math.max(0, finished - started);
+}
+
+function ensureCommandDurationTimer() {
+  if (state.commandDurationTimer) return;
+  state.commandDurationTimer = setInterval(() => {
+    let active = false;
+    for (const record of state.toolNodes.values()) {
+      if (record.kind !== "command") continue;
+      const status = normalizeToolStatus(record.item?.status);
+      if (!status.isActive) continue;
+      active = true;
+      const duration = toolDurationMs(record.item, record);
+      if (Number.isFinite(duration)) record.duration.textContent = durationLabel(duration);
+    }
+    if (!active) {
+      clearInterval(state.commandDurationTimer);
+      state.commandDurationTimer = null;
+    }
+  }, 1000);
+}
+
+function rememberToolStart(item, record) {
+  const status = normalizeToolStatus(item?.status);
+  if (status.isActive) {
+    if (!state.commandObservedStartMs.has(item.id)) state.commandObservedStartMs.set(item.id, Date.now());
+    ensureCommandDurationTimer();
+  } else if (state.commandObservedStartMs.has(item.id)) {
+    record.finishedAtMs ||= Date.now();
+    if (!(item.durationMs !== null && item.durationMs !== undefined && item.durationMs !== "" && Number.isFinite(Number(item.durationMs)))) record.observedDurationMs = toolDurationMs(item, record);
+  }
+}
+
+function setCommandPersistence(record, open) {
+  const defaultOpen = ["running", "failed"].includes(normalizeToolStatus(record.item?.status).kind);
+  if (open) {
+    state.expandedCommands.add(record.item.id);
+    state.collapsedCommands.delete(record.item.id);
+  } else {
+    state.expandedCommands.delete(record.item.id);
+    if (defaultOpen) state.collapsedCommands.add(record.item.id);
+  }
+  saveThreadUi();
+}
+
+function setMcpPersistence(record, open) {
+  if (open) state.expandedMcpTools.add(record.item.id);
+  else state.expandedMcpTools.delete(record.item.id);
+  saveThreadUi();
+}
+
+function commandDefaultOpen(item) {
+  const status = normalizeToolStatus(item?.status);
+  return status.kind === "running" || status.kind === "failed";
+}
+
+function appendCommandField(container, label, value, className = "command-step-field") {
+  const field = document.createElement("div");
+  field.className = className;
+  const name = document.createElement("span");
+  name.className = "command-step-field-label";
+  name.textContent = label;
+  const content = document.createElement("span");
+  content.className = "command-step-field-value";
+  content.textContent = value;
+  content.title = value;
+  field.append(name, content);
+  container.append(field);
+  return content;
+}
+
+function createCommandStep(item, container = chat) {
+  const details = document.createElement("details");
+  details.className = "command-step";
+  details.dataset.itemId = item.id;
+  const summary = document.createElement("summary");
+  summary.className = "command-step-summary";
+  const chevron = document.createElement("span");
+  chevron.className = "command-step-chevron";
+  chevron.textContent = "›";
+  chevron.setAttribute("aria-hidden", "true");
+  const summaryText = document.createElement("span");
+  summaryText.className = "command-step-title";
+  const environment = document.createElement("span");
+  environment.className = "command-step-environment";
+  const status = document.createElement("span");
+  status.className = "command-step-status";
+  const duration = document.createElement("span");
+  duration.className = "command-step-duration";
+  summary.append(chevron, summaryText, environment, status, duration);
+
+  const body = document.createElement("div");
+  body.className = "command-step-body";
+  const meta = document.createElement("div");
+  meta.className = "command-step-meta";
+  const cwd = document.createElement("span");
+  const exit = document.createElement("span");
+  const raw = document.createElement("pre");
+  raw.className = "command-raw";
+  raw.title = "Raw command";
+  const outputBlock = document.createElement("div");
+  outputBlock.className = "command-output-block";
+  const outputHint = document.createElement("div");
+  outputHint.className = "command-output-hint";
+  const outputTail = document.createElement("pre");
+  outputTail.className = "command-output-preview";
+  const outputDetails = document.createElement("details");
+  outputDetails.className = "command-output-details";
+  const outputSummary = document.createElement("summary");
+  outputSummary.textContent = "View full output";
+  const fullOutput = document.createElement("pre");
+  fullOutput.className = "command-output-full";
+  outputDetails.append(outputSummary, fullOutput);
+  outputBlock.append(outputHint, outputTail, outputDetails);
+  meta.append(cwd, exit);
+  body.append(meta, raw, outputBlock);
+  details.append(summary, body);
+
+  const record = {
+    kind: "command",
+    details,
+    summary,
+    summaryText,
+    environment,
+    status,
+    duration,
+    body,
+    meta,
+    cwd,
+    exit,
+    raw,
+    outputBlock,
+    outputHint,
+    outputTail,
+    outputDetails,
+    fullOutput,
+    item,
+    presentation: null,
+    group: null,
+    ignoreNextToggle: true,
+  };
+  details.open = commandDefaultOpen(item) && !state.collapsedCommands.has(item.id) || state.expandedCommands.has(item.id);
+  details.addEventListener("toggle", () => {
+    if (record.ignoreNextToggle) {
+      record.ignoreNextToggle = false;
+      return;
+    }
+    setCommandPersistence(record, details.open);
+    if (details.open) patchCommandStep(record, record.item);
+    scrollToBottom();
+  });
+  outputDetails.open = state.expandedCommandOutputs.has(item.id);
+  outputDetails.addEventListener("toggle", () => {
+    if (outputDetails.open) state.expandedCommandOutputs.add(item.id);
+    else state.expandedCommandOutputs.delete(item.id);
+    if (outputDetails.open) fullOutput.textContent = record.item?.aggregatedOutput || "";
+    saveThreadUi();
+  });
+  if (container) container.append(details);
+  patchCommandStep(record, item);
+  return record;
+}
+
+function patchCommandStep(record, item) {
+  const previousStatus = normalizeToolStatus(record.item?.status);
+  record.item = item;
+  rememberToolStart(item, record);
+  const durationMs = toolDurationMs(item, record);
+  const model = presentCommand(item, { durationMs });
+  record.presentation = model;
+  record.details.dataset.status = model.normalizedStatus.kind;
+  record.details.classList.toggle("command-step-running", model.normalizedStatus.isActive);
+  record.details.classList.toggle("command-step-failed", model.normalizedStatus.isFailure);
+  record.summaryText.textContent = model.summary;
+  record.summaryText.title = model.displayCommand || model.rawCommand || "Command";
+  record.environment.textContent = model.environmentLabel;
+  record.status.textContent = model.normalizedStatus.label;
+  record.status.dataset.kind = model.normalizedStatus.kind;
+  record.duration.textContent = durationLabel(durationMs);
+  record.cwd.textContent = `cwd: ${item.cwd || "--"}`;
+  record.cwd.title = item.cwd || "--";
+  record.exit.textContent = `exit: ${item.exitCode ?? "--"}`;
+  record.raw.textContent = model.rawCommand || "(empty command)";
+  record.raw.title = model.rawCommand || "Raw command";
+  const output = item.aggregatedOutput || "";
+  const lineCount = countOutputLines(output);
+  const tailLimit = model.normalizedStatus.isFailure ? 18 : model.normalizedStatus.isActive ? 5 : 5;
+  const tail = tailOutputLines(output, tailLimit).join("\n");
+  record.outputBlock.hidden = !output;
+  record.outputHint.textContent = output ? `${model.normalizedStatus.isActive ? "Recent" : "Output"} · ${lineCount} line${lineCount === 1 ? "" : "s"}` : "";
+  record.outputTail.textContent = tail;
+  record.outputDetails.hidden = !output;
+  if (record.outputDetails.open) record.fullOutput.textContent = output;
+  if (previousStatus.isActive && model.normalizedStatus.kind === "completed" && !state.expandedCommands.has(item.id) && !state.collapsedCommands.has(item.id)) {
+    record.details.open = false;
+  }
+  if (model.normalizedStatus.isFailure) record.details.classList.add("command-step-failed");
+}
+
+function mcpPayload(item) {
+  const fields = [
+    ["Params", item.arguments ?? item.params ?? item.parameters ?? item.input],
+    ["Result", item.result ?? item.output ?? item.response],
+    ["Error", item.error ?? item.errorMessage ?? item.failureReason],
+  ];
+  return fields.filter(([, value]) => value !== undefined && value !== null && value !== "").map(([label, value]) => {
+    let text;
+    if (typeof value === "string") text = value;
+    else {
+      try { text = JSON.stringify(value, null, 2); } catch { text = "[unserializable value]"; }
+    }
+    return { label, text };
+  });
+}
+
+function createMcpStep(item, container = chat) {
+  const details = document.createElement("details");
+  details.className = "mcp-step";
+  details.dataset.itemId = item.id;
+  const summary = document.createElement("summary");
+  summary.className = "mcp-step-summary";
+  const chevron = document.createElement("span");
+  chevron.className = "command-step-chevron";
+  chevron.textContent = "›";
+  const title = document.createElement("span");
+  title.className = "mcp-step-title";
+  const environment = document.createElement("span");
+  environment.className = "command-step-environment";
+  environment.textContent = "MCP";
+  const status = document.createElement("span");
+  status.className = "command-step-status";
+  const duration = document.createElement("span");
+  duration.className = "command-step-duration";
+  summary.append(chevron, title, environment, status, duration);
+  const body = document.createElement("div");
+  body.className = "mcp-step-body";
+  details.append(summary, body);
+  const record = { kind: "mcp", details, summary, title, environment, status, duration, body, item, ignoreNextToggle: true };
+  details.open = commandDefaultOpen(item) || state.expandedMcpTools.has(item.id);
+  details.addEventListener("toggle", () => {
+    if (record.ignoreNextToggle) {
+      record.ignoreNextToggle = false;
+      return;
+    }
+    setMcpPersistence(record, details.open);
+    scrollToBottom();
+  });
+  container.append(details);
+  patchMcpStep(record, item);
+  return record;
+}
+
+function patchMcpStep(record, item) {
+  record.item = item;
+  const normalizedStatus = normalizeToolStatus(item.status);
+  record.details.dataset.status = normalizedStatus.kind;
+  record.title.textContent = `MCP · ${item.server || "server"} / ${item.tool || "tool"}`;
+  record.status.textContent = normalizedStatus.label;
+  record.status.dataset.kind = normalizedStatus.kind;
+  record.duration.textContent = durationLabel(item.durationMs);
+  record.body.replaceChildren();
+  const meta = document.createElement("div");
+  meta.className = "mcp-step-meta";
+  appendCommandField(meta, "server", item.server || "--", "mcp-step-field");
+  appendCommandField(meta, "tool", item.tool || "--", "mcp-step-field");
+  record.body.append(meta);
+  for (const field of mcpPayload(item)) {
+    const label = document.createElement("div");
+    label.className = "mcp-payload-label";
+    label.textContent = field.label;
+    const value = document.createElement("pre");
+    value.className = "mcp-payload";
+    value.textContent = field.text;
+    record.body.append(label, value);
+  }
+}
+
+function registerConversationTool(record, options = {}) {
+  if (options.live === false || record.orderEntry) return;
+  const previous = state.conversationOrder.at(-1);
+  record.orderEntry = {
+    kind: "tool",
+    record,
+    turnId: options.turnId ?? state.activeTurnId ?? record.item?.turnId ?? null,
+    previousItemId: previous?.record?.item?.id || previous?.id || null,
+    sequence: state.toolCacheSequence++,
+  };
+  state.conversationOrder.push(record.orderEntry);
+}
+
+function commandGroupTitle(records) {
+  const categories = new Set(records.map((record) => record.presentation?.category));
+  if (categories.has("search")) return "搜索项目代码";
+  if (categories.has("read")) return "查看相关文件";
+  return "检查现有实现";
+}
+
+function commandGroupDuration(records) {
+  const durations = records.map((record) => toolDurationMs(record.item, record)).filter((value) => Number.isFinite(value));
+  return durations.length ? durations.reduce((sum, value) => sum + value, 0) : null;
+}
+
+function createCommandGroup(id, turnId, container = chat) {
+  const details = document.createElement("details");
+  details.className = "command-group";
+  details.dataset.groupId = id;
+  const summary = document.createElement("summary");
+  summary.className = "command-group-summary";
+  const chevron = document.createElement("span");
+  chevron.className = "command-step-chevron";
+  chevron.textContent = "›";
+  const title = document.createElement("span");
+  title.className = "command-group-title";
+  const count = document.createElement("span");
+  count.className = "command-group-count";
+  const more = document.createElement("span");
+  more.className = "command-group-more";
+  const duration = document.createElement("span");
+  duration.className = "command-step-duration";
+  summary.append(chevron, title, count, more, duration);
+  const items = document.createElement("div");
+  items.className = "command-group-items";
+  details.append(summary, items);
+  const group = { kind: "commandGroup", id, turnId, details, summary, title, count, more, duration, items, entries: [] };
+  details.open = state.expandedCommandGroups.has(id);
+  details.addEventListener("toggle", () => {
+    if (group.ignoreNextToggle) {
+      group.ignoreNextToggle = false;
+      return;
+    }
+    if (details.open) state.expandedCommandGroups.add(id);
+    else state.expandedCommandGroups.delete(id);
+    saveThreadUi();
+    scrollToBottom();
+  });
+  if (container) container.append(details);
+  group.ignoreNextToggle = true;
+  return group;
+}
+
+function updateCommandGroupSummary(group) {
+  const entries = group.entries;
+  group.title.textContent = commandGroupTitle(entries);
+  group.count.textContent = `${entries.length} commands`;
+  group.more.textContent = entries.length > 5 ? `+${entries.length - 5} more` : "";
+  const duration = commandGroupDuration(entries);
+  group.duration.textContent = durationLabel(duration);
+}
+
+function addCommandToGroup(group, record) {
+  if (record.group === group) return;
+  record.group = group;
+  record.details.classList.add("command-step-nested");
+  group.entries.push(record);
+  group.items.append(record.details);
+  updateCommandGroupSummary(group);
+}
+
+function maybeGroupLiveCommand(record, item) {
+  if (record.group || !isGroupableReadonlyCommand({ ...item, status: record.presentation?.normalizedStatus.kind, durationMs: toolDurationMs(item, record) })) return;
+  const index = state.conversationOrder.indexOf(record.orderEntry);
+  const previous = index > 0 ? state.conversationOrder[index - 1] : null;
+  const previousRecord = previous?.record;
+  if (!previous || previous.turnId !== record.orderEntry.turnId || previousRecord?.kind !== "command") return;
+  if (!isGroupableReadonlyCommand({ ...previousRecord.item, status: previousRecord.presentation?.normalizedStatus.kind, durationMs: toolDurationMs(previousRecord.item, previousRecord) })) return;
+  if (previousRecord.group) {
+    addCommandToGroup(previousRecord.group, record);
+    return;
+  }
+  const group = createCommandGroup(commandGroupId(record.orderEntry.turnId, previousRecord.item.id), record.orderEntry.turnId, null);
+  previousRecord.details.replaceWith(group.details);
+  addCommandToGroup(group, previousRecord);
+  addCommandToGroup(group, record);
+}
+
+function ensureTool(item, options = {}) {
   let record = state.toolNodes.get(item.id);
   if (record) return record;
   if (item.type === "fileChange") {
     const card = document.createElement("section");
     card.className = "tool-card file-change-card";
-    const header = document.createElement("div");
-    header.className = "tool-card-head";
-    header.textContent = toolTitle(item);
     const toggle = document.createElement("button");
     toggle.type = "button";
     toggle.className = "file-change-toggle";
@@ -1004,28 +1605,24 @@ function ensureTool(item) {
     preview.className = "file-change-preview";
     const body = document.createElement("div");
     body.className = "file-change-body";
-    card.append(header, toggle, preview, body);
-    chat.append(card);
-    record = { details: card, summary: toggle, header, preview, body, item, fileList: null };
+    card.append(toggle, preview, body);
+    (options.container || chat).append(card);
+    record = { kind: "fileChange", details: card, summary: toggle, preview, body, item, fileList: null };
     toggle.addEventListener("click", () => {
-      setFileChangeExpanded(record, item, !state.expandedFileChanges.has(item.id));
-      renderToolFileChange(record, item);
-      toggle.setAttribute("aria-expanded", String(state.expandedFileChanges.has(item.id)));
+      const currentItem = record.item || item;
+      setFileChangeExpanded(record, currentItem, !state.expandedFileChanges.has(currentItem.id));
+      renderToolFileChange(record, currentItem);
+      toggle.setAttribute("aria-expanded", String(state.expandedFileChanges.has(currentItem.id)));
     });
     state.toolNodes.set(item.id, record);
+    registerConversationTool(record, options);
+    renderToolFileChange(record, item);
     return record;
   }
-  const details = document.createElement("details");
-  details.className = "tool-card";
-  const summary = document.createElement("summary");
-  summary.textContent = toolTitle(item);
-  const body = document.createElement("pre");
-  body.className = "tool-output";
-  body.textContent = item.aggregatedOutput || "";
-  details.append(summary, body);
-  chat.append(details);
-  record = { details, summary, body, item };
+  if (item.type === "mcpToolCall") record = createMcpStep(item, options.container || chat);
+  else record = createCommandStep(item, options.container || chat);
   state.toolNodes.set(item.id, record);
+  registerConversationTool(record, options);
   return record;
 }
 
@@ -1045,7 +1642,7 @@ function renderToolFileChange(record, item) {
     record.body.hidden = !state.expandedFileChanges.has(item.id);
     return;
   }
-  for (const file of files) {
+  for (const [index, file] of files.entries()) {
     const parts = filePathParts(file.path);
     const row = document.createElement("div");
     row.className = "file-change-preview-row";
@@ -1056,8 +1653,24 @@ function renderToolFileChange(record, item) {
     const relative = document.createElement("span");
     relative.className = "file-change-preview-path";
     relative.textContent = parts.relative === parts.name ? "" : parts.relative;
-    row.append(name, relative);
+    const stats = document.createElement("span");
+    stats.className = "file-change-preview-stats";
+    stats.textContent = `+${file.additions} / -${file.deletions}`;
+    row.append(name, relative, stats);
     record.preview.append(row);
+    if (index === 0) {
+      const previewDiff = document.createElement("div");
+      previewDiff.className = "file-change-preview-diff";
+      const rows = selectDiffPreviewRows(file.rows, { limit: 12, context: 2 });
+      for (const diffRow of rows) previewDiff.append(createDiffLine(diffRow));
+      if (rows.length < file.rows.length) {
+        const more = document.createElement("span");
+        more.className = "file-change-more-lines";
+        more.textContent = `${file.rows.length - rows.length} more lines`;
+        previewDiff.append(more);
+      }
+      record.preview.append(previewDiff);
+    }
   }
   const fileList = document.createElement("div");
   fileList.className = "tool-file-list";
@@ -1092,6 +1705,8 @@ function renderToolFileChange(record, item) {
   record.fileList = fileList;
   const expanded = state.expandedFileChanges.has(item.id);
   record.details.classList.toggle("expanded", expanded);
+  const normalizedStatus = normalizeToolStatus(item.status);
+  record.details.dataset.status = normalizedStatus.kind;
   record.body.hidden = !expanded;
   record.summary.setAttribute("aria-expanded", String(expanded));
   record.summary.replaceChildren();
@@ -1107,7 +1722,11 @@ function renderToolFileChange(record, item) {
   const removed = document.createElement("span");
   removed.className = "file-change-stat-del";
   removed.textContent = `-${files.reduce((sum, file) => sum + file.deletions, 0)}`;
-  record.summary.append(chevron, label, added, removed);
+  const status = document.createElement("span");
+  status.className = "file-change-status";
+  status.textContent = normalizedStatus.label;
+  status.dataset.kind = normalizedStatus.kind;
+  record.summary.append(chevron, label, added, removed, status);
 }
 
 function scheduleArtifactRender(view) {
@@ -1128,47 +1747,42 @@ function flushToolOutput(itemId, record, item) {
     clearTimeout(pending);
     state.toolOutputTimers.delete(itemId);
   }
-  record.body.textContent = item.aggregatedOutput || "";
+  if (record.kind === "command") patchCommandStep(record, item);
 }
 
-function updateTool(item) {
-  const record = ensureTool(item);
-  record.item = item;
-  if (item.type === "fileChange") {
-    record.header.textContent = toolTitle(item);
-    renderToolFileChange(record, item);
-  } else if (item.aggregatedOutput !== undefined) {
-    record.summary.textContent = toolTitle(item);
-    flushToolOutput(item.id, record, item);
-  } else {
-    record.summary.textContent = toolTitle(item);
-    record.body.textContent = JSON.stringify(item, null, 2);
-  }
+function updateTool(item, options = {}) {
+  if (!item?.id) return null;
+  const record = ensureTool(item, { ...options, turnId: options.turnId ?? item.turnId ?? state.activeTurnId });
   if (item.type === "commandExecution") {
     state.commandItems.set(item.id, item);
+    patchCommandStep(record, item);
+    if (options.live !== false) maybeGroupLiveCommand(record, item);
+    cacheToolItem(item, record, { ...options, turnId: options.turnId ?? record.orderEntry?.turnId });
     if (state.activeView === "commands") renderCommandsView();
-  }
-  if (item.type === "fileChange") {
+  } else if (item.type === "fileChange") {
+    record.item = item;
     state.changeItems.set(item.id, item);
+    renderToolFileChange(record, item);
+    cacheToolItem(item, record, { ...options, turnId: options.turnId ?? record.orderEntry?.turnId });
     if (state.activeView === "changes") renderChangesView();
+  } else if (item.type === "mcpToolCall") {
+    patchMcpStep(record, item);
+    cacheToolItem(item, record, { ...options, turnId: options.turnId ?? record.orderEntry?.turnId });
   }
+  return record;
 }
 
 function appendToolOutput(itemId, delta) {
   const record = state.toolNodes.get(itemId);
-  if (!record) return;
   const text = delta || "";
   const item = state.commandItems.get(itemId);
-  if (!item) {
-    record.body.textContent += text;
-    scrollToBottom();
-    return;
-  }
+  if (!record || !item) return;
   item.aggregatedOutput = `${item.aggregatedOutput || ""}${text}`;
   if (!state.toolOutputTimers.has(itemId)) {
     const timer = setTimeout(() => {
       state.toolOutputTimers.delete(itemId);
-      record.body.textContent = item.aggregatedOutput || "";
+      patchCommandStep(record, item);
+      cacheToolItem(item, record, { turnId: record.orderEntry?.turnId });
       scheduleArtifactRender("commands");
     }, 80);
     state.toolOutputTimers.set(itemId, timer);
@@ -1178,6 +1792,7 @@ function appendToolOutput(itemId, delta) {
 }
 
 function durationLabel(value) {
+  if (value === null || value === undefined || value === "") return "--";
   const ms = Number(value);
   if (!Number.isFinite(ms)) return "--";
   return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
@@ -1188,33 +1803,35 @@ function latestUserText() {
   return state.latestUserInput || turn?.items?.find((item) => item.role === "user")?.text || "Latest turn";
 }
 
+function createDiffLine(row) {
+  const line = document.createElement("div");
+  line.className = `diff-line ${row.type}`;
+  const marker = document.createElement("span");
+  marker.className = "line-marker";
+  marker.textContent = diffRowMarker(row.type);
+  marker.setAttribute("aria-hidden", "true");
+  const oldNumber = document.createElement("span");
+  oldNumber.className = "line-number";
+  oldNumber.textContent = row.oldLine ?? "";
+  const newNumber = document.createElement("span");
+  newNumber.className = "line-number";
+  newNumber.textContent = row.newLine ?? "";
+  const code = document.createElement("span");
+  code.className = "line-code";
+  code.textContent = row.type === "addition" || row.type === "deletion"
+    ? row.text.slice(1)
+    : row.type === "context" && row.text.startsWith(" ")
+      ? row.text.slice(1)
+      : row.text;
+  line.append(marker, oldNumber, newNumber, code);
+  return line;
+}
+
 function renderDiffRows(container, file, page = 1) {
   const visible = visibleDiffRows(file.rows, page);
   const scroll = document.createElement("div");
   scroll.className = "diff-scroll";
-  for (const row of visible.rows) {
-    const line = document.createElement("div");
-    line.className = `diff-line ${row.type}`;
-    const marker = document.createElement("span");
-    marker.className = "line-marker";
-    marker.textContent = diffRowMarker(row.type);
-    marker.setAttribute("aria-hidden", "true");
-    const oldNumber = document.createElement("span");
-    oldNumber.className = "line-number";
-    oldNumber.textContent = row.oldLine ?? "";
-    const newNumber = document.createElement("span");
-    newNumber.className = "line-number";
-    newNumber.textContent = row.newLine ?? "";
-    const code = document.createElement("span");
-    code.className = "line-code";
-    code.textContent = row.type === "addition" || row.type === "deletion"
-      ? row.text.slice(1)
-      : row.type === "context" && row.text.startsWith(" ")
-        ? row.text.slice(1)
-        : row.text;
-    line.append(marker, oldNumber, newNumber, code);
-    scroll.append(line);
-  }
+  for (const row of visible.rows) scroll.append(createDiffLine(row));
   container.append(scroll);
   if (visible.hasMore) {
     const load = document.createElement("button");
@@ -1365,28 +1982,60 @@ function addApproval(message) {
   approvalArea.append(card);
 }
 
+function renderHistoricalBlock(block) {
+  if (block.type === "message") {
+    const item = block.item;
+    const record = ensureMessage(item.id, block.role, {
+      startedAt: item.startedAt,
+      deferOutline: true,
+      live: false,
+      turnId: block.turnId,
+    });
+    record.raw = block.role === "user" ? displayInput(item.content || []) : item.text || "";
+    resetStreamingMessage(record);
+    renderMarkdown(record.content, record.raw);
+    record.renderedRaw = record.raw;
+    return;
+  }
+  if (block.type === "commandGroup") {
+    const group = createCommandGroup(block.id, block.turnId);
+    for (const entry of block.items) {
+      const record = updateTool(entry.item, { live: false, container: group.items, turnId: block.turnId });
+      addCommandToGroup(group, record);
+    }
+    updateCommandGroupSummary(group);
+    return;
+  }
+  if (block.type === "command") {
+    updateTool(block.item, { live: false, turnId: block.turnId });
+  } else if (block.type === "fileChange" || block.type === "mcpTool") {
+    updateTool(block.item, { live: false, turnId: block.turnId });
+  } else if (block.type === "error") {
+    addSystemMessage(block.item.message || block.item.error?.message || "Codex error", "error");
+  } else if (block.type === "status") {
+    const text = block.item.text || block.item.message;
+    if (text) addSystemMessage(text);
+  }
+}
+
 function restoreHistory(thread) {
-  state.threadView = normalizeThread(thread);
+  const cachedEntries = readThreadToolCache(thread?.id);
+  state.toolCacheItems.clear();
+  state.toolCacheSequence = 0;
+  for (const entry of cachedEntries) {
+    state.toolCacheItems.set(entry.item.id, entry);
+    state.toolCacheSequence = Math.max(state.toolCacheSequence, Number(entry.sequence) + 1 || 0);
+  }
+  const restoredThread = mergeCachedTools(thread, cachedEntries);
+  state.threadView = normalizeThread(restoredThread);
   state.latestUserInput = state.threadView.latestTurn?.items?.find((item) => item.role === "user")?.text || "";
   syncTurnActivityFromThread(thread);
+  state.toolNodes.clear();
   state.commandItems.clear();
   state.changeItems.clear();
-  for (const turn of Array.isArray(thread?.turns) ? thread.turns : []) {
-    for (const item of turn.items || []) {
-      if (item.type === "userMessage") {
-        const text = displayInput(item.content || []);
-        const record = ensureMessage(item.id, "user", turn);
-        record.raw = text;
-        renderMarkdown(record.content, text);
-      } else if (item.type === "agentMessage") {
-        const record = ensureMessage(item.id, "assistant", turn);
-        record.raw = item.text || "";
-        renderMarkdown(record.content, record.raw);
-      } else if (["commandExecution", "fileChange", "mcpToolCall"].includes(item.type)) {
-        updateTool(item);
-      }
-    }
-  }
+  state.commandObservedStartMs.clear();
+  state.conversationOrder = [];
+  for (const block of buildConversationBlocks(restoredThread?.turns, { cwd: currentCwd() })) renderHistoricalBlock(block);
   if (state.activeView === "changes") renderChangesView();
   if (state.activeView === "commands") renderCommandsView();
   renderConversationOutline();
@@ -1453,7 +2102,7 @@ function handleCodex(message) {
       if (!state.threadId || !params.threadId || params.threadId === state.threadId) {
         state.tokenUsage = params.tokenUsage || params.token_usage || null;
         state.tokenUsageThreadId = params.threadId || state.threadId;
-        updateControls();
+        renderContextUsage();
       }
       break;
 
@@ -1485,6 +2134,7 @@ function handleCodex(message) {
       state.threadStatus = "active";
       state.activeTurnId = params.turn?.id || state.activeTurnId;
       state.currentTurn = params.turn || { id: state.activeTurnId, status: "inProgress", startedAt: Math.floor(Date.now() / 1000) };
+      state.conversationOrder.push({ kind: "barrier", turnId: state.activeTurnId });
       setTurnActivityWorking(state.currentTurn.startedAt);
       updateControls();
       break;
@@ -1523,6 +2173,7 @@ function handleCodex(message) {
       const id = params.itemId;
       if (!id) break;
       const record = ensureMessage(id, "assistant");
+      record.streaming = true;
       record.raw += params.delta || "";
       scheduleRender(record);
       break;
@@ -1543,8 +2194,7 @@ function handleCodex(message) {
           state.renderTimers.delete(item.id);
         }
         record.raw = item.text || record.raw;
-        renderMarkdown(record.content, record.raw);
-        record.renderedRaw = record.raw;
+        renderCompletedMessage(record, record.raw);
       } else if (["commandExecution", "fileChange", "mcpToolCall"].includes(item.type)) {
         updateTool(item);
       }
@@ -1588,7 +2238,10 @@ function handleCodex(message) {
 }
 
 function applyThreadResponse(payload) {
-  if (state.threadId && state.threadId !== payload.thread.id) saveThreadUi();
+  if (state.threadId && state.threadId !== payload.thread.id) {
+    saveThreadUi();
+    saveToolCache();
+  }
   state.threadId = payload.thread.id;
   activateThreadUi(state.threadId);
   if (state.tokenUsageThreadId !== state.threadId) {
@@ -1711,6 +2364,14 @@ function clearPendingRenderTimers() {
   state.renderTimers.clear();
   state.toolOutputTimers.clear();
   state.viewRenderTimers.clear();
+  if (state.toolCacheSaveTimer !== null) {
+    clearTimeout(state.toolCacheSaveTimer);
+    state.toolCacheSaveTimer = null;
+  }
+  if (state.commandDurationTimer) {
+    clearInterval(state.commandDurationTimer);
+    state.commandDurationTimer = null;
+  }
   if (state.threadUiSaveTimer !== null) {
     clearTimeout(state.threadUiSaveTimer);
     state.threadUiSaveTimer = null;
@@ -1726,6 +2387,12 @@ function clearTranscript(showNotice = true) {
   chat.replaceChildren();
   state.messageNodes.clear();
   state.toolNodes.clear();
+  state.commandObservedStartMs.clear();
+  state.conversationOrder = [];
+  state.toolCacheItems.clear();
+  state.toolCacheSequence = 0;
+  state.lastSavedToolCache = null;
+  if (state.threadId) sessionStorage.removeItem(threadToolStorageKey(state.threadId));
   state.latestDiff = "";
   if (showNotice) addSystemMessage("Browser transcript cleared. Codex context was not changed.", "warning");
 }
@@ -2499,6 +3166,11 @@ socket.addEventListener("message", (event) => {
       state.toolNodes.clear();
       state.commandItems.clear();
       state.changeItems.clear();
+      state.commandObservedStartMs.clear();
+      state.conversationOrder = [];
+      state.toolCacheItems.clear();
+      state.toolCacheSequence = 0;
+      state.lastSavedToolCache = null;
       state.turnDiff = "";
       state.latestUserInput = "";
       state.threadView = normalizeThread(payload.thread);
@@ -2951,6 +3623,10 @@ chat.addEventListener("scroll", () => {
 jumpToBottomButton.addEventListener("click", () => scrollToBottom(true));
 chat.addEventListener("toggle", () => requestAnimationFrame(() => scrollToBottom()), true);
 new MutationObserver(() => requestAnimationFrame(() => scrollToBottom())).observe(chat, { childList: true });
+window.addEventListener("pagehide", () => {
+  saveThreadUi();
+  saveToolCache();
+});
 
 $("#workspaceButton").addEventListener("click", () => {
   cwdDialogInput.value = currentCwd();
@@ -2985,7 +3661,7 @@ $("#copyCwdButton").addEventListener("click", () => copyField(currentCwd()));
 $("#accountButton").addEventListener("click", showStatus);
 window.addEventListener("resize", () => {
   updateBackdrop();
-  renderContextSummary(contextStats());
+  renderContextUsage();
 });
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
