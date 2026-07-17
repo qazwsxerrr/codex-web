@@ -1,0 +1,6 @@
+# Codex Web runtime configuration.
+# Edit codexBin and projectCwd for the machine running this server.
+codexBin: codex
+projectCwd: .
+host: 127.0.0.1
+port: 4317

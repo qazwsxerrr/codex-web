@@ -16,8 +16,8 @@ export function validateImage(file) {
 export function composeUserInput(text, mentions = [], images = []) {
   if (images.length > MAX_IMAGES) throw new Error(`Attach at most ${MAX_IMAGES} images`);
   const input = [];
-  const cleanText = String(text || "").trim();
-  if (cleanText) input.push({ type: "text", text: cleanText });
+  const rawText = String(text ?? "");
+  if (rawText.trim()) input.push({ type: "text", text: rawText });
   for (const mention of mentions) input.push(makeMention(mention));
   for (const image of images) {
     const url = typeof image === "string" ? image : image?.url;
@@ -37,4 +37,3 @@ export function displayInput(input = []) {
     return "";
   }).filter(Boolean).join("\n");
 }
-

@@ -1,0 +1,15 @@
+# Codex Web configuration guide for native Windows.
+#
+# codexBin (required): path to the Codex CLI executable or npm shim.
+# Indicator: run `where.exe codex` in PowerShell and use the returned executable path.
+codexBin: 'C:\Users\admin\bin\codex.exe'
+#
+# projectCwd (required): working directory sent to Codex App Server for new threads and file search.
+# Indicator: use the project root that Codex should read and modify.
+projectCwd: 'D:\ai_code\ai_vibecode\codex-web'
+#
+# host (optional): local bind address. Keep 127.0.0.1 unless another trusted interface is required.
+host: 127.0.0.1
+#
+# port (optional): browser URL port. Open http://127.0.0.1:4317 after startup.
+port: 4317

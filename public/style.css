@@ -168,30 +168,33 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; }
 .tool-card summary::before { content: "›"; color: var(--muted); font-size: 17px; transform-origin: center; }
 .tool-card[open] summary::before { transform: rotate(90deg); }
 .tool-card-head { min-height: 36px; display: flex; align-items: center; padding: 9px 11px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; }
-.file-change-card { background: var(--surface); }
-.file-change-toggle { width: 100%; min-height: 40px; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto auto auto; align-items: center; gap: 8px; padding: 7px 11px; border: 0; border-bottom: 1px solid var(--border); background: var(--surface); color: var(--text); text-align: left; }
+.file-change-card { margin-top: 8px; margin-bottom: 14px; border-color: var(--border-strong); background: var(--surface); }
+.file-change-toggle { width: 100%; min-height: 44px; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto auto auto; align-items: center; gap: 8px; padding: 0 14px; border: 0; border-bottom: 1px solid var(--border); background: var(--surface); color: var(--text); text-align: left; }
 .file-change-toggle:hover { background: var(--hover); }
-.file-change-chevron { color: var(--muted); font-size: 18px; transition: transform .15s ease; }
-.file-change-card.expanded .file-change-chevron { transform: rotate(90deg); }
-.file-change-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; }
-.file-change-stat-add, .file-change-stat-del { font-family: ui-monospace, monospace; font-size: 10px; }
+.file-change-card.expanded > .file-change-toggle { background: var(--surface-muted); }
+.file-change-chevron, .tool-file-chevron { width: 16px; display: inline-grid; place-items: center; color: var(--muted); font-size: 19px; line-height: 1; transform-origin: center; transition: transform 150ms ease; }
+.file-change-card.expanded > .file-change-toggle .file-change-chevron,
+.tool-file[open] > summary .tool-file-chevron { transform: rotate(90deg); }
+.file-change-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 650; }
+.file-change-stat-add, .file-change-stat-del { font-family: ui-monospace, monospace; font-size: 11px; white-space: nowrap; }
 .file-change-stat-add { color: var(--green); }
 .file-change-stat-del { color: var(--red); }
 .file-change-body[hidden] { display: none; }
-.file-change-preview { display: grid; gap: 4px; padding: 7px 11px 9px 37px; border-bottom: 1px solid var(--border); }
-.file-change-preview-row { min-width: 0; display: flex; align-items: baseline; gap: 7px; font-size: 11px; }
-.file-change-preview-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-weight: 600; }
-.file-change-preview-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
+.tool-file-list { border-top: 0; }
 .tool-card pre { margin: 0; border-width: 1px 0 0; border-radius: 0; }
-.tool-file-list { border-top: 1px solid var(--border); }
 .tool-file { border-top: 1px solid var(--border); background: var(--surface); }
 .tool-file:first-child { border-top: 0; }
-.tool-file summary { min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 11px; list-style: none; }
+.tool-file summary { min-height: 40px; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 7px; padding: 0 14px; list-style: none; cursor: pointer; }
 .tool-file summary::-webkit-details-marker { display: none; }
-.tool-file-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
-.tool-file-stats { flex: 0 0 auto; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; }
+.tool-file summary:hover { background: var(--hover); }
+.tool-file[open] > summary { background: var(--blue-bg); }
+.tool-file summary::before { content: none; }
+.tool-file-title-wrap { min-width: 0; display: flex; align-items: baseline; gap: 8px; overflow: hidden; }
+.tool-file-path { min-width: 0; flex: 0 1 auto; max-width: 68%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; font-weight: 650; }
+.tool-file-relative-path { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; }
+.tool-file-stats { flex: 0 0 auto; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; white-space: nowrap; }
 .tool-file-diff { min-width: 0; }
-.tool-file-empty { padding: 10px 11px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; }
+.tool-file-empty { padding: 12px 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; }
 .tool-file .diff-scroll { border-top: 1px solid var(--border); }
 .command-step, .command-group, .mcp-step {
   margin: 2px 0 2px 32px;
@@ -257,15 +260,9 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; }
 .mcp-step-field .command-step-field-label { color: var(--faint); }
 .mcp-payload-label { margin-top: 7px; color: var(--muted); font-size: 10px; font-weight: 650; }
 .mcp-payload { max-height: 240px; overflow: auto; }
-.file-change-card { margin-top: 8px; margin-bottom: 14px; }
 .system-message { margin: 8px 0 14px 32px; color: var(--muted); font-size: 11px; }
 .system-error { color: var(--red); }
 .system-warning { color: var(--warning); }
-.file-change-preview-stats { flex: 0 0 auto; margin-left: auto; color: var(--muted); font-family: ui-monospace, monospace; font-size: 10px; }
-.file-change-preview-diff { max-height: 258px; margin: 3px 0 0 26px; overflow: hidden; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-muted); }
-.file-change-preview-diff .diff-line { grid-template-columns: 18px 36px 36px minmax(0, 1fr); min-height: 20px; line-height: 20px; font-size: 10px; }
-.file-change-preview-diff .line-code { padding: 0 7px; }
-.file-change-more-lines { display: block; padding: 5px 8px; border-top: 1px solid var(--border); color: var(--muted); font-size: 10px; }
 .file-change-status { min-width: 62px; color: var(--muted); font-size: 10px; text-align: right; }
 .file-change-status[data-kind="completed"] { color: var(--green); }
 .file-change-status[data-kind="failed"] { color: var(--red); }
@@ -441,7 +438,7 @@ svg { width: 18px; height: 18px; stroke-width: 1.8; }
   .command-step-summary, .mcp-step-summary, .command-group-summary { grid-template-columns: 16px minmax(0, 1fr) auto auto; }
   .command-step-environment { display: none; }
   .command-step-body, .mcp-step-body { padding-left: 18px; }
-  .file-change-toggle { grid-template-columns: 18px minmax(0, 1fr) auto auto; }
+  .file-change-toggle { grid-template-columns: 18px minmax(0, 1fr) auto auto auto; gap: 5px; padding-right: 9px; padding-left: 9px; }
   .chat { padding-top: 18px; padding-bottom: 130px; }
   .composer-tools > .icon-button, .thread-label, .composer-config label { display: none; }
   .composer-config .composer-more { display: inline-grid; }

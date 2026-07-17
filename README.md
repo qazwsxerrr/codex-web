@@ -96,6 +96,15 @@ bash install.sh
 
 ## Start
 
+The server reads `config.yaml` from this project directory (with `config.yml`
+and the legacy `config.json` as fallbacks). It contains `codexBin`,
+`projectCwd`, `host`, and `port`; environment variables with the same names
+(`CODEX_BIN`, `PROJECT_CWD`, `HOST`, and `PORT`) take precedence. See
+`config.example.yaml` for a native Windows example.
+Use native Windows paths when the server is running under native Windows, for
+example `C:\\Users\\admin\\bin\\codex.exe` and
+`D:\\ai_code\\ai_vibecode\\codex-web`.
+
 ```bash
 cd /path/to/codex-web
 PROJECT_CWD=/mnt/d/ai_code/ai_project/ct_time npm start

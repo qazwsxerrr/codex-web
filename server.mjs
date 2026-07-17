@@ -7,14 +7,16 @@ import { fileURLToPath } from "node:url";
 
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
+import { loadServerConfig } from "./server-config.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const HOST = process.env.HOST || "127.0.0.1";
-const PORT = Number(process.env.PORT || 4317);
-const CODEX_BIN = process.env.CODEX_BIN || "codex";
-const DEFAULT_CWD = process.env.PROJECT_CWD || process.cwd();
+const SERVER_CONFIG = loadServerConfig({ rootDir: __dirname });
+const HOST = SERVER_CONFIG.host;
+const PORT = SERVER_CONFIG.port;
+const CODEX_BIN = SERVER_CONFIG.codexBin;
+const DEFAULT_CWD = SERVER_CONFIG.projectCwd;
 
 const app = express();
 const server = http.createServer(app);
@@ -203,7 +205,7 @@ wss.on("connection", (ws) => {
     if (images.length > 4) throw new Error("Attach at most 4 images");
     const input = source.map((part) => {
       if (part?.type === "text" && typeof part.text === "string" && part.text.trim()) {
-        return { type: "text", text: part.text.trim() };
+        return { type: "text", text: part.text };
       }
       if (part?.type === "mention" && typeof part.name === "string" && typeof part.path === "string" && part.path) {
         return { type: "mention", name: part.name, path: part.path };

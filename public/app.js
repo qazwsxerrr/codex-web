@@ -8,7 +8,7 @@ import { codexVersion, formatCompactNumber, providerStatus, threadTokenStats, un
 import { formatMcpInventory, normalizeMcpInventory } from "/mcp-data.js";
 import { filterThreads, formatThreadTime, groupThreads, mergeThreadPages, threadTitle } from "/thread-list-data.js";
 import { composeUserInput, displayInput, makeMention, MAX_IMAGES, validateImage } from "/composer-input.js";
-import { diffRowMarker, normalizeFileChanges, selectDiffPreviewRows, visibleDiffRows } from "/diff-data.js";
+import { diffRowMarker, normalizeFileChanges, visibleDiffRows } from "/diff-data.js";
 import { countOutputLines, normalizeToolStatus, presentCommand, tailOutputLines } from "/command-presentation.js";
 import { buildConversationBlocks, commandGroupId, isGroupableReadonlyCommand, mergeCachedTools } from "/conversation-blocks.js";
 import { normalizeThread } from "/thread-items.js";
@@ -666,6 +666,7 @@ function updateControls() {
 
 function createThreadUiState() {
   return {
+    diffInteractionVersion: 2,
     rightPanelTab: "outline",
     activeOutlineMessageId: null,
     expandedFileChanges: [],
@@ -766,8 +767,11 @@ function readThreadUi(threadId) {
     return {
       ...fallback,
       ...(stored && typeof stored === "object" ? stored : {}),
+      diffInteractionVersion: 2,
       expandedFileChanges: Array.isArray(stored?.expandedFileChanges) ? stored.expandedFileChanges : [],
-      expandedDiffFiles: Array.isArray(stored?.expandedDiffFiles) ? stored.expandedDiffFiles : [],
+      expandedDiffFiles: stored?.diffInteractionVersion === 2 && Array.isArray(stored?.expandedDiffFiles)
+        ? stored.expandedDiffFiles
+        : [],
       expandedCommands: Array.isArray(stored?.expandedCommands) ? stored.expandedCommands : [],
       collapsedCommands: Array.isArray(stored?.collapsedCommands) ? stored.collapsedCommands : [],
       expandedCommandGroups: Array.isArray(stored?.expandedCommandGroups) ? stored.expandedCommandGroups : [],
@@ -1033,9 +1037,9 @@ function addSystemMessage(text, kind = "info") {
   scrollToBottom();
 }
 
-function renderMarkdown(node, raw) {
+function renderMarkdown(node, raw, { preserveLineBreaks = false } = {}) {
   const extracted = extractMath(raw || "");
-  const html = marked.parse(extracted.markdown);
+  const html = marked.parse(extracted.markdown, preserveLineBreaks ? { breaks: true } : undefined);
   node.innerHTML = DOMPurify.sanitize(html, {
     USE_PROFILES: { html: true },
     ADD_ATTR: ["data-codex-math"],
@@ -1163,7 +1167,7 @@ function addLocalUserMessage(input) {
   const id = `local-user-${crypto.randomUUID()}`;
   const record = ensureMessage(id, "user");
   record.raw = Array.isArray(input) ? displayInput(input) : String(input || "");
-  renderMarkdown(record.content, record.raw);
+  renderMarkdown(record.content, record.raw, { preserveLineBreaks: true });
   record.renderedRaw = record.raw;
   renderConversationOutline();
   scrollToBottom(true);
@@ -1197,10 +1201,6 @@ function fileChangeLabel(count) {
 function setFileChangeExpanded(record, item, expanded) {
   if (expanded) {
     state.expandedFileChanges.add(item.id);
-    const files = normalizeFileChanges(item);
-    if (files.length && ![...state.expandedDiffFiles].some((key) => key.startsWith(`${item.id}:`))) {
-      state.expandedDiffFiles.add(`${item.id}:${files[0].id}`);
-    }
   } else {
     state.expandedFileChanges.delete(item.id);
   }
@@ -1601,13 +1601,11 @@ function ensureTool(item, options = {}) {
     toggle.type = "button";
     toggle.className = "file-change-toggle";
     toggle.setAttribute("aria-expanded", "false");
-    const preview = document.createElement("div");
-    preview.className = "file-change-preview";
     const body = document.createElement("div");
     body.className = "file-change-body";
-    card.append(toggle, preview, body);
+    card.append(toggle, body);
     (options.container || chat).append(card);
-    record = { kind: "fileChange", details: card, summary: toggle, preview, body, item, fileList: null };
+    record = { kind: "fileChange", details: card, summary: toggle, body, item, fileList: null, normalizedFiles: null };
     toggle.addEventListener("click", () => {
       const currentItem = record.item || item;
       setFileChangeExpanded(record, currentItem, !state.expandedFileChanges.has(currentItem.id));
@@ -1630,103 +1628,131 @@ function renderDiffFileIfNeeded(details, container, file) {
   if (details.open && !container.childElementCount) renderDiffRows(container, file);
 }
 
+function sameFileChanges(previous, next) {
+  return Array.isArray(previous)
+    && previous.length === next.length
+    && previous.every((file, index) => {
+      const current = next[index];
+      return file.id === current.id
+        && file.path === current.path
+        && file.kind === current.kind
+        && file.diff === current.diff;
+    });
+}
+
+function sameFileChangeStructure(previous, next) {
+  return Array.isArray(previous)
+    && previous.length === next.length
+    && previous.every((file, index) => {
+      const current = next[index];
+      return file.id === current.id && file.path === current.path && file.kind === current.kind;
+    });
+}
+
+function renderFileChangeHeader(record, item, files) {
+  const expanded = state.expandedFileChanges.has(item.id);
+  const normalizedStatus = normalizeToolStatus(item.status);
+  record.details.classList.toggle("expanded", expanded);
+  record.details.dataset.status = normalizedStatus.kind;
+  record.body.hidden = !expanded;
+  record.summary.setAttribute("aria-expanded", String(expanded));
+  let [chevron, label, added, removed, status] = record.summary.children;
+  if (record.summary.children.length !== 5) {
+    record.summary.replaceChildren();
+    chevron = document.createElement("span");
+    chevron.className = "file-change-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    label = document.createElement("span");
+    label.className = "file-change-label";
+    added = document.createElement("span");
+    added.className = "file-change-stat-add";
+    removed = document.createElement("span");
+    removed.className = "file-change-stat-del";
+    status = document.createElement("span");
+    status.className = "file-change-status";
+    record.summary.append(chevron, label, added, removed, status);
+  }
+  chevron.textContent = "›";
+  label.textContent = fileChangeLabel(files.length);
+  added.textContent = `+${files.reduce((sum, file) => sum + file.additions, 0)}`;
+  removed.textContent = `-${files.reduce((sum, file) => sum + file.deletions, 0)}`;
+  status.textContent = normalizedStatus.label;
+  status.dataset.kind = normalizedStatus.kind;
+}
+
 function renderToolFileChange(record, item) {
-  record.body.replaceChildren();
-  record.preview.replaceChildren();
   const files = normalizeFileChanges(item);
+  renderFileChangeHeader(record, item, files);
+  if (record.fileList && sameFileChanges(record.normalizedFiles, files)) return;
+  if (record.fileList && sameFileChangeStructure(record.normalizedFiles, files)) {
+    record.normalizedFiles = files;
+    [...record.fileList.children].forEach((details, index) => {
+      const file = files[index];
+      const stats = details.querySelector(".tool-file-stats");
+      if (stats) stats.textContent = `+${file.additions} / -${file.deletions}`;
+      const diff = details.querySelector(".tool-file-diff");
+      if (!diff) return;
+      diff.replaceChildren();
+      renderDiffFileIfNeeded(details, diff, file);
+    });
+    return;
+  }
+  record.body.replaceChildren();
+  record.fileList = null;
+  record.normalizedFiles = files;
   if (!files.length) {
     const empty = document.createElement("div");
     empty.className = "tool-file-empty";
     empty.textContent = "No file patch was reported.";
-    record.preview.append(empty);
-    record.body.hidden = !state.expandedFileChanges.has(item.id);
+    record.body.append(empty);
     return;
   }
-  for (const [index, file] of files.entries()) {
-    const parts = filePathParts(file.path);
-    const row = document.createElement("div");
-    row.className = "file-change-preview-row";
-    const name = document.createElement("strong");
-    name.className = "file-change-preview-name";
-    name.textContent = parts.name;
-    name.title = parts.full;
-    const relative = document.createElement("span");
-    relative.className = "file-change-preview-path";
-    relative.textContent = parts.relative === parts.name ? "" : parts.relative;
-    const stats = document.createElement("span");
-    stats.className = "file-change-preview-stats";
-    stats.textContent = `+${file.additions} / -${file.deletions}`;
-    row.append(name, relative, stats);
-    record.preview.append(row);
-    if (index === 0) {
-      const previewDiff = document.createElement("div");
-      previewDiff.className = "file-change-preview-diff";
-      const rows = selectDiffPreviewRows(file.rows, { limit: 12, context: 2 });
-      for (const diffRow of rows) previewDiff.append(createDiffLine(diffRow));
-      if (rows.length < file.rows.length) {
-        const more = document.createElement("span");
-        more.className = "file-change-more-lines";
-        more.textContent = `${file.rows.length - rows.length} more lines`;
-        previewDiff.append(more);
-      }
-      record.preview.append(previewDiff);
-    }
-  }
+
   const fileList = document.createElement("div");
   fileList.className = "tool-file-list";
-  for (const [index, file] of files.entries()) {
+  for (const file of files) {
     const key = `${item.id}:${file.id}`;
     const details = document.createElement("details");
     details.className = "tool-file";
-    details.open = state.expandedDiffFiles.has(key) || (state.expandedFileChanges.has(item.id) && index === 0 && ![...state.expandedDiffFiles].some((value) => value.startsWith(`${item.id}:`)));
+    details.dataset.fileKey = key;
+    details.open = state.expandedDiffFiles.has(key);
+    const summary = document.createElement("summary");
+    const chevron = document.createElement("span");
+    chevron.className = "tool-file-chevron";
+    chevron.textContent = "›";
+    chevron.setAttribute("aria-hidden", "true");
+    const titleWrap = document.createElement("span");
+    titleWrap.className = "tool-file-title-wrap";
+    const path = filePathParts(file.path);
+    const name = document.createElement("strong");
+    name.className = "tool-file-path";
+    name.textContent = path.name;
+    name.title = path.full;
+    const relative = document.createElement("span");
+    relative.className = "tool-file-relative-path";
+    relative.textContent = path.relative === path.name ? "" : path.relative;
+    relative.title = path.full;
+    titleWrap.append(name, relative);
+    const stats = document.createElement("span");
+    stats.className = "tool-file-stats";
+    stats.textContent = `+${file.additions} / -${file.deletions}`;
+    summary.append(chevron, titleWrap, stats);
+    details.append(summary);
+    const diff = document.createElement("div");
+    diff.className = "tool-file-diff";
+    details.append(diff);
     details.addEventListener("toggle", () => {
       if (details.open) state.expandedDiffFiles.add(key);
       else state.expandedDiffFiles.delete(key);
       renderDiffFileIfNeeded(details, diff, file);
       saveThreadUi();
     });
-    const summary = document.createElement("summary");
-    const path = document.createElement("strong");
-    path.className = "tool-file-path";
-    const parts = filePathParts(file.path);
-    path.textContent = parts.name;
-    path.title = parts.full;
-    const stats = document.createElement("span");
-    stats.className = "tool-file-stats";
-    stats.textContent = `+${file.additions} / -${file.deletions}`;
-    summary.append(path, stats);
-    const diff = document.createElement("div");
-    diff.className = "tool-file-diff";
-    details.append(summary, diff);
+    summary.addEventListener("click", (event) => event.stopPropagation());
     fileList.append(details);
     renderDiffFileIfNeeded(details, diff, file);
   }
   record.body.append(fileList);
   record.fileList = fileList;
-  const expanded = state.expandedFileChanges.has(item.id);
-  record.details.classList.toggle("expanded", expanded);
-  const normalizedStatus = normalizeToolStatus(item.status);
-  record.details.dataset.status = normalizedStatus.kind;
-  record.body.hidden = !expanded;
-  record.summary.setAttribute("aria-expanded", String(expanded));
-  record.summary.replaceChildren();
-  const chevron = document.createElement("span");
-  chevron.className = "file-change-chevron";
-  chevron.textContent = "›";
-  const label = document.createElement("span");
-  label.className = "file-change-label";
-  label.textContent = fileChangeLabel(files.length);
-  const added = document.createElement("span");
-  added.className = "file-change-stat-add";
-  added.textContent = `+${files.reduce((sum, file) => sum + file.additions, 0)}`;
-  const removed = document.createElement("span");
-  removed.className = "file-change-stat-del";
-  removed.textContent = `-${files.reduce((sum, file) => sum + file.deletions, 0)}`;
-  const status = document.createElement("span");
-  status.className = "file-change-status";
-  status.textContent = normalizedStatus.label;
-  status.dataset.kind = normalizedStatus.kind;
-  record.summary.append(chevron, label, added, removed, status);
 }
 
 function scheduleArtifactRender(view) {
@@ -1993,7 +2019,7 @@ function renderHistoricalBlock(block) {
     });
     record.raw = block.role === "user" ? displayInput(item.content || []) : item.text || "";
     resetStreamingMessage(record);
-    renderMarkdown(record.content, record.raw);
+    renderMarkdown(record.content, record.raw, { preserveLineBreaks: block.role === "user" });
     record.renderedRaw = record.raw;
     return;
   }
@@ -3066,13 +3092,14 @@ function readImage(file) {
 }
 
 function submitMessage() {
-  const text = messageInput.value.trim();
-  if (state.running || (!text && !state.mentions.length && !state.images.length)) return;
-  if (text.startsWith("/") && !state.mentions.length && !state.images.length) {
+  const text = messageInput.value;
+  const trimmedText = text.trim();
+  if (state.running || (!trimmedText && !state.mentions.length && !state.images.length)) return;
+  if (trimmedText.startsWith("/") && !state.mentions.length && !state.images.length) {
     messageInput.value = "";
     autoSizeComposer();
     slashPalette.classList.add("hidden");
-    executeSlash(text);
+    executeSlash(trimmedText);
     updateControls();
     return;
   }
