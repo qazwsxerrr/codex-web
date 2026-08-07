@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import { loadServerConfig } from "./server-config.mjs";
+import { resolveDeleteThreadId } from "./public/thread-delete-data.js";
+import { resumeThreadWithFallback } from "./public/thread-access.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,6 +47,18 @@ function compactError(error) {
   };
 }
 
+function turnBridgeRequestId(command) {
+  const value = String(command?.requestId || "").trim();
+  return value || randomUUID();
+}
+
+function turnBridgeError(message, code = "INVALID_TURN_REQUEST", data = undefined) {
+  const error = new Error(message);
+  error.code = code;
+  error.data = data;
+  return error;
+}
+
 function getDataList(result) {
   if (Array.isArray(result)) return result;
   if (Array.isArray(result?.data)) return result.data;
@@ -64,6 +78,8 @@ wss.on("connection", (ws) => {
   let initialized = false;
   let activeThreadId = null;
   let activeTurnId = null;
+  let activeWriterConflict = null;
+  let activeFileSearchSessionId = null;
   let pendingTurnSettings = {};
   let lastThreadResponse = null;
   const pending = new Map();
@@ -95,6 +111,41 @@ wss.on("connection", (ws) => {
       return { ok: true, result: await request(method, params) };
     } catch (error) {
       return { ok: false, error: compactError(error) };
+    }
+  }
+
+  async function runFileSearch(query, cwd) {
+    const sessionId = randomUUID();
+    const previousSessionId = activeFileSearchSessionId;
+    activeFileSearchSessionId = sessionId;
+    sendJson(ws, { type: "fileSearchStarted", query, sessionId });
+
+    if (previousSessionId && previousSessionId !== sessionId) {
+      await safeRequest("fuzzyFileSearch/sessionStop", { sessionId: previousSessionId });
+    }
+    if (activeFileSearchSessionId !== sessionId) return;
+
+    try {
+      await request("fuzzyFileSearch/sessionStart", { sessionId, roots: [cwd] });
+      if (activeFileSearchSessionId !== sessionId) return;
+      await request("fuzzyFileSearch/sessionUpdate", { sessionId, query });
+    } catch (error) {
+      if (activeFileSearchSessionId !== sessionId) return;
+
+      // Keep older App Server builds usable. The current protocol streams the
+      // session notifications; older builds can still answer the one-shot RPC.
+      await safeRequest("fuzzyFileSearch/sessionStop", { sessionId });
+      const fallback = await safeRequest("fuzzyFileSearch", { query, roots: [cwd] });
+      if (fallback.ok) {
+        sendJson(ws, { type: "fileSearchResult", query, sessionId, result: fallback.result });
+      } else {
+        sendJson(ws, {
+          type: "fileSearchError",
+          query,
+          sessionId,
+          error: fallback.error || compactError(error),
+        });
+      }
     }
   }
 
@@ -133,6 +184,20 @@ wss.on("connection", (ws) => {
       }
     }
 
+    if (message.method === "thread/deleted" && message.params?.threadId === activeThreadId) {
+      activeThreadId = null;
+      activeTurnId = null;
+      activeWriterConflict = null;
+    }
+
+    if (message.method === "turn/started" && message.params?.threadId === activeThreadId) {
+      activeTurnId = message.params?.turn?.id || activeTurnId;
+    }
+    if (message.method === "turn/completed" && message.params?.threadId === activeThreadId) {
+      const completedId = message.params?.turn?.id;
+      if (!completedId || completedId === activeTurnId) activeTurnId = null;
+    }
+
     sendJson(ws, { type: "codex", message });
   });
 
@@ -161,12 +226,13 @@ wss.on("connection", (ws) => {
   });
 
   async function fetchMetadata(cwd = DEFAULT_CWD, threadId = null) {
-    const [models, config, account, permissionProfiles, experiments] = await Promise.all([
+    const [models, config, account, permissionProfiles, experiments, collaborationModes] = await Promise.all([
       safeRequest("model/list", { includeHidden: false }),
       safeRequest("config/read", {}),
       safeRequest("account/read", { refreshToken: false }),
       safeRequest("permissionProfile/list", { cwd }),
       safeRequest("experimentalFeature/list", threadId ? { threadId } : {}),
+      safeRequest("collaborationMode/list", {}),
     ]);
 
     return {
@@ -175,12 +241,14 @@ wss.on("connection", (ws) => {
       account: account.ok ? account.result : null,
       permissionProfiles: permissionProfiles.ok ? getDataList(permissionProfiles.result) : [],
       experiments: experiments.ok ? getDataList(experiments.result) : [],
+      collaborationModes: collaborationModes.ok ? getDataList(collaborationModes.result) : [],
       metadataErrors: {
         models: models.ok ? null : models.error,
         config: config.ok ? null : config.error,
         account: account.ok ? null : account.error,
         permissionProfiles: permissionProfiles.ok ? null : permissionProfiles.error,
         experiments: experiments.ok ? null : experiments.error,
+        collaborationModes: collaborationModes.ok ? null : collaborationModes.error,
       },
     };
   }
@@ -317,10 +385,23 @@ wss.on("connection", (ws) => {
         case "searchFiles": {
           const query = String(command.query || "").trim();
           const cwd = String(command.cwd || lastThreadResponse?.thread?.cwd || DEFAULT_CWD);
-          const result = query
-            ? await request("fuzzyFileSearch", { query, roots: [cwd] })
-            : { files: [] };
-          sendJson(ws, { type: "fileSearchResult", query, result });
+          if (!query) {
+            const previousSessionId = activeFileSearchSessionId;
+            activeFileSearchSessionId = null;
+            if (previousSessionId) {
+              await safeRequest("fuzzyFileSearch/sessionStop", { sessionId: previousSessionId });
+            }
+            sendJson(ws, { type: "fileSearchResult", query, result: { files: [] } });
+          } else {
+            await runFileSearch(query, cwd);
+          }
+          break;
+        }
+
+        case "stopFileSearch": {
+          const sessionId = String(command.sessionId || activeFileSearchSessionId || "").trim();
+          if (sessionId && sessionId === activeFileSearchSessionId) activeFileSearchSessionId = null;
+          if (sessionId) await safeRequest("fuzzyFileSearch/sessionStop", { sessionId });
           break;
         }
 
@@ -346,7 +427,13 @@ wss.on("connection", (ws) => {
           const result = await request("thread/start", params);
           activeThreadId = result.thread.id;
           activeTurnId = null;
-          pendingTurnSettings = {};
+          activeWriterConflict = null;
+          // `thread/start` does not accept collaborationMode in the current
+          // protocol. Keep the selected preset for the first turn instead of
+          // dropping it or sending an invalid parameter to App Server.
+          pendingTurnSettings = command.collaborationMode !== undefined
+            ? { collaborationMode: command.collaborationMode }
+            : {};
           lastThreadResponse = result;
           sendJson(ws, { type: "threadReady", mode: "start", ...result });
           break;
@@ -355,12 +442,18 @@ wss.on("connection", (ws) => {
         case "resumeThread": {
           const threadId = String(command.threadId || "").trim();
           if (!threadId) throw new Error("threadId is required");
-          const result = await request("thread/resume", { threadId });
+          const resumed = await resumeThreadWithFallback(request, threadId);
+          const { result, writerConflict } = resumed;
           activeThreadId = result.thread.id;
           activeTurnId = null;
+          activeWriterConflict = writerConflict || null;
           pendingTurnSettings = {};
           lastThreadResponse = result;
-          sendJson(ws, { type: "threadReady", mode: "resume", ...result });
+          sendJson(ws, {
+            type: "threadReady",
+            mode: "resume",
+            ...result,
+          });
           break;
         }
 
@@ -369,6 +462,7 @@ wss.on("connection", (ws) => {
           const result = await request("thread/fork", { threadId: activeThreadId });
           activeThreadId = result.thread.id;
           activeTurnId = null;
+          activeWriterConflict = null;
           pendingTurnSettings = {};
           lastThreadResponse = result;
           sendJson(ws, { type: "threadReady", mode: "fork", ...result });
@@ -382,11 +476,20 @@ wss.on("connection", (ws) => {
 
         case "sendMessage": {
           if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const requestId = turnBridgeRequestId(command);
+          const requestedThreadId = String(command.threadId || "").trim();
+          if (requestedThreadId && requestedThreadId !== activeThreadId) {
+            throw turnBridgeError("Thread is stale or no longer active", "STALE_THREAD", {
+              expectedThreadId: activeThreadId,
+              receivedThreadId: requestedThreadId,
+            });
+          }
+          if (activeWriterConflict) throw activeWriterConflict;
           const input = browserUserInput(command);
 
           const params = {
             threadId: activeThreadId,
-            clientUserMessageId: randomUUID(),
+            clientUserMessageId: String(command.clientUserMessageId || "").trim() || randomUUID(),
             input,
           };
 
@@ -405,15 +508,46 @@ wss.on("connection", (ws) => {
           if (requested.collaborationMode) params.collaborationMode = requested.collaborationMode;
 
           const result = await request("turn/start", params);
-          activeTurnId = result.turn.id;
+          activeTurnId = result.turn?.id || activeTurnId;
           pendingTurnSettings = {};
-          sendJson(ws, { type: "turnAccepted", ...result });
+          sendJson(ws, { type: "turnAccepted", requestId, accepted: true, ...result });
+          break;
+        }
+
+        case "steerMessage":
+        case "steer": {
+          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const requestId = turnBridgeRequestId(command);
+          const requestedThreadId = String(command.threadId || "").trim();
+          const expectedTurnId = String(command.expectedTurnId || "").trim();
+          if (!requestedThreadId || requestedThreadId !== activeThreadId) {
+            throw turnBridgeError("Thread is stale or no longer active", "STALE_THREAD", {
+              expectedThreadId: activeThreadId,
+              receivedThreadId: requestedThreadId || null,
+            });
+          }
+          if (!expectedTurnId || !activeTurnId || expectedTurnId !== activeTurnId) {
+            throw turnBridgeError("The active turn changed before steering was accepted", "STALE_TURN", {
+              expectedTurnId: activeTurnId,
+              receivedTurnId: expectedTurnId || null,
+            });
+          }
+          const input = browserUserInput(command);
+          const params = {
+            threadId: activeThreadId,
+            expectedTurnId,
+            clientUserMessageId: String(command.clientUserMessageId || "").trim() || randomUUID(),
+            input,
+          };
+          const result = await request("turn/steer", params);
+          sendJson(ws, { type: "steerAccepted", requestId, accepted: true, ...result });
           break;
         }
 
         case "interrupt": {
           const turnId = String(command.turnId || activeTurnId || "").trim();
-          if (!activeThreadId || !turnId) throw new Error("No active turn to interrupt");
+          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          if (!turnId) throw new Error("No active turn to interrupt");
           await request("turn/interrupt", { threadId: activeThreadId, turnId });
           break;
         }
@@ -433,17 +567,22 @@ wss.on("connection", (ws) => {
           const result = await request("thread/archive", { threadId });
           activeThreadId = null;
           activeTurnId = null;
+          activeWriterConflict = null;
           sendJson(ws, { type: "threadArchived", threadId, result });
           break;
         }
 
         case "deleteThread": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
-          const threadId = activeThreadId;
+          const threadId = resolveDeleteThreadId(command.threadId);
+          if (!threadId) throw new Error("threadId is required");
+          const requestId = String(command.requestId || "").trim() || null;
           const result = await request("thread/delete", { threadId });
-          activeThreadId = null;
-          activeTurnId = null;
-          sendJson(ws, { type: "threadDeleted", threadId, result });
+          if (threadId === activeThreadId) {
+            activeThreadId = null;
+            activeTurnId = null;
+            activeWriterConflict = null;
+          }
+          sendJson(ws, { type: "threadDeleted", threadId, requestId, result });
           break;
         }
 
@@ -631,6 +770,15 @@ wss.on("connection", (ws) => {
           break;
         }
 
+        case "serverRequestResponse": {
+          if (command.requestId === undefined) throw new Error("Server requestId is required");
+          writeProtocol({
+            id: command.requestId,
+            result: command.result,
+          });
+          break;
+        }
+
         case "debugState": {
           sendJson(ws, {
             type: "debugState",
@@ -646,7 +794,23 @@ wss.on("connection", (ws) => {
           throw new Error(`Unknown browser command: ${command.type}`);
       }
     } catch (error) {
-      sendJson(ws, { type: "bridgeError", message: error.message, details: compactError(error) });
+      const isTurnBridge = ["sendMessage", "steerMessage", "steer"].includes(command?.type);
+      const requestId = isTurnBridge || command?.type === "deleteThread" ? String(command.requestId || "").trim() : "";
+      if (isTurnBridge) {
+        sendJson(ws, {
+          type: ["steerMessage", "steer"].includes(command.type) ? "steerAccepted" : "turnAccepted",
+          requestId: requestId || turnBridgeRequestId(command),
+          accepted: false,
+          error: compactError(error),
+        });
+        return;
+      }
+      sendJson(ws, {
+        type: "bridgeError",
+        message: error.message,
+        details: compactError(error),
+        ...(requestId ? { requestId } : {}),
+      });
     }
   });
 

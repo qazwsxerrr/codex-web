@@ -3,6 +3,12 @@ import {
   normalizeToolStatus,
   presentCommand,
 } from "./command-presentation.js";
+import {
+  buildProcessDetails,
+  isAnswerItem,
+  isProcessItem,
+  splitAssistantProcess,
+} from "./message-display.js";
 
 const COMMAND_TYPES = new Set(["commandExecution"]);
 
@@ -120,6 +126,10 @@ export function buildConversationBlocks(turns, options = {}) {
         blocks.push({ type: "fileChange", turnId, item });
       } else if (item.type === "mcpToolCall" || item.viewType === "mcp") {
         blocks.push({ type: "mcpTool", turnId, item });
+      } else if (item.type === "webSearch" || item.viewType === "search") {
+        blocks.push({ type: "search", turnId, item });
+      } else if (item.type === "plan" || item.viewType === "plan") {
+        blocks.push({ type: "plan", turnId, item });
       } else if (item.type === "error" || item.viewType === "error") {
         blocks.push({ type: "error", turnId, item });
       } else {
@@ -154,3 +164,49 @@ export function mergeCachedTools(thread, cachedEntries) {
   }
   return { ...thread, turns };
 }
+
+function isUserItem(item) {
+  return item?.type === "userMessage" || item?.role === "user";
+}
+
+function assistantAnswer(item) {
+  if (!item || (!isAnswerItem(item) && item?.type !== "agentMessage" && item?.role !== "assistant")) return false;
+  const split = splitAssistantProcess(item);
+  return split.answerBlocks.length > 0;
+}
+
+/**
+ * Return the user anchor, collapsed process payload, and final answer for one
+ * turn. This is deliberately a pure data representation so live and restored
+ * transcripts can use the same grouping rules.
+ */
+export function buildTurnProcessDetails(turn, options = {}) {
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+  const userIndex = items.findIndex(isUserItem);
+  if (userIndex < 0) return null;
+  const rest = items.slice(userIndex + 1);
+  const answerIndex = rest.findLastIndex(assistantAnswer);
+  const answer = answerIndex >= 0 ? rest[answerIndex] : null;
+  const processItems = (answerIndex >= 0 ? rest.slice(0, answerIndex) : rest)
+    .filter((item) => isProcessItem(item) || (item?.role === "assistant" && !assistantAnswer(item)));
+  return {
+    type: "turn",
+    turnId: turn.id ?? null,
+    user: items[userIndex],
+    process: buildProcessDetails(processItems, {
+      id: `${turn.id || "turn"}:process`,
+      durationMs: options.durationMs ?? turn.durationMs,
+      status: options.status ?? turn.status,
+    }),
+    answer,
+    trailing: answerIndex >= 0 ? rest.slice(answerIndex + 1) : [],
+  };
+}
+
+export function buildProcessDetailsForTurns(turns, options = {}) {
+  return (Array.isArray(turns) ? turns : [])
+    .map((turn) => buildTurnProcessDetails(turn, options))
+    .filter(Boolean);
+}
+
+export const buildProcessBlocks = buildProcessDetailsForTurns;

@@ -4,14 +4,34 @@ import { marked } from "/vendor/marked/lib/marked.esm.js";
 import { extractMath, findStableMarkdownBoundary, renderMathSlots } from "/math-renderer.js";
 import { guardianEventFromNotification, prioritizeSlashMatches, resolveSlashSelection } from "/slash-input.js";
 import { slashAliases, slashCommands } from "/slash-commands.js";
+import { currentApproval, enqueueApproval, removeApproval as removeQueuedApproval } from "/approval-data.js";
 import { codexVersion, formatCompactNumber, providerStatus, threadTokenStats, unwrapConfig } from "/status-data.js";
 import { formatMcpInventory, normalizeMcpInventory } from "/mcp-data.js";
-import { filterThreads, formatThreadTime, groupThreads, mergeThreadPages, threadTitle } from "/thread-list-data.js";
+import { compactThreadCwd, filterThreads, formatThreadTime, groupThreads, mergeThreadPages, threadTitle } from "/thread-list-data.js";
+import { removeThreadById, removeThreadFromNavigation } from "/thread-delete-data.js";
 import { composeUserInput, displayInput, makeMention, MAX_IMAGES, validateImage } from "/composer-input.js";
 import { diffRowMarker, normalizeFileChanges, visibleDiffRows } from "/diff-data.js";
-import { countOutputLines, normalizeToolStatus, presentCommand, tailOutputLines } from "/command-presentation.js";
-import { buildConversationBlocks, commandGroupId, isGroupableReadonlyCommand, mergeCachedTools } from "/conversation-blocks.js";
+import { normalizeFileSearchFiles } from "/file-search-data.js";
+import { countOutputLines, normalizeToolStatus, presentCommand, searchActivityLabel, tailOutputLines, toolInputPreview } from "/command-presentation.js";
+import { buildConversationBlocks, buildProcessDetailsForTurns, commandGroupId, isGroupableReadonlyCommand, mergeCachedTools } from "/conversation-blocks.js";
+import { buildProcessDetails, normalizeDisplayStatus, presentTool } from "/message-display.js";
+import { createQueueEntry, isQueueEntryRetryable, nextQueueEntry, queueForThread, queueReducer } from "/queue-data.js";
 import { normalizeThread } from "/thread-items.js";
+import { isNotificationForThread } from "/notification-scope.js";
+import {
+  canImplementPlan,
+  normalizePlanSnapshot,
+  PLAN_IMPLEMENTATION_PROMPT,
+  planSnapshotKey,
+} from "/plan-data.js";
+import {
+  buildUserInputResult,
+  countUserInputAnswers,
+  isUserInputAnswerComplete,
+  normalizeUserInputQuestions,
+  resetUserInputRequest,
+  USER_INPUT_OTHER,
+} from "/user-input-data.js";
 import { createSessionSettings, navigateThread, pushThreadNavigation, resolveReasoningEffort, shouldFollowScroll } from "/session-state.js";
 import { formatActivityDuration, isActiveTurnStatus, resolveTurnDurationMs, timestampToMs } from "/turn-activity.js";
 import { renderIcons } from "/icons.js";
@@ -21,8 +41,10 @@ marked.setOptions({ gfm: true, breaks: false });
 const $ = (selector) => document.querySelector(selector);
 const connectionStatus = $("#connectionStatus");
 const cwdInput = $("#cwdInput");
+const workspaceButton = $("#workspaceButton");
 const modelSelect = $("#modelSelect");
 const effortSelect = $("#effortSelect");
+const collaborationModeSelect = $("#collaborationModeSelect");
 const tierSelect = $("#tierSelect");
 const permissionSelect = $("#permissionSelect");
 const newThreadButton = $("#newThreadButton");
@@ -39,12 +61,19 @@ const directorySummary = $("#directorySummary");
 const runStatus = $("#runStatus");
 const contextSummary = $("#contextSummary");
 const chat = $("#chat");
+const chatEmptyState = $("#chatEmptyState");
 const approvalArea = $("#approvalArea");
+const composer = $(".composer");
 const turnActivity = $("#turnActivity");
+const queueShelf = $("#queueShelf");
 const messageInput = $("#messageInput");
 const slashPalette = $("#slashPalette");
 const sendButton = $("#sendButton");
 const stopButton = $("#stopButton");
+const steerButton = $("#steerButton");
+const followUpButton = $("#followUpButton");
+const mentionButton = $("#mentionButton");
+const attachButton = $(".attach-button");
 const threadLabel = $("#threadLabel");
 const statusDialog = $("#statusDialog");
 const statusSubtitle = $("#statusSubtitle");
@@ -53,9 +82,14 @@ const rawStatus = $("#rawStatus");
 const textDialog = $("#textDialog");
 const textDialogTitle = $("#textDialogTitle");
 const textDialogBody = $("#textDialogBody");
+const deleteThreadDialog = $("#deleteThreadDialog");
+const deleteThreadDialogTitle = $("#deleteThreadDialogTitle");
+const deleteThreadDialogCwd = $("#deleteThreadDialogCwd");
+const confirmDeleteThreadButton = $("#confirmDeleteThreadButton");
 const inspector = $("#inspector");
 const inspectorModelSelect = $("#inspectorModelSelect");
 const inspectorEffortSelect = $("#inspectorEffortSelect");
+const inspectorCollaborationModeSelect = $("#inspectorCollaborationModeSelect");
 const providerSummary = $("#providerSummary");
 const inspectorConnection = $("#inspectorConnection");
 const inspectorThreadId = $("#inspectorThreadId");
@@ -108,6 +142,11 @@ const state = {
   latestDiff: "",
   messageNodes: new Map(),
   toolNodes: new Map(),
+  processNodes: new Map(),
+  planSnapshots: new Map(),
+  planNodes: new Map(),
+  planDeltaBuffers: new Map(),
+  latestPlanKey: null,
   renderTimers: new Map(),
   toolOutputTimers: new Map(),
   viewRenderTimers: new Map(),
@@ -124,11 +163,17 @@ const state = {
   threadListCursor: null,
   threadListError: null,
   threadListLoading: true,
+  deletingThreadIds: new Set(),
+  pendingThreadDeletes: new Map(),
+  deleteDialogThread: null,
+  deleteDialogThreadId: null,
+  userInputRequest: null,
   sessionSettings: createSessionSettings(),
   activeView: "conversation",
   threadView: normalizeThread({}),
   commandItems: new Map(),
   changeItems: new Map(),
+  searchNodes: new Map(),
   commandObservedStartMs: new Map(),
   conversationOrder: [],
   toolCacheItems: new Map(),
@@ -141,10 +186,15 @@ const state = {
   activityStartedAtMs: null,
   activityDurationMs: null,
   activityStatus: null,
+  activityLabel: null,
   activityTimer: null,
+  searchActivities: new Map(),
   mentions: [],
   images: [],
   fileMatches: [],
+  fileSearchSessionId: null,
+  fileSearchSearching: false,
+  fileSearchError: null,
   mentionIndex: 0,
   mentionQuery: "",
   mentionTimer: null,
@@ -164,6 +214,13 @@ const state = {
   expandedCommandGroups: new Set(),
   expandedMcpTools: new Set(),
   expandedCommandOutputs: new Set(),
+  expandedProcesses: new Set(),
+  queueEntries: [],
+  queueRequestIds: new Map(),
+  queueDispatch: null,
+  ignoredQueueRequestIds: new Set(),
+  steerRequestInputs: new Map(),
+  historicalProcessAnswerIds: new Set(),
   outlineObserver: null,
   outlineNodes: new Map(),
   activeOutlineNode: null,
@@ -242,8 +299,13 @@ function send(payload) {
     addSystemMessage("WebSocket is not connected.", "error");
     return false;
   }
-  socket.send(JSON.stringify(payload));
-  return true;
+  try {
+    socket.send(JSON.stringify(payload));
+    return true;
+  } catch {
+    addSystemMessage("WebSocket is not connected.", "error");
+    return false;
+  }
 }
 
 function setConnection(text, online) {
@@ -335,12 +397,99 @@ function selectedModel() {
 }
 
 function selectedSettings() {
+  const collaborationMode = collaborationModePayload(collaborationModeSelect.value);
   return {
     model: modelSelect.value || null,
     effort: effortSelect.value || null,
     serviceTier: tierSelect.value || null,
     permissions: permissionSelect.value || null,
+    ...(collaborationMode ? { collaborationMode } : {}),
   };
+}
+
+function collaborationModeValue(source = state.threadMeta.collaborationMode) {
+  if (source && typeof source === "object") return source.mode || source.name || "";
+  return String(source || "").trim();
+}
+
+function collaborationModeStorageKey(threadId) {
+  return `codexCollaborationMode:${String(threadId || "")}`;
+}
+
+function rememberCollaborationMode(threadId, value) {
+  const mode = collaborationModeValue(value);
+  if (threadId && mode) localStorage.setItem(collaborationModeStorageKey(threadId), mode);
+}
+
+function collaborationModePreset(value) {
+  const target = String(value || "").trim();
+  return state.collaborationModes.find((preset) =>
+    String(preset?.mode || "") === target || String(preset?.name || "") === target,
+  ) || null;
+}
+
+function collaborationModePayload(value = collaborationModeSelect.value) {
+  const mode = String(value || "").trim();
+  if (!mode) return null;
+  const preset = collaborationModePreset(mode);
+  const presetMode = preset?.mode || mode;
+  const presetModel = preset?.model || currentModelLabel();
+  const presetEffort = preset?.reasoning_effort ?? displayEffortLabel();
+  return {
+    mode: presetMode,
+    settings: {
+      model: String(presetModel || modelSelect.value || ""),
+      reasoning_effort: presetEffort && presetEffort !== "default" ? String(presetEffort) : null,
+      developer_instructions: null,
+    },
+  };
+}
+
+function collaborationModeLabel(preset) {
+  const mode = preset?.mode || preset?.name || "default";
+  if (mode === "plan") return "Plan";
+  if (mode === "default") return "Default";
+  return String(preset?.name || mode);
+}
+
+function populateCollaborationModes(preferred) {
+  const current = collaborationModeValue(state.threadMeta.collaborationMode);
+  const previous = preferred !== undefined
+    ? String(preferred || "")
+    : (collaborationModeSelect.value || current || localStorage.getItem("codexCollaborationMode") || "");
+  collaborationModeSelect.replaceChildren();
+
+  const presets = [...state.collaborationModes];
+  if (current && !presets.some((preset) => (preset?.mode || preset?.name) === current)) {
+    presets.push({ mode: current, name: current });
+  }
+  for (const preset of presets) {
+    const value = String(preset?.mode || preset?.name || "").trim();
+    if (!value || [...collaborationModeSelect.options].some((option) => option.value === value)) continue;
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = collaborationModeLabel(preset);
+    if (preset?.name && preset.name !== value) option.title = preset.name;
+    collaborationModeSelect.append(option);
+  }
+  if (previous && ![...collaborationModeSelect.options].some((option) => option.value === previous)) {
+    const option = document.createElement("option");
+    option.value = previous;
+    option.textContent = previous === "plan" ? "Plan" : previous === "default" ? "Default" : previous;
+    collaborationModeSelect.append(option);
+  }
+  if (!collaborationModeSelect.options.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Mode unavailable";
+    collaborationModeSelect.append(option);
+  }
+  const defaultMode = [...collaborationModeSelect.options].find((option) => option.value === "default")?.value;
+  collaborationModeSelect.value = previous && [...collaborationModeSelect.options].some((option) => option.value === previous)
+    ? previous
+    : defaultMode || collaborationModeSelect.options[0].value;
+  copySelectOptions(collaborationModeSelect, inspectorCollaborationModeSelect);
+  inspectorCollaborationModeSelect.value = collaborationModeSelect.value;
 }
 
 function populateModels(preferred) {
@@ -362,6 +511,7 @@ function populateModels(preferred) {
   populateEfforts();
   populateTiers();
   populatePermissions();
+  populateCollaborationModes();
 }
 
 function populateEfforts(preferred) {
@@ -453,6 +603,7 @@ function saveControlPreferences() {
   localStorage.setItem("codexMathEffort", effortSelect.value);
   localStorage.setItem("codexMathTier", tierSelect.value);
   localStorage.setItem("codexMathPermissions", permissionSelect.value);
+  localStorage.setItem("codexCollaborationMode", collaborationModeSelect.value || "");
 }
 
 function contextStats() {
@@ -501,6 +652,12 @@ function currentTierLabel() {
   return state.threadMeta.serviceTier || tierSelect.value || "default";
 }
 
+function currentCollaborationModeLabel() {
+  return collaborationModeValue(state.threadMeta.collaborationMode)
+    || collaborationModeSelect.value
+    || "default";
+}
+
 function currentCwd() {
   return state.threadMeta.cwd || cwdInput.value || "";
 }
@@ -514,15 +671,17 @@ function stopActivityTimer() {
 function renderTurnActivity() {
   if (!turnActivity) return;
   const mode = state.activityMode;
+  const searching = mode === "working" && String(state.activityLabel || "").startsWith("Searching");
   let labelText = "";
   let detailText = "";
   let ariaLabel = "";
   if (mode === "working") {
-    const elapsed = Math.max(0, Date.now() - (state.activityStartedAtMs || Date.now()));
+    const startedAtMs = Number.isFinite(state.activityStartedAtMs) ? state.activityStartedAtMs : Date.now();
+    const elapsed = Math.max(0, Date.now() - startedAtMs);
     const duration = formatActivityDuration(elapsed);
-    labelText = "Working";
+    labelText = state.activityLabel || "Working";
     detailText = `(${duration} • Esc to interrupt)`;
-    ariaLabel = `Working for ${duration}`;
+    ariaLabel = `${labelText} for ${duration}`;
   } else if (mode !== "idle") {
     const duration = formatActivityDuration(state.activityDurationMs);
     labelText = duration ? `Worked for ${duration}` : "Worked";
@@ -534,7 +693,7 @@ function renderTurnActivity() {
   const renderKey = `${mode}|${labelText}|${detailText}|${ariaLabel}`;
   if (turnActivity.dataset.renderKey === renderKey) return;
   turnActivity.dataset.renderKey = renderKey;
-  turnActivity.className = `turn-activity${mode === "idle" ? " hidden" : ` ${mode}`}`;
+  turnActivity.className = `turn-activity${mode === "idle" ? " hidden" : ` ${mode}`}${searching ? " searching" : ""}`;
   if (mode === "idle") {
     turnActivity.removeAttribute("aria-label");
     return;
@@ -559,13 +718,21 @@ function renderTurnActivity() {
   turnActivity.setAttribute("aria-label", ariaLabel);
 }
 
-function setTurnActivityWorking(startedAt = null) {
+function activeSearchActivityLabel() {
+  return [...state.searchActivities.values()].at(-1) || null;
+}
+
+function setTurnActivityWorking(startedAt = null, label = null) {
   const wasWorking = state.activityMode === "working";
   const explicitStart = timestampToMs(startedAt);
+  const fallbackStart = wasWorking && Number.isFinite(state.activityStartedAtMs)
+    ? state.activityStartedAtMs
+    : Date.now();
   state.activityMode = "working";
-  state.activityStartedAtMs = explicitStart ?? (wasWorking ? state.activityStartedAtMs : Date.now());
+  state.activityStartedAtMs = explicitStart ?? fallbackStart;
   state.activityDurationMs = null;
   state.activityStatus = "inProgress";
+  state.activityLabel = label || activeSearchActivityLabel() || "Working";
   renderTurnActivity();
   if (!state.activityTimer) {
     state.activityTimer = setInterval(() => {
@@ -580,10 +747,12 @@ function setTurnActivityWorking(startedAt = null) {
 
 function setTurnActivityWorked(turn = {}, fallbackStartedAtMs = state.activityStartedAtMs) {
   stopActivityTimer();
+  state.searchActivities.clear();
   state.activityMode = "worked";
   state.activityDurationMs = resolveTurnDurationMs(turn, fallbackStartedAtMs);
   state.activityStartedAtMs = timestampToMs(turn?.startedAt) ?? fallbackStartedAtMs;
   state.activityStatus = turn?.status || "completed";
+  state.activityLabel = null;
   renderTurnActivity();
 }
 
@@ -593,7 +762,22 @@ function clearTurnActivity() {
   state.activityStartedAtMs = null;
   state.activityDurationMs = null;
   state.activityStatus = null;
+  state.activityLabel = null;
+  state.searchActivities.clear();
   renderTurnActivity();
+}
+
+function startSearchActivity(item) {
+  const label = searchActivityLabel(item);
+  if (!label || !item?.id) return;
+  state.searchActivities.set(item.id, label);
+  setTurnActivityWorking(null, label);
+}
+
+function completeSearchActivity(item) {
+  if (!item?.id) return;
+  state.searchActivities.delete(item.id);
+  if (state.running) setTurnActivityWorking(null, activeSearchActivityLabel() || "Working");
 }
 
 function syncTurnActivityFromThread(thread) {
@@ -607,28 +791,228 @@ function syncTurnActivityFromThread(thread) {
   }
 }
 
+function currentQueueEntries() {
+  return queueForThread(state.queueEntries, state.threadId);
+}
+
+function queueStatusLabel(status) {
+  return {
+    pending: "Queued",
+    sending: "Sending",
+    accepted: "Accepted",
+    failed: "Failed",
+  }[status] || status || "Queued";
+}
+
+function updateQueue(action) {
+  state.queueEntries = queueReducer(state.queueEntries, action);
+  renderQueueShelf();
+}
+
+function queueRequestId() {
+  return typeof crypto?.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `queue-request-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function renderQueueShelf() {
+  if (!queueShelf) return;
+  const entries = currentQueueEntries();
+  queueShelf.replaceChildren();
+  queueShelf.classList.toggle("hidden", !entries.length);
+  if (!entries.length) return;
+  const heading = document.createElement("div");
+  heading.className = "queue-shelf-heading";
+  heading.textContent = `Queued messages · ${entries.length}`;
+  queueShelf.append(heading);
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = `queue-row queue-${entry.status}`;
+    const mode = document.createElement("span");
+    mode.className = "queue-mode";
+    mode.textContent = entry.mode === "steer" ? "Steer" : "Follow up";
+    const text = document.createElement("span");
+    text.className = "queue-text";
+    text.textContent = entry.displayText;
+    text.title = entry.displayText;
+    const status = document.createElement("span");
+    status.className = "queue-status";
+    status.textContent = entry.error ? `${queueStatusLabel(entry.status)}: ${entry.error}` : queueStatusLabel(entry.status);
+    status.title = entry.error || queueStatusLabel(entry.status);
+    row.append(mode, text, status);
+    if (isQueueEntryRetryable(entry)) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "queue-row-action";
+      retry.textContent = "Retry";
+      retry.addEventListener("click", () => {
+        updateQueue({ type: "retry", id: entry.id });
+        drainQueue();
+      });
+      row.append(retry);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "queue-row-action";
+    remove.textContent = "Remove";
+    remove.disabled = entry.status === "sending";
+    if (remove.disabled) remove.title = "Wait for the current queue request to finish.";
+    remove.addEventListener("click", () => {
+      if (entry.status === "sending") return;
+      updateQueue({ type: "remove", id: entry.id });
+      if (!state.running && !queueDispatchActive()) drainQueue();
+    });
+    row.append(remove);
+    queueShelf.append(row);
+  }
+}
+
+function failQueueEntry(entryId, error) {
+  if (!entryId) return;
+  updateQueue({ type: "failed", id: entryId, error: error?.message || error || "Queue request failed" });
+}
+
+function queueDispatchActive(threadId = state.threadId) {
+  const dispatch = state.queueDispatch;
+  return Boolean(dispatch?.requestId && (!threadId || dispatch.threadId === threadId));
+}
+
+function releaseQueueDispatch({ fail = false, error = "Queue request interrupted." } = {}) {
+  const requests = new Map(state.queueRequestIds);
+  if (state.queueDispatch?.requestId) requests.set(state.queueDispatch.requestId, state.queueDispatch.entryId);
+  for (const [requestId, entryId] of requests) {
+    state.ignoredQueueRequestIds.add(requestId);
+    if (fail) failQueueEntry(entryId, error);
+  }
+  while (state.ignoredQueueRequestIds.size > 128) {
+    state.ignoredQueueRequestIds.delete(state.ignoredQueueRequestIds.values().next().value);
+  }
+  state.queueDispatch = null;
+  state.queueRequestIds.clear();
+}
+
+function clearQueuedMessages() {
+  releaseQueueDispatch();
+  state.queueEntries = [];
+  state.steerRequestInputs.clear();
+  renderQueueShelf();
+}
+
+function consumeIgnoredQueueResponse(requestId) {
+  if (!requestId || !state.ignoredQueueRequestIds.has(requestId)) return false;
+  state.ignoredQueueRequestIds.delete(requestId);
+  return true;
+}
+
+function drainQueue() {
+  if (state.running || state.queueDispatch || !state.threadId) return false;
+  const entry = nextQueueEntry(state.queueEntries, state.threadId);
+  if (!entry) return false;
+  const requestId = queueRequestId();
+  state.queueDispatch = { threadId: state.threadId, entryId: entry.id, requestId };
+  state.queueRequestIds.set(requestId, entry.id);
+  updateQueue({ type: "sending", id: entry.id, requestId });
+  const sent = send({
+    type: "sendMessage",
+    requestId,
+    threadId: state.threadId,
+    clientUserMessageId: entry.id,
+    input: entry.input,
+    ...(selectedSettings() || {}),
+  });
+  if (!sent) {
+    state.queueDispatch = null;
+    state.queueRequestIds.delete(requestId);
+    failQueueEntry(entry.id, "WebSocket is not connected.");
+    return false;
+  }
+  return true;
+}
+
+function enqueueFollowUp(input) {
+  if (!state.threadId) {
+    addSystemMessage("Start or resume a thread first.", "error");
+    return false;
+  }
+  const entry = createQueueEntry({
+    threadId: state.threadId,
+    input,
+    displayText: displayInput(input),
+    mode: "followUp",
+  });
+  updateQueue({ type: "enqueue", entry });
+  if (!state.running && !queueDispatchActive()) drainQueue();
+  return true;
+}
+
+function steerCurrentTurn(input) {
+  if (!state.threadId || !state.activeTurnId) {
+    addSystemMessage("There is no steerable active turn.", "warning");
+    return false;
+  }
+  const requestId = queueRequestId();
+  state.steerRequestInputs.set(requestId, input);
+  const sent = send({
+    type: "steerMessage",
+    requestId,
+    threadId: state.threadId,
+    expectedTurnId: state.activeTurnId,
+    clientUserMessageId: requestId,
+    input,
+  });
+  if (!sent) state.steerRequestInputs.delete(requestId);
+  return sent;
+}
+
+function clearComposerInput() {
+  messageInput.value = "";
+  state.mentions = [];
+  state.images = [];
+  renderAttachmentChips();
+  autoSizeComposer();
+  slashPalette.classList.add("hidden");
+  mentionPalette.classList.add("hidden");
+}
+
 function updateControls() {
   const hasThread = Boolean(state.threadId);
-  const canConfigure = state.ready && !state.running;
-  modelSelect.disabled = !state.ready;
-  effortSelect.disabled = !state.ready || !modelSelect.value;
-  tierSelect.disabled = !state.ready || !modelSelect.value;
-  permissionSelect.disabled = !state.ready;
-  newThreadButton.disabled = !canConfigure;
+  const canStart = state.ready && !state.running;
+  const canConfigure = canStart;
+  modelSelect.disabled = !canConfigure;
+  effortSelect.disabled = !canConfigure || !modelSelect.value;
+  collaborationModeSelect.disabled = !canConfigure || !collaborationModeSelect.options.length || collaborationModeSelect.options[0].value === "";
+  tierSelect.disabled = !canConfigure || !modelSelect.value;
+  permissionSelect.disabled = !canConfigure;
+  inspectorModelSelect.disabled = !canConfigure;
+  inspectorEffortSelect.disabled = !canConfigure || !modelSelect.value;
+  inspectorCollaborationModeSelect.disabled = !canConfigure || !collaborationModeSelect.options.length || collaborationModeSelect.options[0].value === "";
+  newThreadButton.disabled = !canStart;
   refreshThreadsButton.disabled = !state.ready || state.threadListLoading;
   loadMoreThreadsButton.disabled = !state.ready || state.threadListLoading;
-  resumeButton.disabled = !canConfigure;
+  resumeButton.disabled = !canStart;
   statusButton.disabled = !state.ready;
-  messageInput.disabled = !hasThread || state.running;
-  sendButton.disabled = !hasThread || state.running;
+  const awaitingUserInput = Boolean(state.userInputRequest);
+  messageInput.disabled = !hasThread || awaitingUserInput;
+  sendButton.disabled = !hasThread || state.running || awaitingUserInput;
   stopButton.disabled = !state.running;
   stopButton.classList.toggle("hidden", !state.running);
   sendButton.classList.toggle("hidden", state.running);
+  steerButton.disabled = !hasThread || !state.running || awaitingUserInput;
+  followUpButton.disabled = !hasThread || !state.running || awaitingUserInput;
+  steerButton.classList.toggle("hidden", !state.running);
+  followUpButton.classList.toggle("hidden", !state.running);
+  if (mentionButton) mentionButton.disabled = !hasThread || awaitingUserInput;
+  if (imageInput) imageInput.disabled = !hasThread || awaitingUserInput;
+  if (attachButton) attachButton.classList.toggle("disabled", !hasThread || awaitingUserInput);
+  renderQueueShelf();
 
   const model = currentModelLabel();
   const effort = displayEffortLabel();
   const tier = currentTierLabel();
-  sessionSummary.textContent = hasThread ? `${model} ${effort}${tier !== "default" ? ` / ${tier}` : ""}` : "No active thread";
+  const mode = currentCollaborationModeLabel();
+  sessionSummary.textContent = hasThread
+    ? `${model} ${effort}${tier !== "default" ? ` / ${tier}` : ""}${mode !== "default" ? ` / ${mode}` : ""}`
+    : "No active thread";
   directorySummary.textContent = currentCwd();
   runStatus.textContent = state.threadStatus || (state.running ? "active" : hasThread ? "idle" : "notLoaded");
   runStatus.className = `pill status-${String(state.threadStatus || "unknown").replace(/[^a-zA-Z]/g, "").toLowerCase()}`;
@@ -636,6 +1020,7 @@ function updateControls() {
 
   const context = contextStats();
   renderContextUsage(context);
+  syncPlanActionVisibility();
 
   threadLabel.textContent = hasThread ? `Thread: ${state.threadId}` : "No active thread";
   state.sessionSettings = createSessionSettings(state.threadMeta, {
@@ -643,10 +1028,13 @@ function updateControls() {
     reasoningEffort: effortSelect.value,
     permissions: permissionSelect.value,
     serviceTier: tierSelect.value,
+    collaborationMode: collaborationModePayload(collaborationModeSelect.value),
     cwd: cwdInput.value,
   });
   copySelectOptions(modelSelect, inspectorModelSelect);
   copySelectOptions(effortSelect, inspectorEffortSelect);
+  copySelectOptions(collaborationModeSelect, inspectorCollaborationModeSelect);
+  inspectorCollaborationModeSelect.value = collaborationModeSelect.value;
   workspaceName.textContent = shortPath(currentCwd());
   workspaceName.parentElement.title = currentCwd() || "Change working directory";
   directorySummary.title = currentCwd() || "Working directory unavailable";
@@ -676,6 +1064,7 @@ function createThreadUiState() {
     expandedCommandGroups: [],
     expandedMcpTools: [],
     expandedCommandOutputs: [],
+    expandedProcesses: [],
     scrollTop: 0,
   };
 }
@@ -777,6 +1166,7 @@ function readThreadUi(threadId) {
       expandedCommandGroups: Array.isArray(stored?.expandedCommandGroups) ? stored.expandedCommandGroups : [],
       expandedMcpTools: Array.isArray(stored?.expandedMcpTools) ? stored.expandedMcpTools : [],
       expandedCommandOutputs: Array.isArray(stored?.expandedCommandOutputs) ? stored.expandedCommandOutputs : [],
+      expandedProcesses: Array.isArray(stored?.expandedProcesses) ? stored.expandedProcesses : [],
     };
   } catch {
     return fallback;
@@ -800,6 +1190,7 @@ function saveThreadUi() {
     expandedCommandGroups: [...state.expandedCommandGroups],
     expandedMcpTools: [...state.expandedMcpTools],
     expandedCommandOutputs: [...state.expandedCommandOutputs],
+    expandedProcesses: [...state.expandedProcesses],
     scrollTop: chat.scrollTop,
   };
   const serialized = JSON.stringify(nextUi);
@@ -829,6 +1220,7 @@ function activateThreadUi(threadId) {
   state.expandedCommandGroups = new Set(state.threadUi.expandedCommandGroups);
   state.expandedMcpTools = new Set(state.threadUi.expandedMcpTools);
   state.expandedCommandOutputs = new Set(state.threadUi.expandedCommandOutputs);
+  state.expandedProcesses = new Set(state.threadUi.expandedProcesses);
   state.activeOutlineMessageId = state.threadUi.activeOutlineMessageId || null;
   setInspectorTab(state.threadUi.rightPanelTab || "outline", false);
 }
@@ -921,6 +1313,126 @@ function renderConversationOutline() {
   observeOutlineMessages();
 }
 
+function deleteRequestId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function openDeleteThreadDialog(thread) {
+  const threadId = String(thread?.id || "").trim();
+  if (!threadId || state.deletingThreadIds.has(threadId)) return;
+  if (threadId === state.threadId && state.running) {
+    addSystemMessage("Stop the active turn before deleting this conversation.", "warning");
+    return;
+  }
+  state.deleteDialogThread = { ...thread, id: threadId };
+  state.deleteDialogThreadId = threadId;
+  deleteThreadDialogTitle.textContent = threadTitle(thread);
+  deleteThreadDialogCwd.textContent = thread.cwd || "Working directory unavailable";
+  deleteThreadDialogCwd.title = thread.cwd || "Working directory unavailable";
+  confirmDeleteThreadButton.disabled = false;
+  deleteThreadDialog.showModal();
+}
+
+function requestDeleteThread(threadOrId) {
+  const threadId = typeof threadOrId === "string"
+    ? threadOrId.trim()
+    : String(threadOrId?.id || "").trim();
+  if (!threadId || state.deletingThreadIds.has(threadId)) return;
+  if (threadId === state.threadId && state.running) {
+    addSystemMessage("Stop the active turn before deleting this conversation.", "warning");
+    return;
+  }
+
+  const requestId = deleteRequestId();
+  state.deletingThreadIds.add(threadId);
+  state.pendingThreadDeletes.set(requestId, threadId);
+  renderThreadList();
+  if (!send({ type: "deleteThread", threadId, requestId })) {
+    state.pendingThreadDeletes.delete(requestId);
+    state.deletingThreadIds.delete(threadId);
+    renderThreadList();
+  }
+}
+
+function removePendingThreadDelete(requestId, threadId = null) {
+  const resolvedRequestId = String(requestId || "").trim();
+  const resolvedThreadId = String(threadId || state.pendingThreadDeletes.get(resolvedRequestId) || "").trim();
+  if (resolvedRequestId) state.pendingThreadDeletes.delete(resolvedRequestId);
+  if (resolvedThreadId) state.deletingThreadIds.delete(resolvedThreadId);
+  return resolvedThreadId;
+}
+
+function clearDeletedThreadBrowserState(threadId) {
+  const id = String(threadId || "").trim();
+  if (!id) return;
+  sessionStorage.removeItem(threadUiStorageKey(id));
+  sessionStorage.removeItem(`codexScroll:${id}`);
+  sessionStorage.removeItem(threadToolStorageKey(id));
+  localStorage.removeItem(collaborationModeStorageKey(id));
+}
+
+function resetActiveThreadAfterDeletion(threadId) {
+  const deletedId = String(threadId || state.threadId || "").trim();
+  clearDeletedThreadBrowserState(deletedId);
+  clearTranscript(false);
+  state.outlineObserver?.disconnect();
+  state.outlineObserver = null;
+  state.outlineNodes.clear();
+  state.activeOutlineNode = null;
+  state.activeOutlineMessageId = null;
+  state.commandItems.clear();
+  state.changeItems.clear();
+  state.threadView = normalizeThread({});
+  state.threadUi = null;
+  state.lastSavedThreadUi = null;
+  state.threadId = null;
+  state.activeTurnId = null;
+  state.running = false;
+  state.threadStatus = "notLoaded";
+  state.threadMeta = {};
+  state.tokenUsage = null;
+  state.tokenUsageThreadId = null;
+  state.latestGuardianDenial = null;
+  state.mcpStartupStatuses = {};
+  state.currentTurn = null;
+  state.latestUserInput = "";
+  state.turnDiff = "";
+  state.latestDiff = "";
+  state.approvals = [];
+  state.navigation = removeThreadFromNavigation(state.navigation, deletedId);
+  state.navigatingHistory = false;
+  state.expandedFileChanges.clear();
+  state.expandedDiffFiles.clear();
+  state.expandedCommands.clear();
+  state.collapsedCommands.clear();
+  state.expandedCommandGroups.clear();
+  state.expandedMcpTools.clear();
+  state.expandedCommandOutputs.clear();
+  state.expandedProcesses.clear();
+  clearQueuedMessages();
+  localStorage.removeItem("codexMathThreadId");
+  threadIdInput.value = "";
+  chat.append(chatEmptyState);
+  renderConversationOutline();
+  renderChangesView();
+  renderCommandsView();
+}
+
+function handleThreadDeleted(payload) {
+  const requestId = String(payload.requestId || "").trim();
+  const threadId = removePendingThreadDelete(requestId, payload.threadId);
+  if (!threadId) return;
+
+  state.threads = removeThreadById(state.threads, threadId);
+  state.navigation = removeThreadFromNavigation(state.navigation, threadId);
+  if (threadId === state.threadId) resetActiveThreadAfterDeletion(threadId);
+  else clearDeletedThreadBrowserState(threadId);
+  renderThreadList();
+  refreshThreadList();
+  updateControls();
+}
+
 function renderThreadList() {
   const filtered = filterThreads(state.threads, threadSearchInput.value);
   threadList.replaceChildren();
@@ -946,12 +1458,16 @@ function renderThreadList() {
       section.append(heading);
 
       for (const thread of group.threads) {
+        const item = document.createElement("div");
+        item.dataset.threadId = thread.id;
+        item.className = `thread-item${thread.id === state.threadId ? " active" : ""}`;
+        item.title = `${threadTitle(thread, 500)}\n${thread.cwd || thread.id}`;
+
         const button = document.createElement("button");
         button.type = "button";
-        button.dataset.threadId = thread.id;
-        button.className = `thread-item${thread.id === state.threadId ? " active" : ""}`;
+        button.className = "thread-item-main";
         button.disabled = state.running;
-        button.title = `${threadTitle(thread, 500)}\n${thread.cwd || thread.id}`;
+        button.title = item.title;
         button.setAttribute("aria-current", thread.id === state.threadId ? "true" : "false");
 
         const title = document.createElement("span");
@@ -960,14 +1476,34 @@ function renderThreadList() {
         const time = document.createElement("time");
         time.className = "thread-item-time";
         time.textContent = formatThreadTime(thread);
-        const preview = document.createElement("span");
-        preview.className = "thread-item-preview";
-        preview.textContent = thread.preview || "No preview";
-        button.append(title, time, preview);
+        const cwd = document.createElement("span");
+        cwd.className = "thread-item-cwd";
+        cwd.textContent = compactThreadCwd(thread.cwd) || "Unknown directory";
+        cwd.title = thread.cwd || "Working directory unavailable";
+        button.append(title, time, cwd);
         button.addEventListener("click", () => {
           if (thread.id !== state.threadId) resumeThread(thread.id);
         });
-        section.append(button);
+
+        const deleteButton = document.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.className = "thread-item-delete icon-button";
+        deleteButton.setAttribute("aria-label", `Delete ${threadTitle(thread)}`);
+        deleteButton.title = "Delete conversation";
+        deleteButton.disabled = state.deletingThreadIds.has(thread.id)
+          || (state.running && thread.id === state.threadId);
+        deleteButton.setAttribute("aria-busy", String(state.deletingThreadIds.has(thread.id)));
+        const deleteIcon = document.createElement("i");
+        deleteIcon.dataset.icon = "trash-2";
+        deleteButton.append(deleteIcon);
+        renderIcons(deleteButton);
+        deleteButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          openDeleteThreadDialog(thread);
+        });
+
+        item.append(button, deleteButton);
+        section.append(item);
       }
       threadList.append(section);
     }
@@ -982,11 +1518,19 @@ function renderThreadList() {
 }
 
 function syncThreadListControls() {
-  for (const button of threadList.querySelectorAll(".thread-item")) {
-    const active = button.dataset.threadId === state.threadId;
+  for (const button of threadList.querySelectorAll(".thread-item-main")) {
+    const item = button.closest(".thread-item");
+    const threadId = item?.dataset.threadId || "";
+    const active = threadId === state.threadId;
     button.disabled = state.running;
-    button.classList.toggle("active", active);
+    item?.classList.toggle("active", active);
     button.setAttribute("aria-current", String(active));
+    const deleteButton = item?.querySelector(".thread-item-delete");
+    if (deleteButton) {
+      deleteButton.disabled = state.deletingThreadIds.has(threadId)
+        || (state.running && active);
+      deleteButton.setAttribute("aria-busy", String(state.deletingThreadIds.has(threadId)));
+    }
   }
 }
 
@@ -1052,6 +1596,81 @@ function clearStreamingTail(record) {
   record.streamTailNodes = [];
 }
 
+function processKey(turnId = state.activeTurnId) {
+  return `${state.threadId || "thread"}:${turnId || "turn"}`;
+}
+
+function updateProcessSummary(record) {
+  if (!record) return;
+  const count = record.itemIds.size;
+  const toolCount = [...record.itemIds].filter((id) => state.toolNodes.get(id)).length;
+  const durations = [...record.itemIds]
+    .map((id) => state.toolNodes.get(id)?.item?.durationMs)
+    .map(Number)
+    .filter((value) => Number.isFinite(value) && value >= 0);
+  const duration = durations.length ? durations.reduce((sum, value) => sum + value, 0) : null;
+  const parts = [`Process details`, `${count} item${count === 1 ? "" : "s"}`];
+  if (toolCount) parts.push(`${toolCount} tool${toolCount === 1 ? "" : "s"}`);
+  if (duration !== null) parts.push(durationLabel(duration));
+  record.summaryText.textContent = parts.join(" · ");
+}
+
+function ensureProcessDetails(turnId = state.activeTurnId, container = chat) {
+  const key = processKey(turnId);
+  let record = state.processNodes.get(key);
+  if (record) return record;
+  const details = document.createElement("details");
+  details.className = "process-details";
+  details.dataset.processKey = key;
+  const summary = document.createElement("summary");
+  summary.className = "process-details-summary";
+  const chevron = document.createElement("span");
+  chevron.className = "process-details-chevron";
+  chevron.textContent = "›";
+  const summaryText = document.createElement("span");
+  summaryText.className = "process-details-text";
+  const body = document.createElement("div");
+  body.className = "process-details-body";
+  summary.append(chevron, summaryText);
+  details.append(summary, body);
+  record = { key, turnId, details, summary, summaryText, body, itemIds: new Set() };
+  details.open = state.expandedProcesses.has(key);
+  details.addEventListener("toggle", () => {
+    if (details.open) state.expandedProcesses.add(key);
+    else state.expandedProcesses.delete(key);
+    saveThreadUi();
+  });
+  (container || chat).append(details);
+  state.processNodes.set(key, record);
+  updateProcessSummary(record);
+  return record;
+}
+
+function registerProcessItem(item, record = null) {
+  if (!item?.id) return record;
+  const process = record || ensureProcessDetails(item.turnId || state.activeTurnId);
+  process.itemIds.add(item.id);
+  updateProcessSummary(process);
+  return process;
+}
+
+function promoteAssistantAnswer(record) {
+  if (!record?.article || !record.process) return;
+  if (record.article.parentElement === record.process.body) chat.append(record.article);
+  record.process.itemIds.delete(record.id);
+  updateProcessSummary(record.process);
+  record.process = null;
+}
+
+function promoteLatestAssistantAnswer(turnId = state.currentTurn?.id || state.activeTurnId) {
+  const records = [...state.messageNodes.values()].filter((record) => {
+    if (record.role !== "assistant") return false;
+    if (!turnId) return true;
+    return record.turnId === turnId || record.process?.turnId === turnId;
+  });
+  promoteAssistantAnswer(records.at(-1));
+}
+
 function renderStreamingMessage(record) {
   const raw = record.raw;
   const stableEnd = findStableMarkdownBoundary(raw, record.streamPrefixLength);
@@ -1109,7 +1728,17 @@ function scheduleRender(record) {
 
 function ensureMessage(id, role, meta = {}) {
   let record = state.messageNodes.get(id);
-  if (record) return record;
+  if (record) {
+    if (meta.turnId && !record.turnId) record.turnId = meta.turnId;
+    if (role === "assistant" && meta.process === true && !record.process) {
+      const process = ensureProcessDetails(meta.turnId ?? state.activeTurnId ?? record.turnId);
+      process.body.append(record.article);
+      process.itemIds.add(record.id);
+      record.process = process;
+      updateProcessSummary(process);
+    }
+    return record;
+  }
 
   $("#chatEmptyState")?.remove();
   const article = document.createElement("article");
@@ -1141,7 +1770,11 @@ function ensureMessage(id, role, meta = {}) {
   copy.addEventListener("click", () => navigator.clipboard.writeText(record?.raw || ""));
   head.append(avatar, label, time, copy);
   article.append(head, content);
-  chat.append(article);
+  const turnId = meta.turnId ?? state.activeTurnId ?? state.currentTurn?.id;
+  const process = role === "assistant" && meta.process !== false && (meta.live !== false ? meta.process !== false : meta.process === true)
+    ? ensureProcessDetails(turnId)
+    : null;
+  (process?.body || chat).append(article);
   renderIcons(head);
 
   record = {
@@ -1156,9 +1789,15 @@ function ensureMessage(id, role, meta = {}) {
     streamPrefixLength: 0,
     streamNeedsFinalRender: false,
     streamTailNodes: [],
+    process,
+    turnId,
   };
   state.messageNodes.set(id, record);
-  if (meta.live !== false) state.conversationOrder.push({ kind: "barrier", id, turnId: meta.turnId ?? state.activeTurnId ?? null });
+  if (process) {
+    process.itemIds.add(id);
+    updateProcessSummary(process);
+  }
+  if (meta.live !== false) state.conversationOrder.push({ kind: "barrier", id, turnId: turnId ?? null });
   if (role === "user" && !meta.deferOutline) renderConversationOutline();
   return record;
 }
@@ -1184,6 +1823,140 @@ function toolTitle(item) {
     default:
       return item.type || "Tool event";
   }
+}
+
+function searchQuery(item) {
+  const action = item?.action;
+  const queries = Array.isArray(action?.queries) ? action.queries : [];
+  const value = item?.query || action?.query || queries[0] || "";
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function searchStepTitle(item, isActive) {
+  if (item?.type === "webSearch") return isActive ? "Searching web..." : "Web search";
+  return isActive ? "Searching files..." : "File search";
+}
+
+function searchResultText(item) {
+  const value = item?.results ?? item?.result ?? item?.output ?? item?.response ?? item?.aggregatedOutput;
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value, null, 2); } catch { return "[unserializable search result]"; }
+}
+
+function renderSearchDetails(record) {
+  if (!record.card.open) {
+    record.body.replaceChildren();
+    return;
+  }
+  record.body.replaceChildren();
+  const queryLabel = document.createElement("div");
+  queryLabel.className = "search-step-detail-label";
+  queryLabel.textContent = "Query";
+  const query = document.createElement("pre");
+  query.className = "search-step-detail-value";
+  query.textContent = record.rawQuery || "(empty query)";
+  record.body.append(queryLabel, query);
+  const statusLabel = document.createElement("div");
+  statusLabel.className = "search-step-detail-label";
+  statusLabel.textContent = "Status";
+  const status = document.createElement("pre");
+  status.className = "search-step-detail-value search-step-status-detail";
+  const normalizedStatus = normalizeToolStatus(record.item?.status);
+  status.textContent = record.statusLabel || normalizedStatus.label;
+  record.body.append(statusLabel, status);
+  if (record.resultText) {
+    const resultLabel = document.createElement("div");
+    resultLabel.className = "search-step-detail-label";
+    resultLabel.textContent = "Results";
+    const results = document.createElement("pre");
+    results.className = "search-step-detail-value search-step-results";
+    results.textContent = record.resultText;
+    record.body.append(resultLabel, results);
+  }
+}
+
+function updateSearchStep(item, options = {}) {
+  if (!item?.id || item.type !== "webSearch") return null;
+  let record = state.searchNodes.get(item.id);
+  if (!record) {
+    const card = document.createElement("details");
+    card.className = "search-step";
+    card.dataset.itemId = item.id;
+    const summary = document.createElement("summary");
+    summary.className = "search-step-summary";
+    const tool = document.createElement("span");
+    tool.className = "search-step-tool search-step-title";
+    tool.textContent = "web_search";
+    const query = document.createElement("span");
+    query.className = "search-step-query";
+    const duration = document.createElement("span");
+    duration.className = "search-step-duration";
+    const status = document.createElement("span");
+    status.className = "search-step-status";
+    status.setAttribute("role", "status");
+    const chevron = document.createElement("span");
+    chevron.className = "search-step-chevron command-step-chevron";
+    chevron.textContent = "›";
+    chevron.setAttribute("aria-hidden", "true");
+    // Keep the summary's reading order stable: tool, raw input, duration,
+    // status, then the disclosure arrow.
+    summary.append(tool, query, duration, status, chevron);
+    const body = document.createElement("div");
+    body.className = "search-step-body";
+    card.append(summary, body);
+    const target = options.container || (options.process === true || options.live !== false
+      ? ensureProcessDetails(options.turnId || item.turnId || state.activeTurnId).body
+      : chat);
+    target.append(card);
+    record = {
+      kind: "search",
+      card,
+      summary,
+      tool,
+      title: tool,
+      query,
+      duration,
+      status,
+      chevron,
+      body,
+      item,
+      rawQuery: "",
+      resultText: "",
+    };
+    state.searchNodes.set(item.id, record);
+    card.addEventListener("toggle", () => {
+      renderSearchDetails(record);
+      scrollToBottom();
+    });
+    if (options.process === true || options.live !== false) registerProcessItem(item);
+  }
+  record.item = item;
+  const normalizedStatus = normalizeToolStatus(item.status || (options.active ? "inProgress" : "completed"));
+  const isActive = options.active ?? normalizedStatus.isActive;
+  const query = searchQuery(item);
+  if (isActive && !state.commandObservedStartMs.has(item.id)) state.commandObservedStartMs.set(item.id, Date.now());
+  if (!isActive && state.commandObservedStartMs.has(item.id)) record.finishedAtMs ||= Date.now();
+  const durationMs = toolDurationMs(item, record);
+  record.rawQuery = query;
+  record.resultText = searchResultText(item);
+  record.active = isActive;
+  record.card.dataset.status = normalizedStatus.kind;
+  record.card.classList.toggle("search-step-running", isActive);
+  record.tool.textContent = "web_search";
+  record.title.textContent = "web_search";
+  record.query.textContent = toolInputPreview(item, { maxLength: 180 }) || "(empty query)";
+  record.query.title = query || "(empty query)";
+  record.duration.textContent = durationLabel(durationMs);
+  record.status.textContent = "";
+  record.status.setAttribute("aria-label", normalizedStatus.label);
+  record.status.dataset.label = normalizedStatus.label;
+  record.status.dataset.kind = normalizedStatus.kind;
+  record.statusLabel = normalizedStatus.label;
+  if (record.card.open) renderSearchDetails(record);
+  ensureCommandDurationTimer();
+  updateProcessSummary(record.process);
+  return record;
 }
 
 function filePathParts(filePath) {
@@ -1223,10 +1996,11 @@ function ensureCommandDurationTimer() {
   if (state.commandDurationTimer) return;
   state.commandDurationTimer = setInterval(() => {
     let active = false;
-    for (const record of state.toolNodes.values()) {
-      if (record.kind !== "command") continue;
+    const records = [...state.toolNodes.values(), ...state.searchNodes.values()];
+    for (const record of records) {
+      if (record.kind !== "command" && record.kind !== "search") continue;
       const status = normalizeToolStatus(record.item?.status);
-      if (!status.isActive) continue;
+      if (!status.isActive && !record.active) continue;
       active = true;
       const duration = toolDurationMs(record.item, record);
       if (Number.isFinite(duration)) record.duration.textContent = durationLabel(duration);
@@ -1250,7 +2024,7 @@ function rememberToolStart(item, record) {
 }
 
 function setCommandPersistence(record, open) {
-  const defaultOpen = ["running", "failed"].includes(normalizeToolStatus(record.item?.status).kind);
+  const defaultOpen = false;
   if (open) {
     state.expandedCommands.add(record.item.id);
     state.collapsedCommands.delete(record.item.id);
@@ -1268,8 +2042,9 @@ function setMcpPersistence(record, open) {
 }
 
 function commandDefaultOpen(item) {
-  const status = normalizeToolStatus(item?.status);
-  return status.kind === "running" || status.kind === "failed";
+  // Process details and individual tool rows start collapsed for every
+  // status. The status color and duration remain visible in the summary.
+  return false;
 }
 
 function appendCommandField(container, label, value, className = "command-step-field") {
@@ -1303,9 +2078,11 @@ function createCommandStep(item, container = chat) {
   environment.className = "command-step-environment";
   const status = document.createElement("span");
   status.className = "command-step-status";
+  status.setAttribute("role", "status");
   const duration = document.createElement("span");
   duration.className = "command-step-duration";
-  summary.append(chevron, summaryText, environment, status, duration);
+  // The collapsed row reads as tool, raw input, duration, status, arrow.
+  summary.append(environment, summaryText, duration, status, chevron);
 
   const body = document.createElement("div");
   body.className = "command-step-body";
@@ -1313,6 +2090,8 @@ function createCommandStep(item, container = chat) {
   meta.className = "command-step-meta";
   const cwd = document.createElement("span");
   const exit = document.createElement("span");
+  const statusDetail = document.createElement("span");
+  statusDetail.className = "command-step-status-detail";
   const raw = document.createElement("pre");
   raw.className = "command-raw";
   raw.title = "Raw command";
@@ -1330,7 +2109,7 @@ function createCommandStep(item, container = chat) {
   fullOutput.className = "command-output-full";
   outputDetails.append(outputSummary, fullOutput);
   outputBlock.append(outputHint, outputTail, outputDetails);
-  meta.append(cwd, exit);
+  meta.append(cwd, exit, statusDetail);
   body.append(meta, raw, outputBlock);
   details.append(summary, body);
 
@@ -1346,6 +2125,7 @@ function createCommandStep(item, container = chat) {
     meta,
     cwd,
     exit,
+    statusDetail,
     raw,
     outputBlock,
     outputHint,
@@ -1389,23 +2169,33 @@ function patchCommandStep(record, item) {
   record.details.dataset.status = model.normalizedStatus.kind;
   record.details.classList.toggle("command-step-running", model.normalizedStatus.isActive);
   record.details.classList.toggle("command-step-failed", model.normalizedStatus.isFailure);
-  record.summaryText.textContent = model.summary;
-  record.summaryText.title = model.displayCommand || model.rawCommand || "Command";
-  record.environment.textContent = model.environmentLabel;
-  record.status.textContent = model.normalizedStatus.label;
+  record.summaryText.textContent = model.inputPreview || model.rawCommand || model.summary;
+  record.summaryText.title = model.rawCommand || model.inputPreview || "Tool input";
+  const displayToolName = item.type === "commandExecution"
+    ? model.toolName
+    : item.toolName || model.toolName || (item.type === "read" ? "read" : item.type === "webSearch" ? "web_search" : "bash");
+  record.environment.textContent = displayToolName;
+  record.status.textContent = "";
+  record.status.setAttribute("aria-label", model.normalizedStatus.label);
+  record.status.dataset.label = model.normalizedStatus.label;
   record.status.dataset.kind = model.normalizedStatus.kind;
+  record.statusDetail.textContent = `Status: ${model.normalizedStatus.label}`;
   record.duration.textContent = durationLabel(durationMs);
   record.cwd.textContent = `cwd: ${item.cwd || "--"}`;
   record.cwd.title = item.cwd || "--";
   record.exit.textContent = `exit: ${item.exitCode ?? "--"}`;
-  record.raw.textContent = model.rawCommand || "(empty command)";
-  record.raw.title = model.rawCommand || "Raw command";
+  record.raw.textContent = model.rawCommand || model.inputPreview || "(empty input)";
+  record.raw.title = model.rawCommand || model.inputPreview || "Raw tool input";
   const output = item.aggregatedOutput || "";
   const lineCount = countOutputLines(output);
   const tailLimit = model.normalizedStatus.isFailure ? 18 : model.normalizedStatus.isActive ? 5 : 5;
   const tail = tailOutputLines(output, tailLimit).join("\n");
-  record.outputBlock.hidden = !output;
-  record.outputHint.textContent = output ? `${model.normalizedStatus.isActive ? "Recent" : "Output"} · ${lineCount} line${lineCount === 1 ? "" : "s"}` : "";
+  const searching = model.category === "search" && model.normalizedStatus.isActive;
+  record.outputBlock.hidden = !output && !searching;
+  record.outputHint.textContent = output
+    ? `${model.normalizedStatus.isActive ? "Recent" : "Output"} · ${lineCount} line${lineCount === 1 ? "" : "s"}`
+    : searching ? "Searching..." : "";
+  record.outputTail.hidden = !output;
   record.outputTail.textContent = tail;
   record.outputDetails.hidden = !output;
   if (record.outputDetails.open) record.fullOutput.textContent = output;
@@ -1413,6 +2203,7 @@ function patchCommandStep(record, item) {
     record.details.open = false;
   }
   if (model.normalizedStatus.isFailure) record.details.classList.add("command-step-failed");
+  updateProcessSummary(record.process);
 }
 
 function mcpPayload(item) {
@@ -1447,9 +2238,10 @@ function createMcpStep(item, container = chat) {
   environment.textContent = "MCP";
   const status = document.createElement("span");
   status.className = "command-step-status";
+  status.setAttribute("role", "status");
   const duration = document.createElement("span");
   duration.className = "command-step-duration";
-  summary.append(chevron, title, environment, status, duration);
+  summary.append(environment, title, duration, status, chevron);
   const body = document.createElement("div");
   body.className = "mcp-step-body";
   details.append(summary, body);
@@ -1472,8 +2264,13 @@ function patchMcpStep(record, item) {
   record.item = item;
   const normalizedStatus = normalizeToolStatus(item.status);
   record.details.dataset.status = normalizedStatus.kind;
-  record.title.textContent = `MCP · ${item.server || "server"} / ${item.tool || "tool"}`;
-  record.status.textContent = normalizedStatus.label;
+  const model = presentTool(item, { maxLength: 180 });
+  record.environment.textContent = "mcp";
+  record.title.textContent = model.inputPreview || `${item.server || "server"} / ${item.tool || "tool"}`;
+  record.title.title = model.rawInput || "MCP input";
+  record.status.textContent = "";
+  record.status.setAttribute("aria-label", normalizedStatus.label);
+  record.status.dataset.label = normalizedStatus.label;
   record.status.dataset.kind = normalizedStatus.kind;
   record.duration.textContent = durationLabel(item.durationMs);
   record.body.replaceChildren();
@@ -1481,6 +2278,7 @@ function patchMcpStep(record, item) {
   meta.className = "mcp-step-meta";
   appendCommandField(meta, "server", item.server || "--", "mcp-step-field");
   appendCommandField(meta, "tool", item.tool || "--", "mcp-step-field");
+  appendCommandField(meta, "Status", normalizedStatus.label, "mcp-step-field");
   record.body.append(meta);
   for (const field of mcpPayload(item)) {
     const label = document.createElement("div");
@@ -1491,6 +2289,7 @@ function patchMcpStep(record, item) {
     value.textContent = field.text;
     record.body.append(label, value);
   }
+  updateProcessSummary(record.process);
 }
 
 function registerConversationTool(record, options = {}) {
@@ -1594,6 +2393,10 @@ function maybeGroupLiveCommand(record, item) {
 function ensureTool(item, options = {}) {
   let record = state.toolNodes.get(item.id);
   if (record) return record;
+  const process = options.process === true || (options.process !== false && options.live !== false)
+    ? ensureProcessDetails(options.turnId ?? item.turnId ?? state.activeTurnId)
+    : null;
+  const targetContainer = options.container || process?.body || chat;
   if (item.type === "fileChange") {
     const card = document.createElement("section");
     card.className = "tool-card file-change-card";
@@ -1604,8 +2407,8 @@ function ensureTool(item, options = {}) {
     const body = document.createElement("div");
     body.className = "file-change-body";
     card.append(toggle, body);
-    (options.container || chat).append(card);
-    record = { kind: "fileChange", details: card, summary: toggle, body, item, fileList: null, normalizedFiles: null };
+    targetContainer.append(card);
+    record = { kind: "fileChange", details: card, summary: toggle, body, item, fileList: null, normalizedFiles: null, process };
     toggle.addEventListener("click", () => {
       const currentItem = record.item || item;
       setFileChangeExpanded(record, currentItem, !state.expandedFileChanges.has(currentItem.id));
@@ -1613,13 +2416,16 @@ function ensureTool(item, options = {}) {
       toggle.setAttribute("aria-expanded", String(state.expandedFileChanges.has(currentItem.id)));
     });
     state.toolNodes.set(item.id, record);
+    if (process) registerProcessItem(item, process);
     registerConversationTool(record, options);
     renderToolFileChange(record, item);
     return record;
   }
-  if (item.type === "mcpToolCall") record = createMcpStep(item, options.container || chat);
-  else record = createCommandStep(item, options.container || chat);
+  if (item.type === "mcpToolCall") record = createMcpStep(item, targetContainer);
+  else record = createCommandStep(item, targetContainer);
+  record.process = process;
   state.toolNodes.set(item.id, record);
+  if (process) registerProcessItem(item, process);
   registerConversationTool(record, options);
   return record;
 }
@@ -1975,18 +2781,184 @@ function renderCommandsView() {
   }
 }
 
-function removeApproval(requestId) {
-  state.approvals = state.approvals.filter((entry) => String(entry.id) !== String(requestId));
+function planStepMarker(status) {
+  if (status === "completed") return "✓";
+  if (status === "inProgress") return "●";
+  if (status === "pending") return "○";
+  return "?";
 }
 
-function addApproval(message) {
-  const { id, method, params = {} } = message;
-  state.approvals.push(message);
+function renderPlanCard(snapshot, { text = "", key = null, live = true } = {}) {
+  const resolvedKey = key || planSnapshotKey(snapshot?.threadId || state.threadId, snapshot?.turnId || state.activeTurnId);
+  let record = state.planNodes.get(resolvedKey);
+  if (!record) {
+    const card = document.createElement("section");
+    card.className = "plan-card";
+    card.dataset.planKey = resolvedKey;
+    const head = document.createElement("div");
+    head.className = "plan-card-head";
+    const mark = document.createElement("span");
+    mark.className = "plan-card-mark";
+    mark.textContent = "C";
+    const title = document.createElement("strong");
+    title.className = "plan-card-title";
+    title.textContent = "Updated Plan";
+    const turn = document.createElement("span");
+    turn.className = "plan-card-turn";
+    head.append(mark, title, turn);
+    const explanation = document.createElement("div");
+    explanation.className = "plan-card-explanation";
+    const body = document.createElement("div");
+    body.className = "plan-card-body";
+    body.setAttribute("aria-live", "polite");
+    const actions = document.createElement("div");
+    actions.className = "plan-card-actions";
+    const implement = document.createElement("button");
+    implement.type = "button";
+    implement.className = "plan-card-action hidden";
+    implement.title = "Switch to Default mode and implement this plan";
+    const icon = document.createElement("i");
+    icon.dataset.icon = "play";
+    implement.append(icon, document.createTextNode("Implement plan"));
+    implement.addEventListener("click", () => implementPlan(resolvedKey));
+    actions.append(implement);
+    card.append(head, explanation, body, actions);
+    chat.append(card);
+    renderIcons(card);
+    record = { card, turn, explanation, body, actions, implement, text: "", key: resolvedKey, live };
+    state.planNodes.set(resolvedKey, record);
+    state.conversationOrder.push({ kind: "barrier", turnId: snapshot?.turnId || state.activeTurnId, planKey: resolvedKey });
+  }
+
+  if (live) state.latestPlanKey = resolvedKey;
+  record.live ||= live;
+
+  record.turn.textContent = snapshot?.turnId ? `Turn ${String(snapshot.turnId).slice(0, 8)}` : "";
+  record.explanation.textContent = snapshot?.explanation || "";
+  record.explanation.classList.toggle("hidden", !snapshot?.explanation);
+  record.body.replaceChildren();
+  const steps = Array.isArray(snapshot?.steps) ? snapshot.steps : [];
+  if (steps.length) {
+    const list = document.createElement("ol");
+    list.className = "plan-step-list";
+    for (const step of steps) {
+      const row = document.createElement("li");
+      row.className = `plan-step plan-step-${step.status || "unknown"}`;
+      const marker = document.createElement("span");
+      marker.className = "plan-step-marker";
+      marker.textContent = planStepMarker(step.status);
+      marker.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.className = "plan-step-label";
+      label.textContent = step.step;
+      row.append(marker, label);
+      list.append(row);
+    }
+    record.body.append(list);
+  } else if (text) {
+    const fallback = document.createElement("div");
+    fallback.className = "plan-card-fallback markdown-body";
+    renderMarkdown(fallback, text, { preserveLineBreaks: true });
+    record.body.append(fallback);
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "plan-card-empty";
+    empty.textContent = "Plan details are not available yet.";
+    record.body.append(empty);
+  }
+  record.text = text;
+  record.card.dataset.stepCount = String(steps.length);
+  syncPlanActionVisibility();
+  if (live) scrollToBottom();
+  return record;
+}
+
+function upsertPlanSnapshot(params) {
+  const snapshot = normalizePlanSnapshot(params, {
+    threadId: state.threadId,
+    turnId: state.activeTurnId,
+  });
+  const key = planSnapshotKey(snapshot.threadId || state.threadId, snapshot.turnId || state.activeTurnId);
+  state.planSnapshots.set(key, snapshot);
+  renderPlanCard(snapshot, { key });
+}
+
+function syncPlanActionVisibility() {
+  for (const [key, record] of state.planNodes) {
+    if (!record.implement) continue;
+    const available = key === state.latestPlanKey && canImplementPlan({
+      mode: currentCollaborationModeLabel(),
+      running: state.running,
+      turnStatus: state.currentTurn?.status,
+      hasPlan: true,
+    });
+    record.implement.classList.toggle("hidden", !available);
+    record.implement.disabled = !available;
+  }
+}
+
+function implementPlan(planKey) {
+  if (planKey !== state.latestPlanKey || !state.threadId) return;
+  if (!canImplementPlan({
+    mode: currentCollaborationModeLabel(),
+    running: state.running,
+    turnStatus: state.currentTurn?.status,
+    hasPlan: state.planNodes.has(planKey),
+  })) return;
+  if (!setCollaborationMode("default")) return;
+  sendComposedMessage([{ type: "text", text: PLAN_IMPLEMENTATION_PROMPT }], selectedSettings());
+}
+
+function syncApprovalAreaPosition() {
+  if (!composer) return;
+  const marginBottom = Number.parseFloat(window.getComputedStyle(composer).marginBottom) || 0;
+  const offset = Math.ceil(composer.getBoundingClientRect().height + marginBottom + 12);
+  approvalArea.style.setProperty("--approval-bottom", `${offset}px`);
+}
+
+function syncApprovalQueueMeta(card) {
+  const queue = card.querySelector("[data-approval-queue]");
+  if (!queue) return;
+  const waiting = Math.max(0, state.approvals.length - 1);
+  queue.textContent = waiting ? `${waiting} more waiting` : "";
+  queue.classList.toggle("hidden", !waiting);
+}
+
+function renderApprovalQueue() {
+  const request = currentApproval(state.approvals);
+  const current = approvalArea.querySelector(".approval-card");
+  if (!request || state.userInputRequest) {
+    current?.remove();
+    return;
+  }
+  if (current?.dataset.requestId === String(request.id)) {
+    syncApprovalQueueMeta(current);
+    return;
+  }
+
+  current?.remove();
+  const { id, method, params = {} } = request;
   const card = document.createElement("section");
   card.className = "approval-card";
   card.dataset.requestId = String(id);
+  card.setAttribute("role", "dialog");
+  card.setAttribute("aria-label", method.includes("fileChange") ? "Codex requests a file change" : "Codex requests an operation");
+
+  const head = document.createElement("div");
+  head.className = "approval-card-head";
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "approval-card-title";
+  const kicker = document.createElement("span");
+  kicker.className = "eyebrow";
+  kicker.textContent = "APPROVAL REQUIRED";
   const title = document.createElement("strong");
   title.textContent = method.includes("fileChange") ? "Codex requests a file change" : "Codex requests an operation";
+  titleWrap.append(kicker, title);
+  const queue = document.createElement("span");
+  queue.className = "approval-card-queue";
+  queue.dataset.approvalQueue = "true";
+  head.append(titleWrap, queue);
+
   const description = document.createElement("pre");
   description.textContent = params.command || params.reason || JSON.stringify(params, null, 2);
   const actions = document.createElement("div");
@@ -1998,14 +2970,280 @@ function addApproval(message) {
     button.textContent = label;
     if (decision === "decline") button.className = "secondary";
     button.addEventListener("click", () => {
-      send({ type: "approval", requestId: id, decision });
+      if (!send({ type: "approval", requestId: id, decision })) return;
       removeApproval(id);
-      card.remove();
     });
     actions.append(button);
   }
-  card.append(title, description, actions);
+  card.append(head, description, actions);
   approvalArea.append(card);
+  syncApprovalQueueMeta(card);
+}
+
+function removeApproval(requestId) {
+  state.approvals = removeQueuedApproval(state.approvals, requestId);
+  renderApprovalQueue();
+}
+
+function clearUserInputRequest() {
+  state.userInputRequest = resetUserInputRequest(state.userInputRequest);
+  approvalArea.querySelector(".user-input-card")?.remove();
+  approvalArea.classList.remove("has-user-input");
+  renderApprovalQueue();
+}
+
+function currentUserInputQuestion(request) {
+  return request?.questions?.[request.index] || null;
+}
+
+function userInputAnswerFromCard(card) {
+  const selectedOption = card.querySelector("input[data-user-input-option]:checked");
+  const selectedOther = card.querySelector("input[data-user-input-other]:checked");
+  const textInput = card.querySelector("[data-user-input-text]");
+  if (selectedOption) return { type: "option", value: selectedOption.dataset.userInputOption };
+  if (selectedOther || textInput) return { type: "text", value: textInput?.value || "" };
+  return null;
+}
+
+function captureUserInputAnswer(card) {
+  const request = state.userInputRequest;
+  const question = currentUserInputQuestion(request);
+  if (!request || !question || !card) return null;
+  const answer = userInputAnswerFromCard(card);
+  if (answer) request.answers.set(question.id, answer);
+  else request.answers.delete(question.id);
+  return answer;
+}
+
+function setUserInputError(card, message = "") {
+  const error = card.querySelector(".user-input-error");
+  if (!error) return;
+  error.textContent = message;
+  error.classList.toggle("hidden", !message);
+}
+
+function syncUserInputCard(card) {
+  const request = state.userInputRequest;
+  const question = currentUserInputQuestion(request);
+  if (!request || !question || !card) return;
+  const progress = card.querySelector(".user-input-progress");
+  const answered = countUserInputAnswers(request.questions, request.answers);
+  if (progress) progress.textContent = `Question ${request.index + 1} / ${request.questions.length} · ${answered}/${request.questions.length} answered`;
+  const next = card.querySelector("[data-user-input-next]");
+  if (next) next.disabled = !isUserInputAnswerComplete(question, request.answers.get(question.id));
+}
+
+function userInputChoice(request, question, option, { other = false } = {}) {
+  const row = document.createElement("label");
+  row.className = "user-input-choice";
+  const radio = document.createElement("input");
+  radio.type = "radio";
+  radio.name = `user-input-${String(request.requestId)}-${question.id}`;
+  if (other) {
+    radio.dataset.userInputOther = "true";
+    radio.value = USER_INPUT_OTHER;
+  } else {
+    radio.dataset.userInputOption = option.label;
+    radio.value = option.label;
+  }
+  const answer = request.answers.get(question.id);
+  radio.checked = other ? answer?.type === "text" : answer?.type === "option" && answer.value === option.label;
+  const copy = document.createElement("span");
+  copy.className = "user-input-choice-copy";
+  const label = document.createElement("strong");
+  label.textContent = other ? (question.isSecret ? "Private answer" : "Other") : option.label;
+  copy.append(label);
+  if (!other && option.description) {
+    const description = document.createElement("span");
+    description.textContent = option.description;
+    copy.append(description);
+  }
+  row.append(radio, copy);
+  return { row, radio };
+}
+
+function renderUserInputCard() {
+  const request = state.userInputRequest;
+  const question = currentUserInputQuestion(request);
+  const existing = approvalArea.querySelector(".user-input-card");
+  existing?.remove();
+  if (!request || !question) {
+    approvalArea.classList.remove("has-user-input");
+    renderApprovalQueue();
+    return;
+  }
+
+  approvalArea.classList.add("has-user-input");
+  approvalArea.querySelector(".approval-card")?.remove();
+  const card = document.createElement("section");
+  card.className = "user-input-card";
+  card.dataset.requestId = String(request.requestId);
+  card.setAttribute("aria-live", "polite");
+
+  const head = document.createElement("div");
+  head.className = "user-input-card-head";
+  const title = document.createElement("div");
+  title.className = "user-input-card-title";
+  const eyebrow = document.createElement("span");
+  eyebrow.className = "eyebrow";
+  eyebrow.textContent = "NEED YOUR INPUT";
+  const heading = document.createElement("strong");
+  heading.textContent = question.header || "Question";
+  title.append(eyebrow, heading);
+  const progress = document.createElement("span");
+  progress.className = "user-input-progress";
+  head.append(title, progress);
+  card.append(head);
+
+  const prompt = document.createElement("p");
+  prompt.className = "user-input-question";
+  prompt.textContent = question.question || "Please provide an answer.";
+  card.append(prompt);
+
+  const choices = document.createElement("div");
+  choices.className = "user-input-choices";
+  const textChoice = question.options.length && (question.isOther || question.isSecret);
+  for (const option of question.options) {
+    const choice = userInputChoice(request, question, option);
+    choices.append(choice.row);
+    choice.radio.addEventListener("change", () => {
+      request.answers.set(question.id, { type: "option", value: option.label });
+      if (textInput) textInput.hidden = true;
+      setUserInputError(card);
+      syncUserInputCard(card);
+    });
+  }
+
+  let textInput = null;
+  if (textChoice) {
+    const choice = userInputChoice(request, question, null, { other: true });
+    choices.append(choice.row);
+    choice.radio.addEventListener("change", () => {
+      request.answers.set(question.id, { type: "text", value: textInput?.value || "" });
+      if (textInput) {
+        textInput.hidden = false;
+        textInput.focus();
+      }
+      setUserInputError(card);
+      syncUserInputCard(card);
+    });
+  }
+  if (question.options.length) card.append(choices);
+
+  if (!question.options.length || textChoice) {
+    textInput = document.createElement("input");
+    textInput.type = question.isSecret ? "password" : "text";
+    textInput.className = "user-input-text";
+    textInput.dataset.userInputText = "true";
+    textInput.placeholder = question.isSecret ? "Enter a private answer" : "Type your answer";
+    textInput.autocomplete = question.isSecret ? "new-password" : "off";
+    textInput.spellcheck = !question.isSecret;
+    const answer = request.answers.get(question.id);
+    textInput.value = answer?.type === "text" ? answer.value : "";
+    textInput.hidden = Boolean(textChoice && answer?.type !== "text");
+    textInput.addEventListener("input", () => {
+      request.answers.set(question.id, { type: "text", value: textInput.value });
+      setUserInputError(card);
+      syncUserInputCard(card);
+    });
+    card.append(textInput);
+  }
+
+  const error = document.createElement("p");
+  error.className = "user-input-error hidden";
+  error.setAttribute("role", "alert");
+  card.append(error);
+
+  const actions = document.createElement("div");
+  actions.className = "user-input-actions";
+  const previous = document.createElement("button");
+  previous.type = "button";
+  previous.className = "secondary-button";
+  previous.disabled = request.index === 0;
+  previous.setAttribute("aria-label", "Previous question");
+  previous.textContent = "Previous";
+  const previousIcon = document.createElement("i");
+  previousIcon.dataset.icon = "chevron-left";
+  previous.prepend(previousIcon);
+  previous.addEventListener("click", () => {
+    captureUserInputAnswer(card);
+    request.index -= 1;
+    renderUserInputCard();
+  });
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "user-input-submit";
+  next.dataset.userInputNext = "true";
+  next.textContent = request.index === request.questions.length - 1 ? "Submit" : "Next";
+  const nextIcon = document.createElement("i");
+  nextIcon.dataset.icon = request.index === request.questions.length - 1 ? "check" : "chevron-right";
+  next.append(nextIcon);
+  next.addEventListener("click", () => {
+    const answer = captureUserInputAnswer(card);
+    if (!isUserInputAnswerComplete(question, answer)) {
+      setUserInputError(card, "Answer this question to continue.");
+      syncUserInputCard(card);
+      return;
+    }
+    if (request.index < request.questions.length - 1) {
+      request.index += 1;
+      renderUserInputCard();
+      return;
+    }
+    submitUserInputRequest();
+  });
+  actions.append(previous, next);
+  card.append(actions);
+  approvalArea.append(card);
+  renderIcons(card);
+  syncUserInputCard(card);
+  const answer = request.answers.get(question.id);
+  (answer?.type === "text" ? textInput : card.querySelector("input"))?.focus();
+}
+
+function openUserInputRequest(message) {
+  const questions = normalizeUserInputQuestions(message.params?.questions);
+  if (!questions.length) {
+    if (send({ type: "serverRequestResponse", requestId: message.id, result: { answers: {} } })) {
+      addSystemMessage("Questions 0/0 answered.");
+    }
+    return;
+  }
+  clearUserInputRequest();
+  const wasRunning = state.running;
+  if (isNotificationForThread(message.params, state.threadId)) {
+    state.activeTurnId = message.params?.turnId || state.activeTurnId;
+  }
+  state.running = true;
+  state.threadStatus = "active";
+  if (!wasRunning) setTurnActivityWorking();
+  state.userInputRequest = {
+    requestId: message.id,
+    threadId: message.params?.threadId || state.threadId,
+    turnId: message.params?.turnId || state.activeTurnId,
+    questions,
+    index: 0,
+    answers: new Map(),
+  };
+  renderUserInputCard();
+  updateControls();
+}
+
+function submitUserInputRequest() {
+  const request = state.userInputRequest;
+  if (!request) return;
+  const result = buildUserInputResult(request.questions, request.answers);
+  if (!result) return;
+  if (!send({ type: "serverRequestResponse", requestId: request.requestId, result })) return;
+  const total = request.questions.length;
+  clearUserInputRequest();
+  addSystemMessage(`Questions ${total}/${total} answered.`);
+  updateControls();
+}
+
+function addApproval(message) {
+  state.approvals = enqueueApproval(state.approvals, message);
+  renderApprovalQueue();
 }
 
 function renderHistoricalBlock(block) {
@@ -2015,6 +3253,7 @@ function renderHistoricalBlock(block) {
       startedAt: item.startedAt,
       deferOutline: true,
       live: false,
+      process: block.role === "assistant" && !state.historicalProcessAnswerIds.has(item.id),
       turnId: block.turnId,
     });
     record.raw = block.role === "user" ? displayInput(item.content || []) : item.text || "";
@@ -2024,20 +3263,38 @@ function renderHistoricalBlock(block) {
     return;
   }
   if (block.type === "commandGroup") {
-    const group = createCommandGroup(block.id, block.turnId);
+    const process = ensureProcessDetails(block.turnId);
+    const group = createCommandGroup(block.id, block.turnId, process.body);
     for (const entry of block.items) {
-      const record = updateTool(entry.item, { live: false, container: group.items, turnId: block.turnId });
+      const record = updateTool(entry.item, { live: false, process: true, container: group.items, turnId: block.turnId });
       addCommandToGroup(group, record);
     }
+    for (const entry of block.items) process.itemIds.add(entry.item.id);
+    updateProcessSummary(process);
     updateCommandGroupSummary(group);
     return;
   }
   if (block.type === "command") {
-    updateTool(block.item, { live: false, turnId: block.turnId });
+    updateTool(block.item, { live: false, process: true, turnId: block.turnId });
+  } else if (block.type === "search") {
+    updateSearchStep(block.item, { live: false, process: true, turnId: block.turnId });
   } else if (block.type === "fileChange" || block.type === "mcpTool") {
-    updateTool(block.item, { live: false, turnId: block.turnId });
+    updateTool(block.item, { live: false, process: true, turnId: block.turnId });
   } else if (block.type === "error") {
     addSystemMessage(block.item.message || block.item.error?.message || "Codex error", "error");
+  } else if (block.type === "plan") {
+    const item = block.item || {};
+    const snapshot = {
+      threadId: state.threadId,
+      turnId: block.turnId,
+      explanation: null,
+      steps: [],
+    };
+    renderPlanCard(snapshot, {
+      key: planSnapshotKey(state.threadId, block.turnId || item.id),
+      text: item.planText || item.text || "",
+      live: false,
+    });
   } else if (block.type === "status") {
     const text = block.item.text || block.item.message;
     if (text) addSystemMessage(text);
@@ -2057,10 +3314,20 @@ function restoreHistory(thread) {
   state.latestUserInput = state.threadView.latestTurn?.items?.find((item) => item.role === "user")?.text || "";
   syncTurnActivityFromThread(thread);
   state.toolNodes.clear();
+  state.processNodes.clear();
+  state.historicalProcessAnswerIds.clear();
+  state.searchNodes.clear();
+  state.planSnapshots.clear();
+  state.planNodes.clear();
+  state.planDeltaBuffers.clear();
+  state.latestPlanKey = null;
   state.commandItems.clear();
   state.changeItems.clear();
   state.commandObservedStartMs.clear();
   state.conversationOrder = [];
+  state.historicalProcessAnswerIds = new Set(buildProcessDetailsForTurns(restoredThread?.turns)
+    .map((group) => group.answer?.id)
+    .filter(Boolean));
   for (const block of buildConversationBlocks(restoredThread?.turns, { cwd: currentCwd() })) renderHistoricalBlock(block);
   if (state.activeView === "changes") renderChangesView();
   if (state.activeView === "commands") renderCommandsView();
@@ -2093,6 +3360,10 @@ function mergeThreadSettings(settings) {
   if (settings.permissions !== undefined || settings.activePermissionProfile || settings.permissionProfile) {
     populatePermissions(settings.permissions || settings.activePermissionProfile?.id || settings.permissionProfile?.id || settings.permissionProfile || "");
   }
+  if (settings.collaborationMode !== undefined) {
+    populateCollaborationModes(collaborationModeValue(settings.collaborationMode));
+    rememberCollaborationMode(state.threadId, settings.collaborationMode);
+  }
   if (settings.cwd) cwdInput.value = settings.cwd;
   saveControlPreferences();
   updateControls();
@@ -2103,6 +3374,10 @@ function handleCodex(message) {
   const params = message.params || {};
 
   if (message.id !== undefined) {
+    if (method === "item/tool/requestUserInput") {
+      openUserInputRequest(message);
+      return;
+    }
     if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
       addApproval(message);
       return;
@@ -2112,12 +3387,18 @@ function handleCodex(message) {
     return;
   }
 
+  // Ultra can run child turns on separate threads. Their lifecycle must not
+  // overwrite the active turn state shown for the selected thread.
+  if (!isNotificationForThread(params, state.threadId)) return;
+
   switch (method) {
     case "thread/status/changed":
       if (!params.threadId || params.threadId === state.threadId) {
         const value = params.status;
         state.threadStatus = normalizeThreadStatus(value);
-        state.running = state.threadStatus === "active" || Boolean(value?.activeFlags?.length);
+        state.running = state.threadStatus === "active"
+          || Boolean(value?.activeFlags?.length)
+          || Boolean(state.activeTurnId);
         if (state.running) setTurnActivityWorking(params.startedAt || value?.startedAt);
         else if (state.activityMode === "working") setTurnActivityWorked({ status: state.threadStatus, completedAt: params.completedAt || value?.completedAt });
         updateControls();
@@ -2132,9 +3413,30 @@ function handleCodex(message) {
       }
       break;
 
+    case "turn/plan/updated":
+      if (!params.threadId || params.threadId === state.threadId) {
+        // This event is authoritative for the structured TodoList and is
+        // intentionally independent from the selected collaboration mode.
+        upsertPlanSnapshot(params);
+      }
+      break;
+
+    case "item/plan/delta":
+      if (!params.threadId || params.threadId === state.threadId) {
+        const itemId = params.itemId;
+        if (itemId) state.planDeltaBuffers.set(itemId, `${state.planDeltaBuffers.get(itemId) || ""}${params.delta || ""}`);
+      }
+      break;
+
     case "thread/settings/updated":
-      mergeThreadSettings(params.threadSettings || params.settings || params);
-      addSystemMessage("Thread settings synchronized.");
+      if (!params.threadId || params.threadId === state.threadId) {
+        mergeThreadSettings(params.threadSettings || params.settings || params);
+        addSystemMessage("Thread settings synchronized.");
+      }
+      break;
+
+    case "thread/deleted":
+      handleThreadDeleted({ threadId: params.threadId });
       break;
 
     case "mcpServerStatus/updated":
@@ -2144,6 +3446,22 @@ function handleCodex(message) {
           error: params.error || params.failureReason || null,
         };
       }
+      break;
+
+    case "fuzzyFileSearch/sessionUpdated":
+      if (params.query !== state.mentionQuery) break;
+      if (state.fileSearchSessionId && params.sessionId !== state.fileSearchSessionId) break;
+      if (!state.fileSearchSearching && state.fileSearchSessionId !== params.sessionId) break;
+      state.fileSearchSessionId = params.sessionId || state.fileSearchSessionId;
+      state.fileSearchError = null;
+      state.fileMatches = normalizeFileSearchFiles(params.files);
+      renderMentionPalette();
+      break;
+
+    case "fuzzyFileSearch/sessionCompleted":
+      if (!params.sessionId || params.sessionId !== state.fileSearchSessionId) break;
+      state.fileSearchSearching = false;
+      renderMentionPalette();
       break;
 
     case "item/guardianApprovalReview/completed":
@@ -2160,12 +3478,14 @@ function handleCodex(message) {
       state.threadStatus = "active";
       state.activeTurnId = params.turn?.id || state.activeTurnId;
       state.currentTurn = params.turn || { id: state.activeTurnId, status: "inProgress", startedAt: Math.floor(Date.now() / 1000) };
+      state.searchActivities.clear();
       state.conversationOrder.push({ kind: "barrier", turnId: state.activeTurnId });
       setTurnActivityWorking(state.currentTurn.startedAt);
       updateControls();
       break;
 
     case "turn/completed": {
+      clearUserInputRequest();
       const completedTurn = {
         ...(state.currentTurn || {}),
         ...(params.turn || {}),
@@ -2182,23 +3502,31 @@ function handleCodex(message) {
         state.threadView.turns.push(state.currentTurn);
       }
       setTurnActivityWorked(completedTurn, activityStartedAt);
+      promoteLatestAssistantAnswer(completedTurn.id || state.currentTurn?.id);
       if (status !== "completed") addSystemMessage(`Turn status: ${status}`, status === "failed" ? "error" : "warning");
       updateControls();
       refreshThreadList();
       messageInput.focus();
+      drainQueue();
       break;
     }
 
     case "item/started": {
       const item = params.item;
       if (item && ["commandExecution", "fileChange", "mcpToolCall"].includes(item.type)) updateTool(item);
+      if (item?.type === "webSearch") updateSearchStep(item, { active: true });
+      startSearchActivity(item);
       break;
     }
 
     case "item/agentMessage/delta": {
       const id = params.itemId;
       if (!id) break;
-      const record = ensureMessage(id, "assistant");
+      const record = ensureMessage(id, "assistant", {
+        process: true,
+        live: true,
+        turnId: params.turnId || state.activeTurnId || state.currentTurn?.id,
+      });
       record.streaming = true;
       record.raw += params.delta || "";
       scheduleRender(record);
@@ -2213,7 +3541,11 @@ function handleCodex(message) {
       const item = params.item;
       if (!item) break;
       if (item.type === "agentMessage") {
-        const record = ensureMessage(item.id, "assistant");
+        const record = ensureMessage(item.id, "assistant", {
+          process: true,
+          live: true,
+          turnId: item.turnId || params.turnId || state.activeTurnId || state.currentTurn?.id,
+        });
         const pendingRender = state.renderTimers.get(item.id);
         if (pendingRender) {
           clearTimeout(pendingRender);
@@ -2221,9 +3553,26 @@ function handleCodex(message) {
         }
         record.raw = item.text || record.raw;
         renderCompletedMessage(record, record.raw);
+      } else if (item.type === "plan") {
+        const turnId = item.turnId || params.turnId || state.activeTurnId || state.currentTurn?.id;
+        const key = planSnapshotKey(state.threadId, turnId);
+        if (!state.planSnapshots.has(key)) {
+          renderPlanCard({
+            threadId: state.threadId,
+            turnId,
+            explanation: null,
+            steps: [],
+          }, {
+            key,
+            text: item.text || state.planDeltaBuffers.get(item.id) || "",
+          });
+        }
+        state.planDeltaBuffers.delete(item.id);
       } else if (["commandExecution", "fileChange", "mcpToolCall"].includes(item.type)) {
         updateTool(item);
       }
+      if (item.type === "webSearch") updateSearchStep(item, { active: false });
+      completeSearchActivity(item);
       scrollToBottom();
       break;
     }
@@ -2264,6 +3613,7 @@ function handleCodex(message) {
 }
 
 function applyThreadResponse(payload) {
+  clearQueuedMessages();
   if (state.threadId && state.threadId !== payload.thread.id) {
     saveThreadUi();
     saveToolCache();
@@ -2279,6 +3629,10 @@ function applyThreadResponse(payload) {
   state.threadStatus = normalizeThreadStatus(payload.thread?.status || "idle");
   clearTurnActivity();
   const reasoningEffort = resolveReasoningEffort(payload) || resolveReasoningEffort(payload.thread);
+  const storedMode = payload.thread?.id ? localStorage.getItem(collaborationModeStorageKey(payload.thread.id)) : "";
+  const initialMode = payload.mode === "start"
+    ? collaborationModeValue(collaborationModeSelect.value)
+    : storedMode || "";
   state.threadMeta = {
     name: payload.thread?.name,
     model: payload.model || payload.thread?.model,
@@ -2291,6 +3645,7 @@ function applyThreadResponse(payload) {
     permissionProfile: payload.permissionProfile || payload.activePermissionProfile,
     activePermissionProfile: payload.activePermissionProfile,
     permissions: payload.permissions,
+    collaborationMode: payload.collaborationMode || payload.thread?.collaborationMode || initialMode || null,
     reasoningEffort,
     gitInfo: payload.thread?.gitInfo || null,
   };
@@ -2309,6 +3664,8 @@ function applyThreadResponse(payload) {
   populateEfforts(state.threadMeta.reasoningEffort);
   populateTiers(state.threadMeta.serviceTier || "");
   populatePermissions(activePermissionId());
+  populateCollaborationModes(collaborationModeValue(state.threadMeta.collaborationMode));
+  rememberCollaborationMode(state.threadId, state.threadMeta.collaborationMode);
   saveControlPreferences();
 }
 
@@ -2347,7 +3704,7 @@ function showStatus() {
     ["Directory", currentCwd()],
     ["Permissions", permissionLabel()],
     ["Approval policy", state.threadMeta.approvalPolicy || "default"],
-    ["Collaboration mode", state.threadMeta.collaborationMode?.mode || state.threadMeta.collaborationMode || "Default"],
+    ["Collaboration mode", currentCollaborationModeLabel()],
     ["Thread state", state.threadStatus],
     ["Session", state.threadId || "none"],
     ["Account", accountLabel()],
@@ -2409,12 +3766,21 @@ function clearPendingRenderTimers() {
 }
 
 function clearTranscript(showNotice = true) {
+  clearUserInputRequest();
   clearPendingRenderTimers();
   chat.replaceChildren();
   state.messageNodes.clear();
   state.toolNodes.clear();
+  state.processNodes.clear();
+  state.historicalProcessAnswerIds.clear();
+  state.searchNodes.clear();
+  state.planSnapshots.clear();
+  state.planNodes.clear();
+  state.planDeltaBuffers.clear();
+  state.latestPlanKey = null;
   state.commandObservedStartMs.clear();
   state.conversationOrder = [];
+  clearQueuedMessages();
   state.toolCacheItems.clear();
   state.toolCacheSequence = 0;
   state.lastSavedToolCache = null;
@@ -2429,6 +3795,7 @@ function startNewThread(sessionStartSource = null) {
     addSystemMessage("Enter a WSL project directory first.", "error");
     return;
   }
+  clearUserInputRequest();
   localStorage.setItem("codexMathCwd", cwd);
   saveControlPreferences();
   const settings = selectedSettings();
@@ -2440,6 +3807,7 @@ function resumeThread(threadId = threadIdInput.value.trim()) {
     addSystemMessage("A thread ID is required.", "error");
     return;
   }
+  clearUserInputRequest();
   send({ type: "resumeThread", threadId });
 }
 
@@ -2490,6 +3858,26 @@ function setModelAndEffort(model, effort) {
     effortSelect.value = effort;
   }
   updateThreadSettings();
+  return true;
+}
+
+function setCollaborationMode(mode) {
+  const value = String(mode || "").trim();
+  if (!value) {
+    addSystemMessage("No collaboration mode was advertised by App Server.", "warning");
+    return false;
+  }
+  if (![...collaborationModeSelect.options].some((option) => option.value === value)) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value === "plan" ? "Plan" : value === "default" ? "Default" : value;
+    collaborationModeSelect.append(option);
+  }
+  collaborationModeSelect.value = value;
+  inspectorCollaborationModeSelect.value = value;
+  saveControlPreferences();
+  if (state.threadId) updateThreadSettings();
+  updateControls();
   return true;
 }
 
@@ -2793,9 +4181,19 @@ function executeSlash(raw) {
     case "/archive":
       if (window.confirm("Archive the current Codex thread?")) send({ type: "archiveThread" });
       break;
-    case "/delete":
-      if (window.confirm("Permanently delete the current Codex thread and its descendants? This cannot be undone.")) send({ type: "deleteThread" });
+    case "/delete": {
+      if (!state.threadId) {
+        addSystemMessage("Start or resume a thread before deleting it.", "error");
+        break;
+      }
+      const currentThread = state.threads.find((thread) => thread.id === state.threadId) || {
+        id: state.threadId,
+        name: state.threadMeta.name,
+        cwd: currentCwd(),
+      };
+      openDeleteThreadDialog(currentThread);
       break;
+    }
     case "/goal": {
       const value = args.join(" ").trim();
       if (!value) send({ type: "getGoal" });
@@ -2841,17 +4239,7 @@ function executeSlash(raw) {
       if (!state.threadId) {
         addSystemMessage("Start or resume a thread before switching collaboration mode.", "error");
       } else {
-        send({
-          type: "updateSettings",
-          collaborationMode: {
-            mode: "plan",
-            settings: {
-              model: currentModelLabel(),
-              reasoning_effort: currentEffortLabel() === "default" ? null : currentEffortLabel(),
-              developer_instructions: null,
-            },
-          },
-        });
+        setCollaborationMode("plan");
       }
       break;
     case "/new":
@@ -2982,6 +4370,7 @@ function commitPaletteSelection(command, source = "enter") {
 function autoSizeComposer() {
   messageInput.style.height = "auto";
   messageInput.style.height = `${Math.min(200, Math.max(50, messageInput.scrollHeight))}px`;
+  syncApprovalAreaPosition();
 }
 
 function mentionToken() {
@@ -2990,13 +4379,33 @@ function mentionToken() {
   return match ? { query: match[1], start: before.length - match[1].length - 1, end: before.length } : null;
 }
 
+function stopActiveFileSearch() {
+  const sessionId = state.fileSearchSessionId;
+  state.fileSearchSessionId = null;
+  state.fileSearchSearching = false;
+  state.fileSearchError = null;
+  if (sessionId) send({ type: "stopFileSearch", sessionId });
+}
+
 function renderMentionPalette() {
   mentionPalette.replaceChildren();
-  if (!state.fileMatches.length) {
+  const hasSearchState = state.fileSearchSearching || state.fileSearchError;
+  if (!state.fileMatches.length && !hasSearchState) {
     mentionPalette.classList.add("hidden");
     return;
   }
-  state.mentionIndex = Math.min(state.mentionIndex, state.fileMatches.length - 1);
+  if (state.fileSearchSearching || state.fileSearchError) {
+    const status = document.createElement("div");
+    status.className = `mention-search-status${state.fileSearchError ? " error" : ""}`;
+    status.setAttribute("role", "status");
+    status.textContent = state.fileSearchError
+      ? `File search failed: ${state.fileSearchError}`
+      : "Searching files...";
+    mentionPalette.append(status);
+  }
+  state.mentionIndex = state.fileMatches.length
+    ? Math.min(Math.max(0, state.mentionIndex), state.fileMatches.length - 1)
+    : 0;
   state.fileMatches.slice(0, 12).forEach((file, index) => {
     const button = document.createElement("button");
     button.type = "button";
@@ -3019,18 +4428,34 @@ function renderMentionPalette() {
 function requestMentionSearch() {
   const token = mentionToken();
   if (!token) {
+    stopActiveFileSearch();
+    state.mentionQuery = "";
+    state.fileMatches = [];
     mentionPalette.classList.add("hidden");
     return;
   }
   clearTimeout(state.mentionTimer);
+  const queryChanged = state.mentionQuery !== token.query;
   state.mentionQuery = token.query;
+  if (queryChanged) {
+    state.fileMatches = [];
+    state.fileSearchSessionId = null;
+    state.fileSearchSearching = Boolean(token.query);
+    state.fileSearchError = null;
+    renderMentionPalette();
+  }
   state.mentionTimer = setTimeout(() => {
     if (!state.mentionQuery) {
       state.fileMatches = [];
+      state.fileSearchSearching = false;
       renderMentionPalette();
       return;
     }
-    send({ type: "searchFiles", query: state.mentionQuery, cwd: currentCwd() });
+    if (!send({ type: "searchFiles", query: state.mentionQuery, cwd: currentCwd() })) {
+      state.fileSearchSearching = false;
+      state.fileSearchError = "WebSocket is not connected.";
+      renderMentionPalette();
+    }
   }, 140);
 }
 
@@ -3042,6 +4467,8 @@ function chooseMention(file) {
     messageInput.setRangeText("", token.start, token.end, "end");
   }
   state.fileMatches = [];
+  stopActiveFileSearch();
+  state.mentionQuery = "";
   mentionPalette.classList.add("hidden");
   renderAttachmentChips();
   autoSizeComposer();
@@ -3094,7 +4521,7 @@ function readImage(file) {
 function submitMessage() {
   const text = messageInput.value;
   const trimmedText = text.trim();
-  if (state.running || (!trimmedText && !state.mentions.length && !state.images.length)) return;
+  if (!trimmedText && !state.mentions.length && !state.images.length) return;
   if (trimmedText.startsWith("/") && !state.mentions.length && !state.images.length) {
     messageInput.value = "";
     autoSizeComposer();
@@ -3110,20 +4537,36 @@ function submitMessage() {
     addSystemMessage(error.message, "error");
     return;
   }
-  messageInput.value = "";
-  state.mentions = [];
-  state.images = [];
-  renderAttachmentChips();
-  autoSizeComposer();
-  slashPalette.classList.add("hidden");
-  mentionPalette.classList.add("hidden");
+  clearComposerInput();
+  if (state.running || queueDispatchActive()) {
+    // Enter while a turn is active is a follow-up queue operation. It does
+    // not create a chat bubble until App Server accepts the next turn.
+    enqueueFollowUp(input);
+    return;
+  }
+  sendComposedMessage(input, selectedSettings());
+}
+
+function sendComposedMessage(input, settings) {
+  if (queueDispatchActive()) {
+    enqueueFollowUp(input);
+    return;
+  }
   addLocalUserMessage(input);
   state.latestUserInput = displayInput(input);
+  const requestId = queueRequestId();
   state.running = true;
   state.threadStatus = "active";
   setTurnActivityWorking();
   updateControls();
-  if (!send({ type: "sendMessage", input, ...selectedSettings() })) {
+  if (!send({
+    type: "sendMessage",
+    requestId,
+    threadId: state.threadId,
+    clientUserMessageId: requestId,
+    input,
+    ...(settings || selectedSettings()),
+  })) {
     state.running = false;
     state.threadStatus = "idle";
     clearTurnActivity();
@@ -3131,10 +4574,37 @@ function submitMessage() {
   }
 }
 
+function composeCurrentInput() {
+  const text = messageInput.value;
+  if (!text.trim() && !state.mentions.length && !state.images.length) return null;
+  try {
+    return composeUserInput(text, state.mentions, state.images);
+  } catch (error) {
+    addSystemMessage(error.message, "error");
+    return null;
+  }
+}
+
+function submitSteerNow() {
+  const input = composeCurrentInput();
+  if (!input) return;
+  clearComposerInput();
+  steerCurrentTurn(input);
+}
+
+function submitFollowUp() {
+  const input = composeCurrentInput();
+  if (!input) return;
+  clearComposerInput();
+  enqueueFollowUp(input);
+}
+
 socket.addEventListener("open", () => setConnection("Bridge connected", true));
 socket.addEventListener("close", () => {
   state.ready = false;
   state.running = false;
+  releaseQueueDispatch({ fail: true, error: "WebSocket disconnected." });
+  clearUserInputRequest();
   clearTurnActivity();
   setConnection("Disconnected", false);
   updateControls();
@@ -3152,6 +4622,7 @@ socket.addEventListener("message", (event) => {
       state.account = payload.account;
       state.permissionProfiles = payload.permissionProfiles || [];
       state.experiments = payload.experiments || [];
+      state.collaborationModes = payload.collaborationModes || [];
       state.metadataErrors = payload.metadataErrors || {};
       applyThreadList(payload.threadList, false, payload.threadListError);
       cwdInput.value = localStorage.getItem("codexMathCwd") || payload.defaultCwd || "";
@@ -3178,12 +4649,14 @@ socket.addEventListener("message", (event) => {
       state.account = payload.account ?? state.account;
       state.permissionProfiles = payload.permissionProfiles || state.permissionProfiles;
       state.experiments = payload.experiments || state.experiments;
+      state.collaborationModes = payload.collaborationModes || state.collaborationModes;
       state.metadataErrors = payload.metadataErrors || state.metadataErrors;
       populateModels(currentModelLabel());
       updateControls();
       break;
 
     case "threadReady":
+      clearUserInputRequest();
       applyThreadResponse(payload);
       clearPendingRenderTimers();
       chat.replaceChildren();
@@ -3191,6 +4664,13 @@ socket.addEventListener("message", (event) => {
       state.outlineObserver?.disconnect();
       state.messageNodes.clear();
       state.toolNodes.clear();
+      state.processNodes.clear();
+      state.historicalProcessAnswerIds.clear();
+      state.searchNodes.clear();
+      state.planSnapshots.clear();
+      state.planNodes.clear();
+      state.planDeltaBuffers.clear();
+      state.latestPlanKey = null;
       state.commandItems.clear();
       state.changeItems.clear();
       state.commandObservedStartMs.clear();
@@ -3221,10 +4701,58 @@ socket.addEventListener("message", (event) => {
       break;
 
     case "turnAccepted":
-      state.activeTurnId = payload.turn.id;
+      if (consumeIgnoredQueueResponse(payload.requestId)) break;
+      {
+        const dispatch = state.queueDispatch?.requestId === payload.requestId ? state.queueDispatch : null;
+        const queuedId = state.queueRequestIds.get(payload.requestId) || dispatch?.entryId;
+        if (dispatch) state.queueDispatch = null;
+        if (payload.accepted === false) {
+          if (queuedId) {
+            state.queueRequestIds.delete(payload.requestId);
+            failQueueEntry(queuedId, payload.error?.message || "Turn was not accepted");
+          }
+          state.running = false;
+          state.threadStatus = "idle";
+          state.activeTurnId = null;
+          clearTurnActivity();
+          addSystemMessage(payload.error?.message || "Turn was not accepted.", "error");
+          updateControls();
+          break;
+        }
+        if (queuedId) {
+          const queued = currentQueueEntries().find((entry) => entry.id === queuedId);
+          state.queueRequestIds.delete(payload.requestId);
+          if (queued) {
+            addLocalUserMessage(queued.input);
+            state.latestUserInput = queued.displayText;
+          }
+          updateQueue({ type: "accepted", id: queuedId, requestId: payload.requestId });
+          updateQueue({ type: "remove", id: queuedId });
+        }
+        state.activeTurnId = payload.turn?.id || state.activeTurnId;
+        state.running = true;
+        state.threadStatus = "active";
+        setTurnActivityWorking(payload.turn?.startedAt);
+        updateControls();
+      }
+      break;
+
+    case "steerAccepted":
+      if (payload.accepted === false) {
+        state.steerRequestInputs.delete(payload.requestId);
+        addSystemMessage(payload.error?.message || "Steer was not accepted.", "error");
+        break;
+      }
+      {
+        const input = state.steerRequestInputs.get(payload.requestId);
+        state.steerRequestInputs.delete(payload.requestId);
+        if (input) {
+          addLocalUserMessage(input);
+          state.latestUserInput = displayInput(input);
+        }
+      }
       state.running = true;
       state.threadStatus = "active";
-      setTurnActivityWorking(payload.turn.startedAt);
       updateControls();
       break;
 
@@ -3253,9 +4781,10 @@ socket.addEventListener("message", (event) => {
       updateControls();
       break;
 
-    case "threadArchived":
-    case "threadDeleted": {
-      const verb = payload.type === "threadArchived" ? "archived" : "deleted";
+    case "threadArchived": {
+      clearUserInputRequest();
+      clearQueuedMessages();
+      if (state.threadId) localStorage.removeItem(collaborationModeStorageKey(state.threadId));
       state.threadId = null;
       state.activeTurnId = null;
       state.running = false;
@@ -3267,11 +4796,15 @@ socket.addEventListener("message", (event) => {
       state.latestGuardianDenial = null;
       localStorage.removeItem("codexMathThreadId");
       threadIdInput.value = "";
-      addSystemMessage(`Thread ${verb}.`);
+      addSystemMessage("Thread archived.");
       refreshThreadList();
       updateControls();
       break;
     }
+
+    case "threadDeleted":
+      handleThreadDeleted(payload);
+      break;
 
     case "threadList":
       applyThreadList(payload.result, payload.append, payload.error);
@@ -3325,8 +4858,30 @@ socket.addEventListener("message", (event) => {
 
     case "fileSearchResult":
       if (payload.query === state.mentionQuery) {
-        state.fileMatches = Array.isArray(payload.result?.files) ? payload.result.files.filter((file) => file.match_type === "file") : [];
+        state.fileSearchSessionId = payload.sessionId || state.fileSearchSessionId;
+        state.fileSearchSearching = false;
+        state.fileSearchError = null;
+        state.fileMatches = normalizeFileSearchFiles(payload.result);
         state.mentionIndex = 0;
+        renderMentionPalette();
+      }
+      break;
+
+    case "fileSearchStarted":
+      if (payload.query === state.mentionQuery) {
+        state.fileSearchSessionId = payload.sessionId || null;
+        state.fileSearchSearching = true;
+        state.fileSearchError = null;
+        renderMentionPalette();
+      }
+      break;
+
+    case "fileSearchError":
+      if (payload.query === state.mentionQuery
+        && (!state.fileSearchSessionId || !payload.sessionId || payload.sessionId === state.fileSearchSessionId)) {
+        state.fileSearchSessionId = payload.sessionId || state.fileSearchSessionId;
+        state.fileSearchSearching = false;
+        state.fileSearchError = payload.error?.message || "Unknown file search error.";
         renderMentionPalette();
       }
       break;
@@ -3356,6 +4911,13 @@ socket.addEventListener("message", (event) => {
       break;
 
     case "bridgeError":
+      if (payload.requestId) {
+        removePendingThreadDelete(payload.requestId);
+        renderThreadList();
+        if (state.queueDispatch?.requestId === payload.requestId || state.queueRequestIds.has(payload.requestId)) {
+          releaseQueueDispatch({ fail: true, error: payload.message || "Queue request failed." });
+        }
+      }
       state.running = false;
       clearTurnActivity();
       addSystemMessage(payload.message, "error");
@@ -3461,6 +5023,11 @@ modelSelect.addEventListener("change", () => {
   updateThreadSettings();
 });
 effortSelect.addEventListener("change", updateThreadSettings);
+collaborationModeSelect.addEventListener("change", () => {
+  inspectorCollaborationModeSelect.value = collaborationModeSelect.value;
+  updateThreadSettings();
+  updateControls();
+});
 tierSelect.addEventListener("change", updateThreadSettings);
 permissionSelect.addEventListener("change", updateThreadSettings);
 inspectorModelSelect.addEventListener("change", () => {
@@ -3472,6 +5039,11 @@ inspectorModelSelect.addEventListener("change", () => {
 inspectorEffortSelect.addEventListener("change", () => {
   effortSelect.value = inspectorEffortSelect.value;
   updateThreadSettings();
+});
+inspectorCollaborationModeSelect.addEventListener("change", () => {
+  collaborationModeSelect.value = inspectorCollaborationModeSelect.value;
+  updateThreadSettings();
+  updateControls();
 });
 newThreadButton.addEventListener("click", () => startNewThread());
 refreshThreadsButton.addEventListener("click", () => refreshThreadList());
@@ -3488,9 +5060,14 @@ threadIdInput.addEventListener("keydown", (event) => {
 statusButton.addEventListener("click", showStatus);
 connectionStatus.addEventListener("click", () => send({ type: "refreshMetadata", cwd: cwdInput.value.trim() }));
 sendButton.addEventListener("click", submitMessage);
+steerButton.addEventListener("click", submitSteerNow);
+followUpButton.addEventListener("click", submitFollowUp);
 function interruptActiveTurn() {
   if (!state.running || !state.activeTurnId) return;
-  send({ type: "interrupt", turnId: state.activeTurnId });
+  if (send({ type: "interrupt", turnId: state.activeTurnId })) {
+    clearUserInputRequest();
+    updateControls();
+  }
 }
 stopButton.addEventListener("click", interruptActiveTurn);
 
@@ -3522,9 +5099,19 @@ messageInput.addEventListener("keydown", (event) => {
     }
     if (event.key === "Escape") {
       event.preventDefault();
+      stopActiveFileSearch();
       mentionPalette.classList.add("hidden");
       return;
     }
+  }
+  if (!mentionPalette.classList.contains("hidden")
+    && !state.fileMatches.length
+    && (state.fileSearchSearching || state.fileSearchError)
+    && event.key === "Escape") {
+    event.preventDefault();
+    stopActiveFileSearch();
+    mentionPalette.classList.add("hidden");
+    return;
   }
   if (state.choicePalette && !slashPalette.classList.contains("hidden")) {
     const count = state.choicePalette.items.length;
@@ -3655,7 +5242,7 @@ window.addEventListener("pagehide", () => {
   saveToolCache();
 });
 
-$("#workspaceButton").addEventListener("click", () => {
+workspaceButton.addEventListener("click", () => {
   cwdDialogInput.value = currentCwd();
   cwdDialog.showModal();
   cwdDialogInput.focus();
@@ -3670,6 +5257,16 @@ $("#applyCwdButton").addEventListener("click", (event) => {
   else send({ type: "refreshMetadata", cwd });
   cwdDialog.close();
   updateControls();
+});
+deleteThreadDialog.addEventListener("close", () => {
+  state.deleteDialogThread = null;
+  state.deleteDialogThreadId = null;
+});
+confirmDeleteThreadButton.addEventListener("click", (event) => {
+  event.preventDefault();
+  const threadId = state.deleteDialogThreadId;
+  deleteThreadDialog.close();
+  if (threadId) requestDeleteThread(threadId);
 });
 cwdInput.addEventListener("change", () => {
   const cwd = cwdInput.value.trim();
@@ -3689,7 +5286,13 @@ $("#accountButton").addEventListener("click", showStatus);
 window.addEventListener("resize", () => {
   updateBackdrop();
   renderContextUsage();
+  syncApprovalAreaPosition();
 });
+
+if (composer && typeof ResizeObserver === "function") {
+  new ResizeObserver(syncApprovalAreaPosition).observe(composer);
+}
+
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
   state.choicePalette = null;

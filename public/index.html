@@ -115,6 +115,7 @@
             <footer class="composer">
               <div id="attachmentChips" class="attachment-chips hidden"></div>
               <div id="turnActivity" class="turn-activity hidden" aria-live="polite"></div>
+              <section id="queueShelf" class="queue-shelf hidden" aria-label="Queued messages"></section>
               <div class="composer-shell">
                 <textarea id="messageInput" rows="1" placeholder="Ask Codex anything, use @ for files, / for commands" disabled></textarea>
                 <div id="slashPalette" class="floating-palette hidden" role="listbox"></div>
@@ -127,8 +128,11 @@
                   </div>
                   <div class="composer-config">
                     <button id="mobileMoreButton" class="icon-button composer-more" type="button" aria-label="More session settings" title="Session settings"><i data-icon="sliders-horizontal"></i></button>
+                    <label><span class="sr-only">Collaboration mode</span><select id="collaborationModeSelect" disabled></select></label>
                     <label><span class="sr-only">Model</span><select id="modelSelect" disabled></select></label>
                     <label><span class="sr-only">Reasoning effort</span><select id="effortSelect" disabled></select></label>
+                    <button id="steerButton" class="queue-action steer hidden" type="button" disabled aria-label="Steer now" title="Steer now"><i data-icon="arrow-up"></i><span>Steer now</span></button>
+                    <button id="followUpButton" class="queue-action follow hidden" type="button" disabled aria-label="Follow up" title="Follow up"><i data-icon="arrow-down"></i><span>Follow up</span></button>
                     <button id="stopButton" class="send-button stop hidden" type="button" disabled aria-label="Stop"><i data-icon="square"></i></button>
                     <button id="sendButton" class="send-button" type="button" disabled aria-label="Send"><i data-icon="arrow-up"></i></button>
                   </div>
@@ -152,6 +156,7 @@
               <h3>Configuration</h3>
               <label class="setting-row"><span>Model</span><select id="inspectorModelSelect" disabled></select></label>
               <label class="setting-row"><span>Reasoning</span><select id="inspectorEffortSelect" disabled></select></label>
+              <label class="setting-row"><span>Mode</span><select id="inspectorCollaborationModeSelect" disabled></select></label>
               <label class="setting-row"><span>Permissions</span><select id="permissionSelect" disabled></select></label>
               <label class="setting-row"><span>Service tier</span><select id="tierSelect" disabled></select></label>
             </section>
@@ -187,6 +192,14 @@
         <div class="modal-head"><div><span class="eyebrow">WORKSPACE</span><h2>Working directory</h2></div><button class="icon-button" value="cancel" aria-label="Close"><i data-icon="x"></i></button></div>
         <label class="setting-stack"><span>WSL / Linux path</span><input id="cwdDialogInput" spellcheck="false" placeholder="/mnt/d/path/to/project" /></label>
         <div class="modal-actions"><button value="cancel" class="secondary-button">Cancel</button><button id="applyCwdButton" value="default">Apply</button></div>
+      </form>
+    </dialog>
+    <dialog id="deleteThreadDialog" class="modal small-modal">
+      <form method="dialog" class="modal-card">
+        <div class="modal-head"><div><span class="eyebrow">DELETE CONVERSATION</span><h2>Delete conversation?</h2></div><button class="icon-button" value="cancel" aria-label="Close"><i data-icon="x"></i></button></div>
+        <p class="delete-thread-warning">This permanently deletes the Codex conversation and cannot be undone.</p>
+        <div class="delete-thread-details"><strong id="deleteThreadDialogTitle"></strong><code id="deleteThreadDialogCwd"></code></div>
+        <div class="modal-actions"><button value="cancel" class="secondary-button">Cancel</button><button id="confirmDeleteThreadButton" value="default" class="danger-button">Delete</button></div>
       </form>
     </dialog>
     <dialog id="statusDialog" class="modal">

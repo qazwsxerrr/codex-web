@@ -9,6 +9,8 @@ export function normalizeThreadItem(item, turn = {}) {
   if (item.type === "commandExecution") return { ...base, viewType: "command" };
   if (item.type === "fileChange") return { ...base, viewType: "change", files: normalizeFileChanges(item) };
   if (item.type === "mcpToolCall") return { ...base, viewType: "mcp" };
+  if (item.type === "webSearch") return { ...base, viewType: "search" };
+  if (item.type === "plan") return { ...base, viewType: "plan", planText: item.text || "" };
   if (item.type === "error") return { ...base, viewType: "error", text: item.message || item.error?.message || "Codex error" };
   return { ...base, viewType: "status" };
 }
@@ -27,4 +29,3 @@ export function normalizeThread(thread) {
     latestTurn: turns.at(-1) || null,
   };
 }
-

@@ -2,6 +2,7 @@ const STATUS_LABELS = {
   running: "Running",
   completed: "Completed",
   failed: "Failed",
+  denied: "Denied",
   cancelled: "Cancelled",
   unknown: "Unknown",
 };
@@ -10,6 +11,10 @@ const READONLY_COMMANDS = new Set([
   "cat", "cut", "du", "file", "head", "less", "ls", "more", "nl", "pwd",
   "find", "rg", "grep", "sed", "sort", "stat", "tail", "tree", "uniq", "wc",
 ]);
+
+// These commands expose file contents directly, so they get the compact
+// `read` label even though Codex reports the protocol item as bash.
+const READ_TOOL_COMMANDS = new Set(["cat", "sed", "head", "tail", "nl", "less", "more"]);
 
 const WRITE_COMMANDS = new Set([
   "chmod", "chown", "cp", "install", "mkdir", "mv", "rm", "rmdir", "tee", "touch",
@@ -296,9 +301,61 @@ function fallbackSummary(displayCommand, maxLength) {
   return truncateText(first || "执行命令", maxLength);
 }
 
+function commandActionsCategory(actions) {
+  if (!Array.isArray(actions)) return "";
+  const types = new Set(actions.map((action) => action?.type));
+  if (types.has("search") || types.has("listFiles")) return "search";
+  if (types.has("read")) return "read";
+  return "";
+}
+
+function summarizeCommandActions(actions, maxLength) {
+  if (!Array.isArray(actions)) return "";
+  const search = actions.find((action) => action?.type === "search");
+  if (search) {
+    const query = search.query || "";
+    return query ? truncateText(`搜索 “${query}”`, maxLength) : "搜索项目文件";
+  }
+  if (actions.some((action) => action?.type === "listFiles")) return "列出项目文件";
+  const read = actions.find((action) => action?.type === "read");
+  return read ? `查看 ${displayPath(read.path)}` : "";
+}
+
+function searchToolText(item) {
+  const actionText = Array.isArray(item?.commandActions)
+    ? item.commandActions.flatMap((action) => [action?.type, action?.query, action?.path])
+    : [];
+  return [item?.server, item?.tool, item?.name, item?.command, item?.action?.type, ...actionText]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase();
+}
+
+const SEARCH_TOOL_PATTERN = /(?:^|[\s:./_-])(?:search|find|grep|rg|ripgrep|glob|filesearch|searchfiles|listfiles)(?=$|[\s:./_-])/;
+
+export function searchActivityLabel(item) {
+  if (!item || typeof item !== "object") return "";
+  if (item.type === "webSearch") return "Searching web...";
+  if (item.type === "commandExecution") {
+    const command = unwrapShellCommand(item.command);
+    const names = splitSegments(command).map((segment) => commandBase(segment[0]));
+    if (commandActionsCategory(item.commandActions) === "search"
+      || classifyCommand(command).category === "search"
+      || names.some((name) => ["find", "grep", "rg"].includes(name))) {
+      return "Searching files...";
+    }
+  }
+  if (["mcpToolCall", "dynamicToolCall"].includes(item.type) && SEARCH_TOOL_PATTERN.test(searchToolText(item))) {
+    return "Searching files...";
+  }
+  return "";
+}
+
 function commandCategoryFromSegments(segments, source) {
   const names = segments.map((segment) => commandBase(segment[0]));
-  if (names.some((name) => ["rg", "grep"].includes(name))) return "search";
+  if (names.some((name) => ["rg", "grep"].includes(name)
+    || /(?:^|[-_])search(?:$|[-_])/.test(name))) return "search";
   if (names.some((name) => ["pytest", "jest", "vitest"].includes(name))) return "test";
   if (names.some((name) => name === "npm" && /(?:^|\s)(?:test|run\s+(?:test|check|lint))/.test(source))) return "test";
   if (names.some((name) => name === "node" && segments.some((segment) => segment.includes("--test")))) return "test";
@@ -349,18 +406,49 @@ function hasWriteSignal(source, segments) {
 }
 
 export function normalizeToolStatus(status) {
-  const raw = typeof status === "object" ? status?.kind || status?.status || status?.type : status;
+  const raw = typeof status === "object"
+    ? status?.kind || status?.status || status?.state || status?.type || status?.result
+    : status;
   const value = asText(raw).replace(/[\s_-]/g, "").toLowerCase();
-  const kind = value === "inprogress" || value === "running" || value === "started" || value === "active"
+  const kind = value === "inprogress" || value === "running" || value === "started" || value === "active" || value === "processing" || value === "cancelling" || value === "pending"
     ? "running"
     : value === "completed" || value === "complete" || value === "succeeded" || value === "success"
       ? "completed"
-      : value === "failed" || value === "error"
+      : value === "denied" || value === "rejected" || value === "forbidden"
+        ? "denied"
+        : value === "failed" || value === "failure" || value === "error" || value === "errored"
         ? "failed"
-        : value === "cancelled" || value === "canceled" || value === "aborted"
-          ? "cancelled"
-          : "unknown";
-  return { kind, label: STATUS_LABELS[kind], isActive: kind === "running", isFailure: kind === "failed" };
+          : value === "cancelled" || value === "canceled" || value === "aborted" || value === "stopped" || value === "interrupted"
+            ? "cancelled"
+            : "unknown";
+  return { kind, label: STATUS_LABELS[kind], isActive: kind === "running", isFailure: kind === "failed" || kind === "denied" };
+}
+
+function rawToolInput(item = {}) {
+  if (item.type === "commandExecution" || item.command !== undefined || item.commandLine !== undefined) {
+    return item.command ?? item.commandLine ?? item.rawCommand ?? item.input ?? "";
+  }
+  if (item.type === "read" || item.viewType === "read") {
+    return item.path ?? item.filePath ?? item.file ?? item.input ?? "";
+  }
+  if (item.type === "webSearch" || item.viewType === "search") {
+    return item.query ?? item.searchQuery ?? item.input ?? "";
+  }
+  if (item.type === "mcpToolCall") return item.input ?? item.arguments ?? item.params ?? item.parameters ?? item.tool ?? "";
+  return item.input ?? item.query ?? item.text ?? item.message ?? "";
+}
+
+export function toolInputText(item = {}) {
+  const value = rawToolInput(item);
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value); } catch { return "[unserializable input]"; }
+}
+
+export function toolInputPreview(item = {}, options = {}) {
+  const maxLength = Number(options.maxLength) > 0 ? Number(options.maxLength) : 150;
+  const value = toolInputText(item).replace(/\s+/g, " ").trim();
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(1, maxLength - 3)).trimEnd()}...`;
 }
 
 export function countOutputLines(output) {
@@ -417,6 +505,19 @@ export function commandEnvironmentLabel(rawCommand, options = {}) {
   return options.fallback || "Terminal";
 }
 
+export function commandToolName(itemOrCommand = {}) {
+  if (typeof itemOrCommand === "object" && itemOrCommand !== null) {
+    if (itemOrCommand.type === "read" || itemOrCommand.viewType === "read") return "read";
+    if (Array.isArray(itemOrCommand.commandActions)
+      && itemOrCommand.commandActions.some((action) => action?.type === "read")) return "read";
+  }
+  const rawCommand = typeof itemOrCommand === "string"
+    ? itemOrCommand
+    : itemOrCommand?.command ?? itemOrCommand?.commandLine ?? itemOrCommand?.rawCommand ?? "";
+  const names = splitSegments(unwrapShellCommand(rawCommand)).map((segment) => commandBase(segment[0]));
+  return names.some((name) => READ_TOOL_COMMANDS.has(name)) ? "read" : "bash";
+}
+
 export function summarizeCommand(rawCommand, options = {}) {
   const maxLength = Number(options.maxLength) > 0 ? Number(options.maxLength) : 96;
   const displayCommand = unwrapShellCommand(rawCommand);
@@ -442,6 +543,7 @@ export function summarizeCommand(rawCommand, options = {}) {
   } else if (first === "pwd") summary = "查看当前目录";
   else if (["ls", "tree"].includes(first)) summary = "列出项目文件";
   else if (first === "find") summary = "查找项目文件";
+  else if (/(?:^|[-_])search(?:$|[-_])/.test(first)) summary = "搜索项目内容";
   else if (["pytest", "jest", "vitest"].includes(first) || (first === "npm" && (segments[0]?.[1] === "test" || (segments[0]?.[1] === "run" && ["test", "check", "lint"].includes(segments[0]?.[2])))) || (first === "node" && segments[0]?.includes("--test"))) summary = "运行测试";
   else if (first === "npm" && segments[0]?.[1] === "run") summary = `运行 npm ${segments[0]?.[2] || "脚本"}`;
   else if (["make", "tsc", "vite", "webpack", "cargo"].includes(first)) summary = "构建项目";
@@ -455,18 +557,25 @@ export function summarizeCommand(rawCommand, options = {}) {
 
 export function presentCommand(itemOrCommand, options = {}) {
   const item = itemOrCommand && typeof itemOrCommand === "object" ? itemOrCommand : {};
-  const rawCommand = typeof itemOrCommand === "string" ? itemOrCommand : item.command;
+  const rawCommand = typeof itemOrCommand === "string"
+    ? itemOrCommand
+    : item.command ?? item.commandLine ?? item.rawCommand ?? "";
   const raw = asText(rawCommand);
   const displayCommand = unwrapShellCommand(raw);
-  const normalizedStatus = normalizeToolStatus(item.status);
+  const normalizedStatus = normalizeToolStatus(item.status ?? item.state ?? item.result);
   const classification = classifyCommand(raw, { durationMs: item.durationMs ?? options.durationMs });
+  const actionCategory = commandActionsCategory(item.commandActions);
+  const actionSummary = summarizeCommandActions(item.commandActions, options.maxLength);
   return {
     rawCommand: raw,
     displayCommand,
-    summary: summarizeCommand(raw, options),
-    category: classification.category,
+    ...classification,
+    summary: actionSummary || summarizeCommand(raw, options),
+    category: actionCategory || classification.category,
+    toolName: commandToolName(item),
     environmentLabel: commandEnvironmentLabel(raw, options),
     normalizedStatus,
-    ...classification,
+    rawInput: raw,
+    inputPreview: toolInputPreview(item, options),
   };
 }

@@ -4,6 +4,7 @@ export function createSessionSettings(thread = {}, fallback = {}) {
     reasoningEffort: thread.reasoningEffort || thread.effort || fallback.reasoningEffort || null,
     permissions: thread.permissions || thread.activePermissionProfile?.id || fallback.permissions || null,
     serviceTier: thread.serviceTier || fallback.serviceTier || null,
+    collaborationMode: thread.collaborationMode || fallback.collaborationMode || null,
     cwd: thread.cwd || fallback.cwd || "",
   };
 }

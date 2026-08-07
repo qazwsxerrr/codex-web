@@ -1,8 +1,14 @@
 export function timestampToMs(value) {
+  if (value === null || value === undefined) return null;
   if (value instanceof Date) return value.getTime();
-  if (typeof value === "string" && value.trim() && !/^[+-]?\d+(?:\.\d+)?$/.test(value.trim())) {
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : null;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return null;
+    if (/^[+-]?\d+(?:\.\d+)?$/.test(text)) value = text;
+    else {
+      const parsed = Date.parse(text);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
   }
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return null;

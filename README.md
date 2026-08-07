@@ -30,6 +30,12 @@ resume remains available as a secondary control. If an older App Server does not
 support `thread/list`, the sidebar reports that limitation and keeps manual
 resume available instead of presenting a synthetic history list.
 
+If another Codex client currently owns the Thread rollout writer, the web client
+falls back to `thread/read` to restore the existing conversation. History,
+Markdown/KaTeX, tool output, diffs, and status remain available. The composer and
+other controls keep their normal appearance; App Server reports the original
+`already has an active writer` error if a write is attempted.
+
 ## What v4 fixes
 
 - Pressing Enter on a highlighted slash suggestion now executes the complete
@@ -136,8 +142,9 @@ PORT=4318 PROJECT_CWD=/mnt/d/ai_code/ai_project/ct_time npm start
 
 This is a browser client for Codex App Server. It can list, resume, and operate
 the same threads, but it does not mirror terminal pixels or the local input state of a
-simultaneously running Codex TUI. Do not drive one active thread from both clients
-at the same time.
+simultaneously running Codex TUI. When the TUI owns a Thread writer, codex-web can
+still restore the saved conversation, while writes remain exclusive to the owning
+client and are rejected by App Server.
 
 ## Security
 
