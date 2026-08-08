@@ -13,8 +13,8 @@ import { composeUserInput, displayInput, makeMention, MAX_IMAGES, validateImage 
 import { diffRowMarker, normalizeFileChanges, visibleDiffRows } from "/diff-data.js";
 import { normalizeFileSearchFiles } from "/file-search-data.js";
 import { countOutputLines, normalizeToolStatus, presentCommand, searchActivityLabel, tailOutputLines, toolInputPreview } from "/command-presentation.js";
-import { buildConversationBlocks, buildProcessDetailsForTurns, commandGroupId, isGroupableReadonlyCommand, mergeCachedTools } from "/conversation-blocks.js";
-import { buildProcessDetails, normalizeDisplayStatus, presentTool } from "/message-display.js";
+import { buildConversationBlocks, buildProcessDetailsForTurns, mergeCachedTools } from "/conversation-blocks.js";
+import { buildProcessDetails, isDisplayableProcessItem, isToolCallItem, normalizeDisplayStatus, presentTool, resolveModelDisplayName } from "/message-display.js";
 import { createQueueEntry, isQueueEntryRetryable, nextQueueEntry, queueForThread, queueReducer } from "/queue-data.js";
 import { normalizeThread } from "/thread-items.js";
 import { isNotificationForThread } from "/notification-scope.js";
@@ -211,7 +211,6 @@ const state = {
   expandedDiffFiles: new Set(),
   expandedCommands: new Set(),
   collapsedCommands: new Set(),
-  expandedCommandGroups: new Set(),
   expandedMcpTools: new Set(),
   expandedCommandOutputs: new Set(),
   expandedProcesses: new Set(),
@@ -1061,7 +1060,6 @@ function createThreadUiState() {
     expandedDiffFiles: [],
     expandedCommands: [],
     collapsedCommands: [],
-    expandedCommandGroups: [],
     expandedMcpTools: [],
     expandedCommandOutputs: [],
     expandedProcesses: [],
@@ -1163,7 +1161,6 @@ function readThreadUi(threadId) {
         : [],
       expandedCommands: Array.isArray(stored?.expandedCommands) ? stored.expandedCommands : [],
       collapsedCommands: Array.isArray(stored?.collapsedCommands) ? stored.collapsedCommands : [],
-      expandedCommandGroups: Array.isArray(stored?.expandedCommandGroups) ? stored.expandedCommandGroups : [],
       expandedMcpTools: Array.isArray(stored?.expandedMcpTools) ? stored.expandedMcpTools : [],
       expandedCommandOutputs: Array.isArray(stored?.expandedCommandOutputs) ? stored.expandedCommandOutputs : [],
       expandedProcesses: Array.isArray(stored?.expandedProcesses) ? stored.expandedProcesses : [],
@@ -1187,7 +1184,6 @@ function saveThreadUi() {
     expandedDiffFiles: [...state.expandedDiffFiles],
     expandedCommands: [...state.expandedCommands],
     collapsedCommands: [...state.collapsedCommands],
-    expandedCommandGroups: [...state.expandedCommandGroups],
     expandedMcpTools: [...state.expandedMcpTools],
     expandedCommandOutputs: [...state.expandedCommandOutputs],
     expandedProcesses: [...state.expandedProcesses],
@@ -1217,7 +1213,6 @@ function activateThreadUi(threadId) {
   state.expandedDiffFiles = new Set(state.threadUi.expandedDiffFiles);
   state.expandedCommands = new Set(state.threadUi.expandedCommands);
   state.collapsedCommands = new Set(state.threadUi.collapsedCommands);
-  state.expandedCommandGroups = new Set(state.threadUi.expandedCommandGroups);
   state.expandedMcpTools = new Set(state.threadUi.expandedMcpTools);
   state.expandedCommandOutputs = new Set(state.threadUi.expandedCommandOutputs);
   state.expandedProcesses = new Set(state.threadUi.expandedProcesses);
@@ -1406,7 +1401,6 @@ function resetActiveThreadAfterDeletion(threadId) {
   state.expandedDiffFiles.clear();
   state.expandedCommands.clear();
   state.collapsedCommands.clear();
-  state.expandedCommandGroups.clear();
   state.expandedMcpTools.clear();
   state.expandedCommandOutputs.clear();
   state.expandedProcesses.clear();
@@ -1581,6 +1575,23 @@ function addSystemMessage(text, kind = "info") {
   scrollToBottom();
 }
 
+function addProcessError(item, turnId = state.activeTurnId) {
+  const message = item?.message || item?.error?.message || item?.errorMessage || item?.text || "Codex error";
+  const process = ensureProcessDetails(turnId);
+  const node = document.createElement("div");
+  node.className = "process-error";
+  node.textContent = message;
+  node.title = message;
+  process.body.append(node);
+  if (item?.id) {
+    process.itemIds.add(item.id);
+    process.items?.set(item.id, { ...item, type: "error", message });
+  }
+  updateProcessSummary(process);
+  scrollToBottom();
+  return node;
+}
+
 function renderMarkdown(node, raw, { preserveLineBreaks = false } = {}) {
   const extracted = extractMath(raw || "");
   const html = marked.parse(extracted.markdown, preserveLineBreaks ? { breaks: true } : undefined);
@@ -1602,16 +1613,23 @@ function processKey(turnId = state.activeTurnId) {
 
 function updateProcessSummary(record) {
   if (!record) return;
-  const count = record.itemIds.size;
-  const toolCount = [...record.itemIds].filter((id) => state.toolNodes.get(id)).length;
-  const durations = [...record.itemIds]
-    .map((id) => state.toolNodes.get(id)?.item?.durationMs)
-    .map(Number)
-    .filter((value) => Number.isFinite(value) && value >= 0);
-  const duration = durations.length ? durations.reduce((sum, value) => sum + value, 0) : null;
-  const parts = [`Process details`, `${count} item${count === 1 ? "" : "s"}`];
-  if (toolCount) parts.push(`${toolCount} tool${toolCount === 1 ? "" : "s"}`);
-  if (duration !== null) parts.push(durationLabel(duration));
+  let messageCount = 0;
+  let toolCount = 0;
+  for (const id of record.itemIds) {
+    const tool = state.toolNodes.get(id)?.item || record.items?.get(id);
+    if (isToolCallItem(tool)) {
+      toolCount += 1;
+      continue;
+    }
+    const message = state.messageNodes.get(id);
+    if (message && (message.raw || message.role === "assistant")) {
+      messageCount += 1;
+      continue;
+    }
+    if (isDisplayableProcessItem(record.items?.get(id))) messageCount += 1;
+  }
+  const parts = [`Process details`, `${messageCount} message${messageCount === 1 ? "" : "s"}`];
+  if (toolCount) parts.push(`${toolCount} tool call${toolCount === 1 ? "" : "s"}`);
   record.summaryText.textContent = parts.join(" · ");
 }
 
@@ -1619,26 +1637,48 @@ function ensureProcessDetails(turnId = state.activeTurnId, container = chat) {
   const key = processKey(turnId);
   let record = state.processNodes.get(key);
   if (record) return record;
-  const details = document.createElement("details");
+  const details = document.createElement("section");
   details.className = "process-details";
   details.dataset.processKey = key;
-  const summary = document.createElement("summary");
-  summary.className = "process-details-summary";
-  const chevron = document.createElement("span");
-  chevron.className = "process-details-chevron";
-  chevron.textContent = "›";
+  const summary = document.createElement("button");
+  summary.type = "button";
+  summary.className = "process-details-toggle";
+  summary.setAttribute("aria-expanded", "false");
+  const chevron = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  chevron.setAttribute("class", "process-details-chevron");
+  chevron.setAttribute("width", "12");
+  chevron.setAttribute("height", "12");
+  chevron.setAttribute("viewBox", "0 0 12 12");
+  chevron.setAttribute("fill", "none");
+  chevron.setAttribute("stroke", "currentColor");
+  chevron.setAttribute("stroke-width", "1.6");
+  chevron.setAttribute("stroke-linecap", "round");
+  chevron.setAttribute("stroke-linejoin", "round");
+  chevron.setAttribute("aria-hidden", "true");
+  const processChevronLine = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  processChevronLine.setAttribute("points", "4 2.5 7.5 6 4 9.5");
+  chevron.append(processChevronLine);
   const summaryText = document.createElement("span");
   summaryText.className = "process-details-text";
   const body = document.createElement("div");
   body.className = "process-details-body";
+  body.hidden = true;
   summary.append(chevron, summaryText);
   details.append(summary, body);
-  record = { key, turnId, details, summary, summaryText, body, itemIds: new Set() };
-  details.open = state.expandedProcesses.has(key);
-  details.addEventListener("toggle", () => {
-    if (details.open) state.expandedProcesses.add(key);
+  record = { key, turnId, details, summary, summaryText, body, itemIds: new Set(), items: new Map() };
+  const expanded = state.expandedProcesses.has(key);
+  body.hidden = !expanded;
+  summary.setAttribute("aria-expanded", String(expanded));
+  details.classList.toggle("expanded", expanded);
+  summary.addEventListener("click", () => {
+    const next = body.hidden;
+    body.hidden = !next;
+    summary.setAttribute("aria-expanded", String(next));
+    details.classList.toggle("expanded", next);
+    if (next) state.expandedProcesses.add(key);
     else state.expandedProcesses.delete(key);
     saveThreadUi();
+    scrollToBottom();
   });
   (container || chat).append(details);
   state.processNodes.set(key, record);
@@ -1650,6 +1690,7 @@ function registerProcessItem(item, record = null) {
   if (!item?.id) return record;
   const process = record || ensureProcessDetails(item.turnId || state.activeTurnId);
   process.itemIds.add(item.id);
+  process.items?.set(item.id, item);
   updateProcessSummary(process);
   return process;
 }
@@ -1730,10 +1771,27 @@ function ensureMessage(id, role, meta = {}) {
   let record = state.messageNodes.get(id);
   if (record) {
     if (meta.turnId && !record.turnId) record.turnId = meta.turnId;
+    if (role === "assistant") {
+      const resolved = resolveModelDisplayName({
+        message: meta.item,
+        turn: meta.turn,
+        thread: { model: record.modelId || meta.model || state.threadMeta.model || modelSelect.value },
+        models: state.models,
+        modelId: record.modelId || meta.model,
+      });
+      // A metadata refresh may finally provide the display name for the id
+      // this message was created with. Never follow a later selector change.
+      if (resolved.id && record.modelId === resolved.id && !record.modelResolved && resolved.resolved) {
+        record.modelLabel = resolved.label;
+        record.modelResolved = true;
+        record.label.textContent = resolved.label;
+      }
+    }
     if (role === "assistant" && meta.process === true && !record.process) {
       const process = ensureProcessDetails(meta.turnId ?? state.activeTurnId ?? record.turnId);
       process.body.append(record.article);
       process.itemIds.add(record.id);
+      process.items?.set(record.id, { id: record.id, type: "agentMessage", role: "assistant", text: record.raw });
       record.process = process;
       updateProcessSummary(process);
     }
@@ -1747,16 +1805,30 @@ function ensureMessage(id, role, meta = {}) {
   article.id = `message-${String(id).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
   const head = document.createElement("div");
   head.className = "message-head";
-  const avatar = document.createElement("span");
-  avatar.className = "message-avatar";
-  avatar.textContent = role === "user" ? "Y" : "C";
+  const avatar = role === "user" ? document.createElement("span") : null;
+  if (avatar) {
+    avatar.className = "message-avatar";
+    avatar.textContent = "Y";
+  }
   const label = document.createElement("div");
   label.className = "message-label";
-  label.textContent = role === "user" ? "You" : "Codex";
-  const time = document.createElement("time");
-  time.className = "message-time";
-  const timestamp = Number(meta.startedAt || state.currentTurn?.startedAt || 0);
-  time.textContent = timestamp ? new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(new Date(timestamp * 1000)) : "";
+  const modelInfo = role === "assistant"
+    ? resolveModelDisplayName({
+        message: meta.item,
+        turn: meta.turn,
+        thread: { model: meta.model || state.threadMeta.model || modelSelect.value },
+        models: state.models,
+        modelId: meta.item?.model ?? meta.item?.modelId ?? meta.model,
+      })
+    : null;
+  label.textContent = role === "user" ? "You" : modelInfo.label;
+  if (modelInfo?.id) label.dataset.modelId = modelInfo.id;
+  const time = role === "user" ? document.createElement("time") : null;
+  if (time) {
+    time.className = "message-time";
+    const timestamp = Number(meta.startedAt || state.currentTurn?.startedAt || 0);
+    time.textContent = timestamp ? new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" }).format(new Date(timestamp * 1000)) : "";
+  }
   const copy = document.createElement("button");
   copy.type = "button";
   copy.className = "icon-button message-copy";
@@ -1768,7 +1840,10 @@ function ensureMessage(id, role, meta = {}) {
   const content = document.createElement("div");
   content.className = "message-content markdown-body";
   copy.addEventListener("click", () => navigator.clipboard.writeText(record?.raw || ""));
-  head.append(avatar, label, time, copy);
+  if (avatar) head.append(avatar);
+  head.append(label);
+  if (time) head.append(time);
+  head.append(copy);
   article.append(head, content);
   const turnId = meta.turnId ?? state.activeTurnId ?? state.currentTurn?.id;
   const process = role === "assistant" && meta.process !== false && (meta.live !== false ? meta.process !== false : meta.process === true)
@@ -1785,6 +1860,10 @@ function ensureMessage(id, role, meta = {}) {
     article,
     content,
     time,
+    label,
+    modelId: modelInfo?.id || "",
+    modelLabel: modelInfo?.label || "Codex",
+    modelResolved: Boolean(modelInfo?.resolved),
     streaming: false,
     streamPrefixLength: 0,
     streamNeedsFinalRender: false,
@@ -1795,6 +1874,7 @@ function ensureMessage(id, role, meta = {}) {
   state.messageNodes.set(id, record);
   if (process) {
     process.itemIds.add(id);
+    process.items?.set(id, { id, type: role === "assistant" ? "agentMessage" : "userMessage", role });
     updateProcessSummary(process);
   }
   if (meta.live !== false) state.conversationOrder.push({ kind: "barrier", id, turnId: turnId ?? null });
@@ -1829,7 +1909,7 @@ function searchQuery(item) {
   const action = item?.action;
   const queries = Array.isArray(action?.queries) ? action.queries : [];
   const value = item?.query || action?.query || queries[0] || "";
-  return typeof value === "string" ? value : JSON.stringify(value);
+  return typeof value === "string" ? value : toolCopyText(value);
 }
 
 function searchStepTitle(item, isActive) {
@@ -1841,11 +1921,73 @@ function searchResultText(item) {
   const value = item?.results ?? item?.result ?? item?.output ?? item?.response ?? item?.aggregatedOutput;
   if (value === undefined || value === null || value === "") return "";
   if (typeof value === "string") return value;
-  try { return JSON.stringify(value, null, 2); } catch { return "[unserializable search result]"; }
+  return toolCopyText(value);
+}
+
+function toolCopyText(value) {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "string") return value;
+  try {
+    const serialized = JSON.stringify(value, (key, nested) => {
+      if (!nested || typeof nested !== "object" || Array.isArray(nested)) return nested;
+      return Object.fromEntries(Object.keys(nested).sort().map((name) => [name, nested[name]]));
+    }, 2);
+    return serialized === undefined ? String(value) : serialized;
+  } catch {
+    return "[unserializable value]";
+  }
+}
+
+function toolCopySection(label, value) {
+  const text = toolCopyText(value);
+  return text ? `${label}:\n${text}` : "";
+}
+
+function commandCopyText(record) {
+  const item = record?.item || {};
+  const model = record?.presentation || presentCommand(item);
+  const sections = [
+    toolCopySection("Command", item.command ?? item.commandLine ?? item.rawCommand ?? model.rawCommand),
+    toolCopySection("Output", item.aggregatedOutput),
+    toolCopySection("stdout", item.stdout),
+    toolCopySection("stderr", item.stderr),
+    toolCopySection("Error", item.errorMessage ?? item.error),
+  ].filter(Boolean);
+  return sections.join("\n\n") || toolCopyText(item);
+}
+
+function searchCopyText(record) {
+  const sections = [
+    toolCopySection("Query", record?.rawQuery || "(empty query)"),
+    toolCopySection("Results", record?.resultText),
+  ].filter(Boolean);
+  return sections.join("\n\n") || toolCopyText(record?.item || {});
+}
+
+function mcpCopyText(item) {
+  const input = item?.arguments ?? item?.params ?? item?.parameters ?? item?.input;
+  const result = item?.result ?? item?.output ?? item?.response;
+  const error = item?.error ?? item?.errorMessage ?? item?.failureReason;
+  const sections = [
+    toolCopySection("Server", item?.server),
+    toolCopySection("Tool", item?.tool),
+    toolCopySection("Params", input),
+    toolCopySection("Result", result),
+    toolCopySection("Error", error),
+  ].filter(Boolean);
+  return sections.join("\n\n") || toolCopyText(item || {});
+}
+
+function fileChangeCopyText(item, files = normalizeFileChanges(item)) {
+  const sections = (Array.isArray(files) ? files : []).map((file) => [
+    toolCopySection("Path", file?.path),
+    toolCopySection("Diff", file?.diff),
+  ].filter(Boolean).join("\n")).filter(Boolean);
+  return sections.join("\n\n") || toolCopyText(item || {});
 }
 
 function renderSearchDetails(record) {
-  if (!record.card.open) {
+  if (!record.open) {
     record.body.replaceChildren();
     return;
   }
@@ -1874,62 +2016,34 @@ function renderSearchDetails(record) {
     results.textContent = record.resultText;
     record.body.append(resultLabel, results);
   }
+  record.body.append(record.copyButton);
 }
 
 function updateSearchStep(item, options = {}) {
   if (!item?.id || item.type !== "webSearch") return null;
   let record = state.searchNodes.get(item.id);
   if (!record) {
-    const card = document.createElement("details");
-    card.className = "search-step";
-    card.dataset.itemId = item.id;
-    const summary = document.createElement("summary");
-    summary.className = "search-step-summary";
-    const tool = document.createElement("span");
-    tool.className = "search-step-tool search-step-title";
-    tool.textContent = "web_search";
-    const query = document.createElement("span");
-    query.className = "search-step-query";
-    const duration = document.createElement("span");
-    duration.className = "search-step-duration";
-    const status = document.createElement("span");
-    status.className = "search-step-status";
-    status.setAttribute("role", "status");
-    const chevron = document.createElement("span");
-    chevron.className = "search-step-chevron command-step-chevron";
-    chevron.textContent = "›";
-    chevron.setAttribute("aria-hidden", "true");
-    // Keep the summary's reading order stable: tool, raw input, duration,
-    // status, then the disclosure arrow.
-    summary.append(tool, query, duration, status, chevron);
-    const body = document.createElement("div");
-    body.className = "search-step-body";
-    card.append(summary, body);
-    const target = options.container || (options.process === true || options.live !== false
-      ? ensureProcessDetails(options.turnId || item.turnId || state.activeTurnId).body
-      : chat);
-    target.append(card);
+    const process = options.process === true || options.live !== false
+      ? ensureProcessDetails(options.turnId || item.turnId || state.activeTurnId)
+      : null;
+    const target = options.container || process?.body || chat;
+    const shell = createPiToolShell(item, "search", target);
     record = {
       kind: "search",
-      card,
-      summary,
-      tool,
-      title: tool,
-      query,
-      duration,
-      status,
-      chevron,
-      body,
+      ...shell,
+      card: shell.details,
+      tool: shell.type,
+      title: shell.type,
+      query: shell.preview,
       item,
+      process,
       rawQuery: "",
       resultText: "",
     };
+    record.copyButton = createPiToolCopyButton(() => searchCopyText(record));
+    shell.onToggle = () => renderSearchDetails(record);
     state.searchNodes.set(item.id, record);
-    card.addEventListener("toggle", () => {
-      renderSearchDetails(record);
-      scrollToBottom();
-    });
-    if (options.process === true || options.live !== false) registerProcessItem(item);
+    if (process) registerProcessItem(item, process);
   }
   record.item = item;
   const normalizedStatus = normalizeToolStatus(item.status || (options.active ? "inProgress" : "completed"));
@@ -1945,15 +2059,15 @@ function updateSearchStep(item, options = {}) {
   record.card.classList.toggle("search-step-running", isActive);
   record.tool.textContent = "web_search";
   record.title.textContent = "web_search";
-  record.query.textContent = toolInputPreview(item, { maxLength: 180 }) || "(empty query)";
+  record.query.textContent = toolInputPreview(item, { maxLength: 120 }) || "";
   record.query.title = query || "(empty query)";
-  record.duration.textContent = durationLabel(durationMs);
+  record.duration.textContent = toolDurationLabel(durationMs);
   record.status.textContent = "";
   record.status.setAttribute("aria-label", normalizedStatus.label);
   record.status.dataset.label = normalizedStatus.label;
   record.status.dataset.kind = normalizedStatus.kind;
   record.statusLabel = normalizedStatus.label;
-  if (record.card.open) renderSearchDetails(record);
+  if (record.open) renderSearchDetails(record);
   ensureCommandDurationTimer();
   updateProcessSummary(record.process);
   return record;
@@ -1979,6 +2093,8 @@ function setFileChangeExpanded(record, item, expanded) {
   }
   record.details.classList.toggle("expanded", expanded);
   record.body.hidden = !expanded;
+  record.open = expanded;
+  record.summary.setAttribute("aria-expanded", String(expanded));
   saveThreadUi();
 }
 
@@ -2003,7 +2119,7 @@ function ensureCommandDurationTimer() {
       if (!status.isActive && !record.active) continue;
       active = true;
       const duration = toolDurationMs(record.item, record);
-      if (Number.isFinite(duration)) record.duration.textContent = durationLabel(duration);
+      if (Number.isFinite(duration)) record.duration.textContent = toolDurationLabel(duration);
     }
     if (!active) {
       clearInterval(state.commandDurationTimer);
@@ -2062,30 +2178,87 @@ function appendCommandField(container, label, value, className = "command-step-f
   return content;
 }
 
-function createCommandStep(item, container = chat) {
-  const details = document.createElement("details");
-  details.className = "command-step";
-  details.dataset.itemId = item.id;
-  const summary = document.createElement("summary");
-  summary.className = "command-step-summary";
-  const chevron = document.createElement("span");
-  chevron.className = "command-step-chevron";
-  chevron.textContent = "›";
-  chevron.setAttribute("aria-hidden", "true");
-  const summaryText = document.createElement("span");
-  summaryText.className = "command-step-title";
-  const environment = document.createElement("span");
-  environment.className = "command-step-environment";
-  const status = document.createElement("span");
-  status.className = "command-step-status";
-  status.setAttribute("role", "status");
-  const duration = document.createElement("span");
-  duration.className = "command-step-duration";
-  // The collapsed row reads as tool, raw input, duration, status, arrow.
-  summary.append(environment, summaryText, duration, status, chevron);
+function createPiToolCopyButton(getText) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "pi-tool-copy text-button";
+  button.title = "Copy tool details";
+  button.setAttribute("aria-label", "Copy tool details");
+  const icon = document.createElement("i");
+  icon.dataset.icon = "copy";
+  const label = document.createElement("span");
+  label.textContent = "Copy";
+  button.append(icon, label);
+  renderIcons(button);
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    let value = "";
+    try { value = getText?.() ?? ""; } catch { value = "[unserializable value]"; }
+    copyField(String(value));
+  });
+  return button;
+}
 
+function createToolChevron(className = "pi-tool-chevron") {
+  const chevron = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  chevron.setAttribute("class", className);
+  chevron.setAttribute("width", "10");
+  chevron.setAttribute("height", "10");
+  chevron.setAttribute("viewBox", "0 0 10 10");
+  chevron.setAttribute("fill", "none");
+  chevron.setAttribute("stroke", "currentColor");
+  chevron.setAttribute("stroke-width", "1.6");
+  chevron.setAttribute("stroke-linecap", "round");
+  chevron.setAttribute("stroke-linejoin", "round");
+  chevron.setAttribute("aria-hidden", "true");
+  const toolChevronLine = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  toolChevronLine.setAttribute("points", "2 3.5 5 6.5 8 3.5");
+  chevron.append(toolChevronLine);
+  return chevron;
+}
+
+/** Shared Pi-style shell used by every expandable tool row. */
+function createPiToolShell(item, kind, container, onToggle) {
+  const details = document.createElement("section");
+  details.className = `pi-tool-step ${kind}-step`;
+  details.dataset.itemId = item.id;
+  const summary = document.createElement("button");
+  summary.type = "button";
+  summary.className = `pi-tool-step-toggle ${kind}-step-summary`;
+  summary.setAttribute("aria-expanded", "false");
+  const type = document.createElement("span");
+  type.className = `pi-tool-type ${kind}-step-tool ${kind}-step-title`;
+  const preview = document.createElement("span");
+  preview.className = `pi-tool-preview ${kind}-step-preview ${kind}-step-query`;
+  const duration = document.createElement("span");
+  duration.className = "pi-tool-duration command-step-duration";
+  const status = document.createElement("span");
+  status.className = "pi-tool-status command-step-status";
+  status.setAttribute("role", "status");
+  const chevron = createToolChevron();
+  summary.append(type, preview, duration, status, chevron);
   const body = document.createElement("div");
-  body.className = "command-step-body";
+  body.className = `pi-tool-step-body ${kind}-step-body`;
+  body.hidden = true;
+  details.append(summary, body);
+  const record = { details, summary, type, preview, duration, status, chevron, body, item, open: false };
+  summary.addEventListener("click", () => {
+    record.open = !record.open;
+    body.hidden = !record.open;
+    summary.setAttribute("aria-expanded", String(record.open));
+    details.classList.toggle("expanded", record.open);
+    record.onToggle?.(record, record.open);
+    scrollToBottom();
+  });
+  if (container) container.append(details);
+  return record;
+}
+
+function createCommandStep(item, container = chat) {
+  const shell = createPiToolShell(item, "command", container);
+  const { details, summary, type: environment, preview: summaryText, status, duration, chevron, body } = shell;
+
   const meta = document.createElement("div");
   meta.className = "command-step-meta";
   const cwd = document.createElement("span");
@@ -2111,10 +2284,9 @@ function createCommandStep(item, container = chat) {
   outputBlock.append(outputHint, outputTail, outputDetails);
   meta.append(cwd, exit, statusDetail);
   body.append(meta, raw, outputBlock);
-  details.append(summary, body);
-
   const record = {
     kind: "command",
+    ...shell,
     details,
     summary,
     summaryText,
@@ -2134,19 +2306,18 @@ function createCommandStep(item, container = chat) {
     fullOutput,
     item,
     presentation: null,
-    group: null,
-    ignoreNextToggle: true,
   };
-  details.open = commandDefaultOpen(item) && !state.collapsedCommands.has(item.id) || state.expandedCommands.has(item.id);
-  details.addEventListener("toggle", () => {
-    if (record.ignoreNextToggle) {
-      record.ignoreNextToggle = false;
-      return;
-    }
-    setCommandPersistence(record, details.open);
-    if (details.open) patchCommandStep(record, record.item);
-    scrollToBottom();
-  });
+  record.copyButton = createPiToolCopyButton(() => commandCopyText(record));
+  body.append(record.copyButton);
+  shell.onToggle = (ignoredShell, open) => {
+    setCommandPersistence(record, open);
+    if (open) patchCommandStep(record, record.item);
+  };
+  const expanded = commandDefaultOpen(item) && !state.collapsedCommands.has(item.id) || state.expandedCommands.has(item.id);
+  record.open = expanded;
+  body.hidden = !expanded;
+  summary.setAttribute("aria-expanded", String(expanded));
+  details.classList.toggle("expanded", expanded);
   outputDetails.open = state.expandedCommandOutputs.has(item.id);
   outputDetails.addEventListener("toggle", () => {
     if (outputDetails.open) state.expandedCommandOutputs.add(item.id);
@@ -2154,7 +2325,6 @@ function createCommandStep(item, container = chat) {
     if (outputDetails.open) fullOutput.textContent = record.item?.aggregatedOutput || "";
     saveThreadUi();
   });
-  if (container) container.append(details);
   patchCommandStep(record, item);
   return record;
 }
@@ -2169,7 +2339,7 @@ function patchCommandStep(record, item) {
   record.details.dataset.status = model.normalizedStatus.kind;
   record.details.classList.toggle("command-step-running", model.normalizedStatus.isActive);
   record.details.classList.toggle("command-step-failed", model.normalizedStatus.isFailure);
-  record.summaryText.textContent = model.inputPreview || model.rawCommand || model.summary;
+  record.summaryText.textContent = model.inputPreview || model.rawCommand || "";
   record.summaryText.title = model.rawCommand || model.inputPreview || "Tool input";
   const displayToolName = item.type === "commandExecution"
     ? model.toolName
@@ -2180,10 +2350,10 @@ function patchCommandStep(record, item) {
   record.status.dataset.label = model.normalizedStatus.label;
   record.status.dataset.kind = model.normalizedStatus.kind;
   record.statusDetail.textContent = `Status: ${model.normalizedStatus.label}`;
-  record.duration.textContent = durationLabel(durationMs);
-  record.cwd.textContent = `cwd: ${item.cwd || "--"}`;
-  record.cwd.title = item.cwd || "--";
-  record.exit.textContent = `exit: ${item.exitCode ?? "--"}`;
+  record.duration.textContent = toolDurationLabel(durationMs);
+  record.cwd.textContent = item.cwd ? `cwd: ${item.cwd}` : "";
+  record.cwd.title = item.cwd || "Working directory unavailable";
+  record.exit.textContent = item.exitCode === null || item.exitCode === undefined ? "" : `exit: ${item.exitCode}`;
   record.raw.textContent = model.rawCommand || model.inputPreview || "(empty input)";
   record.raw.title = model.rawCommand || model.inputPreview || "Raw tool input";
   const output = item.aggregatedOutput || "";
@@ -2200,7 +2370,10 @@ function patchCommandStep(record, item) {
   record.outputDetails.hidden = !output;
   if (record.outputDetails.open) record.fullOutput.textContent = output;
   if (previousStatus.isActive && model.normalizedStatus.kind === "completed" && !state.expandedCommands.has(item.id) && !state.collapsedCommands.has(item.id)) {
-    record.details.open = false;
+    record.open = false;
+    record.body.hidden = true;
+    record.summary.setAttribute("aria-expanded", "false");
+    record.details.classList.remove("expanded");
   }
   if (model.normalizedStatus.isFailure) record.details.classList.add("command-step-failed");
   updateProcessSummary(record.process);
@@ -2223,39 +2396,16 @@ function mcpPayload(item) {
 }
 
 function createMcpStep(item, container = chat) {
-  const details = document.createElement("details");
-  details.className = "mcp-step";
-  details.dataset.itemId = item.id;
-  const summary = document.createElement("summary");
-  summary.className = "mcp-step-summary";
-  const chevron = document.createElement("span");
-  chevron.className = "command-step-chevron";
-  chevron.textContent = "›";
-  const title = document.createElement("span");
-  title.className = "mcp-step-title";
-  const environment = document.createElement("span");
-  environment.className = "command-step-environment";
-  environment.textContent = "MCP";
-  const status = document.createElement("span");
-  status.className = "command-step-status";
-  status.setAttribute("role", "status");
-  const duration = document.createElement("span");
-  duration.className = "command-step-duration";
-  summary.append(environment, title, duration, status, chevron);
-  const body = document.createElement("div");
-  body.className = "mcp-step-body";
-  details.append(summary, body);
-  const record = { kind: "mcp", details, summary, title, environment, status, duration, body, item, ignoreNextToggle: true };
-  details.open = commandDefaultOpen(item) || state.expandedMcpTools.has(item.id);
-  details.addEventListener("toggle", () => {
-    if (record.ignoreNextToggle) {
-      record.ignoreNextToggle = false;
-      return;
-    }
-    setMcpPersistence(record, details.open);
-    scrollToBottom();
-  });
-  container.append(details);
+  const shell = createPiToolShell(item, "mcp", container);
+  const { details, summary, type: environment, preview: title, status, duration, chevron, body } = shell;
+  const record = { kind: "mcp", ...shell, details, summary, title, environment, status, duration, body, item };
+  record.copyButton = createPiToolCopyButton(() => mcpCopyText(record.item));
+  shell.onToggle = (ignoredShell, open) => setMcpPersistence(record, open);
+  const expanded = commandDefaultOpen(item) || state.expandedMcpTools.has(item.id);
+  record.open = expanded;
+  body.hidden = !expanded;
+  summary.setAttribute("aria-expanded", String(expanded));
+  details.classList.toggle("expanded", expanded);
   patchMcpStep(record, item);
   return record;
 }
@@ -2265,19 +2415,19 @@ function patchMcpStep(record, item) {
   const normalizedStatus = normalizeToolStatus(item.status);
   record.details.dataset.status = normalizedStatus.kind;
   const model = presentTool(item, { maxLength: 180 });
-  record.environment.textContent = "mcp";
-  record.title.textContent = model.inputPreview || `${item.server || "server"} / ${item.tool || "tool"}`;
+  record.environment.textContent = item.tool || "mcp";
+  record.title.textContent = model.inputPreview || "";
   record.title.title = model.rawInput || "MCP input";
   record.status.textContent = "";
   record.status.setAttribute("aria-label", normalizedStatus.label);
   record.status.dataset.label = normalizedStatus.label;
   record.status.dataset.kind = normalizedStatus.kind;
-  record.duration.textContent = durationLabel(item.durationMs);
+  record.duration.textContent = toolDurationLabel(item.durationMs);
   record.body.replaceChildren();
   const meta = document.createElement("div");
   meta.className = "mcp-step-meta";
-  appendCommandField(meta, "server", item.server || "--", "mcp-step-field");
-  appendCommandField(meta, "tool", item.tool || "--", "mcp-step-field");
+  if (item.server) appendCommandField(meta, "server", item.server, "mcp-step-field");
+  if (item.tool) appendCommandField(meta, "tool", item.tool, "mcp-step-field");
   appendCommandField(meta, "Status", normalizedStatus.label, "mcp-step-field");
   record.body.append(meta);
   for (const field of mcpPayload(item)) {
@@ -2289,6 +2439,7 @@ function patchMcpStep(record, item) {
     value.textContent = field.text;
     record.body.append(label, value);
   }
+  record.body.append(record.copyButton);
   updateProcessSummary(record.process);
 }
 
@@ -2305,91 +2456,6 @@ function registerConversationTool(record, options = {}) {
   state.conversationOrder.push(record.orderEntry);
 }
 
-function commandGroupTitle(records) {
-  const categories = new Set(records.map((record) => record.presentation?.category));
-  if (categories.has("search")) return "搜索项目代码";
-  if (categories.has("read")) return "查看相关文件";
-  return "检查现有实现";
-}
-
-function commandGroupDuration(records) {
-  const durations = records.map((record) => toolDurationMs(record.item, record)).filter((value) => Number.isFinite(value));
-  return durations.length ? durations.reduce((sum, value) => sum + value, 0) : null;
-}
-
-function createCommandGroup(id, turnId, container = chat) {
-  const details = document.createElement("details");
-  details.className = "command-group";
-  details.dataset.groupId = id;
-  const summary = document.createElement("summary");
-  summary.className = "command-group-summary";
-  const chevron = document.createElement("span");
-  chevron.className = "command-step-chevron";
-  chevron.textContent = "›";
-  const title = document.createElement("span");
-  title.className = "command-group-title";
-  const count = document.createElement("span");
-  count.className = "command-group-count";
-  const more = document.createElement("span");
-  more.className = "command-group-more";
-  const duration = document.createElement("span");
-  duration.className = "command-step-duration";
-  summary.append(chevron, title, count, more, duration);
-  const items = document.createElement("div");
-  items.className = "command-group-items";
-  details.append(summary, items);
-  const group = { kind: "commandGroup", id, turnId, details, summary, title, count, more, duration, items, entries: [] };
-  details.open = state.expandedCommandGroups.has(id);
-  details.addEventListener("toggle", () => {
-    if (group.ignoreNextToggle) {
-      group.ignoreNextToggle = false;
-      return;
-    }
-    if (details.open) state.expandedCommandGroups.add(id);
-    else state.expandedCommandGroups.delete(id);
-    saveThreadUi();
-    scrollToBottom();
-  });
-  if (container) container.append(details);
-  group.ignoreNextToggle = true;
-  return group;
-}
-
-function updateCommandGroupSummary(group) {
-  const entries = group.entries;
-  group.title.textContent = commandGroupTitle(entries);
-  group.count.textContent = `${entries.length} commands`;
-  group.more.textContent = entries.length > 5 ? `+${entries.length - 5} more` : "";
-  const duration = commandGroupDuration(entries);
-  group.duration.textContent = durationLabel(duration);
-}
-
-function addCommandToGroup(group, record) {
-  if (record.group === group) return;
-  record.group = group;
-  record.details.classList.add("command-step-nested");
-  group.entries.push(record);
-  group.items.append(record.details);
-  updateCommandGroupSummary(group);
-}
-
-function maybeGroupLiveCommand(record, item) {
-  if (record.group || !isGroupableReadonlyCommand({ ...item, status: record.presentation?.normalizedStatus.kind, durationMs: toolDurationMs(item, record) })) return;
-  const index = state.conversationOrder.indexOf(record.orderEntry);
-  const previous = index > 0 ? state.conversationOrder[index - 1] : null;
-  const previousRecord = previous?.record;
-  if (!previous || previous.turnId !== record.orderEntry.turnId || previousRecord?.kind !== "command") return;
-  if (!isGroupableReadonlyCommand({ ...previousRecord.item, status: previousRecord.presentation?.normalizedStatus.kind, durationMs: toolDurationMs(previousRecord.item, previousRecord) })) return;
-  if (previousRecord.group) {
-    addCommandToGroup(previousRecord.group, record);
-    return;
-  }
-  const group = createCommandGroup(commandGroupId(record.orderEntry.turnId, previousRecord.item.id), record.orderEntry.turnId, null);
-  previousRecord.details.replaceWith(group.details);
-  addCommandToGroup(group, previousRecord);
-  addCommandToGroup(group, record);
-}
-
 function ensureTool(item, options = {}) {
   let record = state.toolNodes.get(item.id);
   if (record) return record;
@@ -2398,23 +2464,19 @@ function ensureTool(item, options = {}) {
     : null;
   const targetContainer = options.container || process?.body || chat;
   if (item.type === "fileChange") {
-    const card = document.createElement("section");
-    card.className = "tool-card file-change-card";
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "file-change-toggle";
-    toggle.setAttribute("aria-expanded", "false");
-    const body = document.createElement("div");
-    body.className = "file-change-body";
-    card.append(toggle, body);
-    targetContainer.append(card);
-    record = { kind: "fileChange", details: card, summary: toggle, body, item, fileList: null, normalizedFiles: null, process };
-    toggle.addEventListener("click", () => {
+    const shell = createPiToolShell(item, "file", targetContainer);
+    shell.details.classList.add("file-change-card");
+    record = { kind: "fileChange", ...shell, details: shell.details, summary: shell.summary, body: shell.body, item, fileList: null, normalizedFiles: null, process };
+    record.copyButton = createPiToolCopyButton(() => fileChangeCopyText(record.item, record.normalizedFiles));
+    shell.onToggle = (ignoredShell, open) => {
       const currentItem = record.item || item;
-      setFileChangeExpanded(record, currentItem, !state.expandedFileChanges.has(currentItem.id));
+      setFileChangeExpanded(record, currentItem, open);
       renderToolFileChange(record, currentItem);
-      toggle.setAttribute("aria-expanded", String(state.expandedFileChanges.has(currentItem.id)));
-    });
+    };
+    const expanded = state.expandedFileChanges.has(item.id);
+    record.open = expanded;
+    record.body.hidden = !expanded;
+    record.summary.setAttribute("aria-expanded", String(expanded));
     state.toolNodes.set(item.id, record);
     if (process) registerProcessItem(item, process);
     registerConversationTool(record, options);
@@ -2462,28 +2524,15 @@ function renderFileChangeHeader(record, item, files) {
   record.details.dataset.status = normalizedStatus.kind;
   record.body.hidden = !expanded;
   record.summary.setAttribute("aria-expanded", String(expanded));
-  let [chevron, label, added, removed, status] = record.summary.children;
-  if (record.summary.children.length !== 5) {
-    record.summary.replaceChildren();
-    chevron = document.createElement("span");
-    chevron.className = "file-change-chevron";
-    chevron.setAttribute("aria-hidden", "true");
-    label = document.createElement("span");
-    label.className = "file-change-label";
-    added = document.createElement("span");
-    added.className = "file-change-stat-add";
-    removed = document.createElement("span");
-    removed.className = "file-change-stat-del";
-    status = document.createElement("span");
-    status.className = "file-change-status";
-    record.summary.append(chevron, label, added, removed, status);
-  }
-  chevron.textContent = "›";
-  label.textContent = fileChangeLabel(files.length);
-  added.textContent = `+${files.reduce((sum, file) => sum + file.additions, 0)}`;
-  removed.textContent = `-${files.reduce((sum, file) => sum + file.deletions, 0)}`;
-  status.textContent = normalizedStatus.label;
-  status.dataset.kind = normalizedStatus.kind;
+  record.open = expanded;
+  record.type.textContent = "edit";
+  const preview = files[0]?.path || (files.length ? fileChangeLabel(files.length) : "");
+  record.preview.textContent = preview;
+  record.preview.title = files.map((file) => file.path).filter(Boolean).join("\n") || fileChangeLabel(files.length);
+  record.duration.textContent = toolDurationLabel(item.durationMs);
+  record.status.textContent = "";
+  record.status.dataset.kind = normalizedStatus.kind;
+  record.status.setAttribute("aria-label", normalizedStatus.label);
 }
 
 function renderToolFileChange(record, item) {
@@ -2510,7 +2559,7 @@ function renderToolFileChange(record, item) {
     const empty = document.createElement("div");
     empty.className = "tool-file-empty";
     empty.textContent = "No file patch was reported.";
-    record.body.append(empty);
+    record.body.append(empty, record.copyButton);
     return;
   }
 
@@ -2557,7 +2606,7 @@ function renderToolFileChange(record, item) {
     fileList.append(details);
     renderDiffFileIfNeeded(details, diff, file);
   }
-  record.body.append(fileList);
+  record.body.append(fileList, record.copyButton);
   record.fileList = fileList;
 }
 
@@ -2588,7 +2637,6 @@ function updateTool(item, options = {}) {
   if (item.type === "commandExecution") {
     state.commandItems.set(item.id, item);
     patchCommandStep(record, item);
-    if (options.live !== false) maybeGroupLiveCommand(record, item);
     cacheToolItem(item, record, { ...options, turnId: options.turnId ?? record.orderEntry?.turnId });
     if (state.activeView === "commands") renderCommandsView();
   } else if (item.type === "fileChange") {
@@ -2628,6 +2676,13 @@ function durationLabel(value) {
   const ms = Number(value);
   if (!Number.isFinite(ms)) return "--";
   return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
+}
+
+function toolDurationLabel(value) {
+  if (value === null || value === undefined || value === "") return "";
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  return `${Math.round(ms / 1000)}s`;
 }
 
 function latestUserText() {
@@ -3251,6 +3306,8 @@ function renderHistoricalBlock(block) {
     const item = block.item;
     const record = ensureMessage(item.id, block.role, {
       startedAt: item.startedAt,
+      item,
+      model: item.model,
       deferOutline: true,
       live: false,
       process: block.role === "assistant" && !state.historicalProcessAnswerIds.has(item.id),
@@ -3262,18 +3319,6 @@ function renderHistoricalBlock(block) {
     record.renderedRaw = record.raw;
     return;
   }
-  if (block.type === "commandGroup") {
-    const process = ensureProcessDetails(block.turnId);
-    const group = createCommandGroup(block.id, block.turnId, process.body);
-    for (const entry of block.items) {
-      const record = updateTool(entry.item, { live: false, process: true, container: group.items, turnId: block.turnId });
-      addCommandToGroup(group, record);
-    }
-    for (const entry of block.items) process.itemIds.add(entry.item.id);
-    updateProcessSummary(process);
-    updateCommandGroupSummary(group);
-    return;
-  }
   if (block.type === "command") {
     updateTool(block.item, { live: false, process: true, turnId: block.turnId });
   } else if (block.type === "search") {
@@ -3281,7 +3326,7 @@ function renderHistoricalBlock(block) {
   } else if (block.type === "fileChange" || block.type === "mcpTool") {
     updateTool(block.item, { live: false, process: true, turnId: block.turnId });
   } else if (block.type === "error") {
-    addSystemMessage(block.item.message || block.item.error?.message || "Codex error", "error");
+    addProcessError(block.item, block.turnId);
   } else if (block.type === "plan") {
     const item = block.item || {};
     const snapshot = {
@@ -3526,6 +3571,8 @@ function handleCodex(message) {
         process: true,
         live: true,
         turnId: params.turnId || state.activeTurnId || state.currentTurn?.id,
+        turn: state.currentTurn,
+        model: params.model || state.currentTurn?.model || state.threadMeta.model,
       });
       record.streaming = true;
       record.raw += params.delta || "";
@@ -3545,6 +3592,9 @@ function handleCodex(message) {
           process: true,
           live: true,
           turnId: item.turnId || params.turnId || state.activeTurnId || state.currentTurn?.id,
+          item,
+          turn: state.currentTurn,
+          model: item.model || state.currentTurn?.model || state.threadMeta.model,
         });
         const pendingRender = state.renderTimers.get(item.id);
         if (pendingRender) {
@@ -3570,6 +3620,8 @@ function handleCodex(message) {
         state.planDeltaBuffers.delete(item.id);
       } else if (["commandExecution", "fileChange", "mcpToolCall"].includes(item.type)) {
         updateTool(item);
+      } else if (item.type === "error") {
+        addProcessError(item, item.turnId || params.turnId || state.activeTurnId);
       }
       if (item.type === "webSearch") updateSearchStep(item, { active: false });
       completeSearchActivity(item);

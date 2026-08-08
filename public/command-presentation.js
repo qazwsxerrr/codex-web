@@ -424,18 +424,50 @@ export function normalizeToolStatus(status) {
   return { kind, label: STATUS_LABELS[kind], isActive: kind === "running", isFailure: kind === "failed" || kind === "denied" };
 }
 
+const PREVIEW_KEYS = ["command", "path", "file_path", "pattern", "query"];
+
+function inputObjects(item = {}) {
+  return ["input", "arguments", "params", "parameters"]
+    .map((key) => item?.[key])
+    .filter((value) => value && typeof value === "object" && !Array.isArray(value));
+}
+
+/**
+ * Return the raw value used by the compact Pi-style tool title.  Keep this
+ * deliberately boring: the title should expose the protocol input, not a
+ * translated summary.  The complete value is still available through
+ * `toolInputText` for the expanded pane and the title attribute.
+ */
+export function toolPreviewValue(item = {}) {
+  const inputs = inputObjects(item);
+  for (const key of PREVIEW_KEYS) {
+    if (item?.[key] !== undefined && item?.[key] !== null) return item[key];
+    for (const input of inputs) {
+      if (input[key] !== undefined && input[key] !== null) return input[key];
+    }
+  }
+  if (item?.commandLine !== undefined) return item.commandLine;
+  if (item?.rawCommand !== undefined) return item.rawCommand;
+  if (item?.searchQuery !== undefined) return item.searchQuery;
+  if (item?.filePath !== undefined) return item.filePath;
+  if (item?.file !== undefined) return item.file;
+  for (const key of ["input", "arguments", "params", "parameters"]) {
+    if (item?.[key] !== undefined) return item[key];
+  }
+  if (item?.type === "fileChange" || item?.viewType === "change") {
+    const changes = Array.isArray(item.changes) ? item.changes : Array.isArray(item.files) ? item.files : [];
+    const firstPath = changes[0]?.path ?? changes[0]?.filePath ?? changes[0]?.file_path;
+    if (firstPath) return firstPath;
+    if (changes.length) return `${changes.length} file${changes.length === 1 ? "" : "s"}`;
+  }
+  if (item?.input !== undefined) return item.input;
+  if (item?.text !== undefined) return item.text;
+  if (item?.message !== undefined) return item.message;
+  return "";
+}
+
 function rawToolInput(item = {}) {
-  if (item.type === "commandExecution" || item.command !== undefined || item.commandLine !== undefined) {
-    return item.command ?? item.commandLine ?? item.rawCommand ?? item.input ?? "";
-  }
-  if (item.type === "read" || item.viewType === "read") {
-    return item.path ?? item.filePath ?? item.file ?? item.input ?? "";
-  }
-  if (item.type === "webSearch" || item.viewType === "search") {
-    return item.query ?? item.searchQuery ?? item.input ?? "";
-  }
-  if (item.type === "mcpToolCall") return item.input ?? item.arguments ?? item.params ?? item.parameters ?? item.tool ?? "";
-  return item.input ?? item.query ?? item.text ?? item.message ?? "";
+  return toolPreviewValue(item);
 }
 
 export function toolInputText(item = {}) {
@@ -445,10 +477,18 @@ export function toolInputText(item = {}) {
 }
 
 export function toolInputPreview(item = {}, options = {}) {
-  const maxLength = Number(options.maxLength) > 0 ? Number(options.maxLength) : 150;
+  const requested = typeof options === "number" ? options : options?.maxLength;
+  const maxLength = Number(requested) > 0 ? Number(requested) : 120;
   const value = toolInputText(item).replace(/\s+/g, " ").trim();
-  if (value.length <= maxLength) return value;
-  return `${value.slice(0, Math.max(1, maxLength - 3)).trimEnd()}...`;
+  // CSS owns the visual ellipsis.  Returning a hard 120-character prefix
+  // avoids making the protocol input look like it literally contains `...`.
+  return value.length <= maxLength ? value : value.slice(0, maxLength).trimEnd();
+}
+
+// Pi Web names this pure helper `getToolPreview`; keep the alias explicit so
+// native callers and tests can use the same vocabulary without importing UI.
+export function getToolPreview(item = {}) {
+  return toolInputPreview(item, { maxLength: 120 });
 }
 
 export function countOutputLines(output) {
@@ -517,6 +557,17 @@ export function commandToolName(itemOrCommand = {}) {
   const names = splitSegments(unwrapShellCommand(rawCommand)).map((segment) => commandBase(segment[0]));
   return names.some((name) => READ_TOOL_COMMANDS.has(name)) ? "read" : "bash";
 }
+
+export function toolType(item = {}) {
+  if (item?.type === "commandExecution") return commandToolName(item);
+  if (item?.type === "webSearch" || item?.viewType === "search") return "web_search";
+  if (item?.type === "fileChange" || item?.viewType === "change") return "edit";
+  if (item?.type === "mcpToolCall") return item.tool || "mcp";
+  if (item?.type === "read" || item?.viewType === "read") return "read";
+  return item?.tool || item?.name || item?.type || "tool";
+}
+
+export const getToolType = toolType;
 
 export function summarizeCommand(rawCommand, options = {}) {
   const maxLength = Number(options.maxLength) > 0 ? Number(options.maxLength) : 96;

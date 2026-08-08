@@ -1,4 +1,4 @@
-import { commandToolName } from "./command-presentation.js";
+import { commandToolName, toolPreviewValue } from "./command-presentation.js";
 
 const PROCESS_TYPES = new Set([
   "thinking", "reasoning", "plan", "commandExecution", "fileChange", "mcpToolCall",
@@ -50,6 +50,7 @@ export function toolName(item = {}) {
   if (item.type === "read" || item.viewType === "read") return "read";
   if (item.type === "webSearch" || item.viewType === "search") return "web_search";
   if (item.type === "mcpToolCall") return item.tool || "mcp";
+  if (item.type === "fileChange" || item.viewType === "change") return "edit";
   return item.name || item.tool || item.type || "tool";
 }
 
@@ -66,6 +67,9 @@ function inputValue(item = {}) {
   if (item.type === "mcpToolCall") {
     return item.input ?? item.arguments ?? item.params ?? item.parameters ?? item.tool;
   }
+  if (item.type === "fileChange" || item.viewType === "change") {
+    return item.changes ?? item.files ?? item.diff ?? item.patch ?? item.input ?? "";
+  }
   return item.input ?? item.query ?? item.text ?? item.message ?? "";
 }
 
@@ -74,13 +78,86 @@ export function originalToolInput(item = {}) {
   return value && typeof value === "object" ? jsonText(value) : asText(value);
 }
 
-export function toolInputPreview(item = {}, maxLength = 150) {
-  const raw = compactWhitespace(originalToolInput(item));
+export function toolInputPreview(item = {}, maxLength = 120) {
   const requested = typeof maxLength === "object" ? maxLength?.maxLength : maxLength;
-  const limit = Number(requested) > 0 ? Number(requested) : 150;
-  if (raw.length <= limit) return raw;
-  return `${raw.slice(0, Math.max(1, limit - 3)).trimEnd()}...`;
+  const limit = Number(requested) > 0 ? Number(requested) : 120;
+  // Keep this helper in sync with the command presentation layer while
+  // retaining the public message-display API used by restored transcripts.
+  const raw = compactWhitespace(originalToolInput(item));
+  const preferredValue = toolPreviewValue(item);
+  const preferred = compactWhitespace(preferredValue && typeof preferredValue === "object"
+    ? jsonText(preferredValue)
+    : asText(preferredValue));
+  const value = preferred || raw;
+  return value.length <= limit ? value : value.slice(0, limit).trimEnd();
 }
+
+/** The visual type shown at the start of every Pi-style tool row. */
+export function toolType(item = {}) {
+  return toolName(item);
+}
+
+const TOOL_CALL_TYPES = new Set(["commandExecution", "fileChange", "mcpToolCall", "webSearch"]);
+
+export function isToolCallItem(item) {
+  return Boolean(item && TOOL_CALL_TYPES.has(item.type));
+}
+
+function hasDisplayableText(item) {
+  if (!item || typeof item !== "object") return false;
+  if (item.role === "assistant" || item.type === "agentMessage" || item.type === "assistantMessage") {
+    return getAssistantBlocks(item).some((block) => {
+      if (block?.type === "thinking" || block?.type === "reasoning") return asText(block.thinking ?? block.text).trim().length > 0;
+      return block?.type === "text" || block?.type === "image";
+    });
+  }
+  return Boolean(asText(item.text ?? item.message ?? item.thinking ?? item.reasoning ?? item.explanation ?? item.planText).trim());
+}
+
+/** A process item that contributes to the `N messages` part of the header. */
+export function isDisplayableProcessItem(item) {
+  return Boolean(item && !isToolCallItem(item) && (isProcessItem(item) || hasDisplayableText(item)) && hasDisplayableText(item));
+}
+
+function modelIdFrom(value) {
+  if (value && typeof value === "object") return value.id || value.model || value.slug || value.name || "";
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function modelDisplayNameFrom(value) {
+  if (!value || typeof value !== "object") return "";
+  return value.displayName || value.display_name || value.label || value.name || "";
+}
+
+/**
+ * Resolve the stable model label used by an assistant message.
+ *
+ * The model id is intentionally returned separately so callers can freeze it
+ * when a message is created.  Metadata updates may fill in a display name for
+ * that same id, but a later selector change must not rewrite old messages.
+ */
+export function resolveModelDisplayName({ message, turn, thread, models = [], modelId, fallback = "Codex" } = {}) {
+  const messageModel = message?.model ?? message?.modelId ?? message?.model_id;
+  const turnModel = turn?.model ?? turn?.modelId ?? turn?.model_id;
+  const threadModel = thread?.model ?? thread?.modelId ?? thread?.model_id;
+  const selected = modelId || messageModel || turnModel || threadModel;
+  const id = modelIdFrom(selected);
+  const direct = [messageModel, turnModel, threadModel]
+    .find((candidate) => modelDisplayNameFrom(candidate) && (!id || modelIdFrom(candidate) === id));
+  const directLabel = modelDisplayNameFrom(direct);
+  if (directLabel) return { id, label: directLabel, resolved: true };
+  const model = (Array.isArray(models) ? models : []).find((entry) => modelIdFrom(entry) === id);
+  const displayName = modelDisplayNameFrom(model);
+  if (displayName) return { id, label: displayName, resolved: true };
+  return { id, label: fallback, resolved: false };
+}
+
+export function modelDisplayName(options = {}) {
+  return resolveModelDisplayName(options).label;
+}
+
+export const getModelDisplayName = modelDisplayName;
+export const resolveAssistantModelLabel = modelDisplayName;
 
 export function presentTool(item = {}, options = {}) {
   const status = normalizeDisplayStatus(item.status ?? item.state ?? item.result);
@@ -147,13 +224,14 @@ export function buildProcessDetails(items = [], options = {}) {
   const durationMs = Number.isFinite(Number(options.durationMs))
     ? Number(options.durationMs)
     : durations.length ? durations.reduce((sum, value) => sum + value, 0) : null;
-  const toolCount = list.filter((item) => PROCESS_TYPES.has(item.type) && !["thinking", "reasoning", "status", "error", "plan"].includes(item.type)).length;
+  const toolCount = list.filter(isToolCallItem).length;
+  const messageCount = list.filter(isDisplayableProcessItem).length;
   return {
     id: options.id ?? list.find((item) => item.id)?.turnId ?? null,
     items: list,
-    messageCount: list.length,
+    messageCount,
     toolCount,
-    counts: { messages: list.length, tools: toolCount },
+    counts: { messages: messageCount, tools: toolCount },
     durationMs,
     status: normalizeDisplayStatus(options.status ?? list.at(-1)?.status ?? "completed").kind,
   };
