@@ -5,6 +5,43 @@ model and reasoning controls, live thread status, and a capability-based
 slash-command palette for Linux/WSL. The connected App Server reports the
 actual CLI version at runtime.
 
+## UI preview
+
+### Conversation workspace
+
+The main workspace keeps the conversation, process details, tool output,
+approvals, files, and the conversation minimap in one focused view.
+
+![Codex Web conversation workspace with the conversation minimap](conversation-minimap-desktop.png)
+
+### Thread navigation
+
+The compact sidebar makes recent threads easy to search, resume, and switch
+between without losing per-thread runtime state.
+
+![Codex Web thread navigation sidebar](sidebar-compact-desktop.png)
+
+## Feature overview
+
+- **App Server sessions**: list and resume threads through the official RPCs,
+  keep model, reasoning effort, service tier, permissions, working directory,
+  context usage, MCP inventory, and connection state synchronized with the
+  active thread.
+- **Rich conversation rendering**: stream user and assistant messages with
+  Markdown, KaTeX inline and display math, images, plans, reasoning, web
+  search, file changes, MCP calls, child-agent activity, approvals, and bounded
+  command output.
+- **Efficient navigation**: search and group recent conversations, use the
+  minimap to jump between turns, preserve intentional scrolling during large
+  history restores, and follow new output only while near the latest message.
+- **Developer workflow**: inspect unified diffs, browse workspace files, open
+  linked source locations, attach images, mention files, and use slash commands
+  for status, model, permissions, MCP, plan, review, resume, fork, and other
+  supported actions.
+- **Local-first safety**: bind the web server to `127.0.0.1` by default, keep
+  Codex approval and sandbox boundaries intact, and expose writer conflicts as
+  read-only snapshots instead of pretending the browser owns the thread.
+
 ## Workspace views
 
 - Conversation keeps restored and streaming messages, tool activity, approvals,
