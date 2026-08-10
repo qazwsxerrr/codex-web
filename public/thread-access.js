@@ -4,6 +4,24 @@ const ACTIVE_WRITER_MESSAGES = [
   /thread-store conflict:[^\n]*writer/i,
 ];
 
+export const SNAPSHOT_REASON_ACTIVE_WRITER = "active_writer";
+
+function liveAccessMetadata() {
+  return {
+    accessMode: "live",
+    snapshotAt: null,
+    snapshotReason: null,
+  };
+}
+
+export function createSnapshotAccessMetadata(snapshotAt = new Date().toISOString()) {
+  return {
+    accessMode: "snapshot",
+    snapshotAt,
+    snapshotReason: SNAPSHOT_REASON_ACTIVE_WRITER,
+  };
+}
+
 function errorMessages(error) {
   return [
     error?.message,
@@ -33,12 +51,15 @@ export async function resumeThreadWithFallback(request, threadId) {
     return {
       result: await request("thread/resume", { threadId }),
       writerConflict: null,
+      ...liveAccessMetadata(),
     };
   } catch (error) {
     if (!isActiveWriterConflict(error)) throw error;
+    const result = await request("thread/read", { threadId, includeTurns: true });
     return {
-      result: await request("thread/read", { threadId, includeTurns: true }),
+      result,
       writerConflict: error,
+      ...createSnapshotAccessMetadata(),
     };
   }
 }

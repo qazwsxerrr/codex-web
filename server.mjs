@@ -1,49 +1,291 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-
-import express from "express";
-import { WebSocketServer, WebSocket } from "ws";
-import { loadServerConfig } from "./server-config.mjs";
-import { resolveDeleteThreadId } from "./public/thread-delete-data.js";
-import { resumeThreadWithFallback } from "./public/thread-access.js";
+import { enqueueSerialTask } from "./public/session-state.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const fileAccessRoots = new Map();
 
-const SERVER_CONFIG = loadServerConfig({ rootDir: __dirname });
-const HOST = SERVER_CONFIG.host;
-const PORT = SERVER_CONFIG.port;
-const CODEX_BIN = SERVER_CONFIG.codexBin;
-const DEFAULT_CWD = SERVER_CONFIG.projectCwd;
+let SERVER_CONFIG = null;
+let HOST = null;
+let PORT = null;
+let CODEX_BIN = null;
+let DEFAULT_CWD = null;
+let fullRequestHandler = null;
+let activeWss = null;
+let activeRuntimeManager = null;
+let WebSocketImpl = null;
+let startupFailed = false;
+const pendingUpgrades = [];
+const SNAPSHOT_REASON_ACTIVE_WRITER = "active_writer";
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+const STATIC_CONTENT_TYPES = new Map([
+  [".css", "text/css; charset=utf-8"],
+  [".gif", "image/gif"],
+  [".html", "text/html; charset=utf-8"],
+  [".ico", "image/x-icon"],
+  [".jpeg", "image/jpeg"],
+  [".jpg", "image/jpeg"],
+  [".js", "text/javascript; charset=utf-8"],
+  [".json", "application/json; charset=utf-8"],
+  [".map", "application/json; charset=utf-8"],
+  [".mjs", "text/javascript; charset=utf-8"],
+  [".png", "image/png"],
+  [".svg", "image/svg+xml"],
+  [".txt", "text/plain; charset=utf-8"],
+  [".webp", "image/webp"],
+  [".woff", "font/woff"],
+  [".woff2", "font/woff2"],
+]);
 
-app.disable("x-powered-by");
-app.use(express.static(path.join(__dirname, "public")));
-app.use("/vendor/marked", express.static(path.join(__dirname, "node_modules", "marked")));
-app.use("/vendor/dompurify", express.static(path.join(__dirname, "node_modules", "dompurify")));
-app.use("/vendor/katex", express.static(path.join(__dirname, "node_modules", "katex")));
-app.use("/vendor/lucide", express.static(path.join(__dirname, "node_modules", "lucide")));
-app.get("/favicon.ico", (_req, res) => res.status(204).end());
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
+const STATIC_ROOTS = [
+  { prefix: "/vendor/marked", root: path.join(__dirname, "node_modules", "marked") },
+  { prefix: "/vendor/dompurify", root: path.join(__dirname, "node_modules", "dompurify") },
+  { prefix: "/vendor/katex", root: path.join(__dirname, "node_modules", "katex") },
+  { prefix: "/vendor/lucide", root: path.join(__dirname, "node_modules", "lucide") },
+  { prefix: "", root: path.join(__dirname, "public") },
+];
+
+function sendEarlyJson(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Content-Length", String(Buffer.byteLength(body)));
+  res.end(body);
+}
+
+function nonEmpty(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function resolveConfiguredPath(value, rootDir, bareCommand = false) {
+  if (!value) return value;
+  if (bareCommand && !value.startsWith(".") && !/[\\/]/.test(value)) return value;
+  return path.isAbsolute(value) ? value : path.resolve(rootDir, value);
+}
+
+function startupConfigPath(rootDir, env) {
+  const configured = nonEmpty(env.CODEX_WEB_CONFIG);
+  if (configured) return path.isAbsolute(configured) ? configured : path.resolve(rootDir, configured);
+  for (const name of ["config.yaml", "config.yml", "config.json"]) {
+    const candidate = path.join(rootDir, name);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(rootDir, "config.json");
+}
+
+function parseSimpleStartupConfig(configPath) {
+  let text;
+  try {
+    text = fs.readFileSync(configPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { exists: false, value: {} };
+    return null;
+  }
+  if (path.extname(configPath).toLowerCase() === ".json") {
+    try {
+      const value = JSON.parse(text);
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? { exists: true, value }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  const value = {};
+  for (const sourceLine of text.split(/\r?\n/)) {
+    const line = sourceLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (sourceLine !== line) return null;
+    const separator = line.indexOf(":");
+    if (separator <= 0) return null;
+    const key = line.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_-]*$/.test(key)) return null;
+    let raw = line.slice(separator + 1).trim();
+    if (raw.startsWith("'") || raw.startsWith('"')) {
+      const quote = raw[0];
+      let closeIndex = -1;
+      for (let index = 1; index < raw.length; index += 1) {
+        if (quote === "'" && raw[index] === "'") {
+          if (raw[index + 1] === "'") {
+            index += 1;
+          } else {
+            closeIndex = index;
+            break;
+          }
+        } else if (quote === '"' && raw[index] === '"' && raw[index - 1] !== "\\") {
+          closeIndex = index;
+          break;
+        }
+      }
+      const trailing = raw.slice(closeIndex + 1);
+      if (closeIndex < 0 || (trailing.trim() && !/^\s+#/.test(trailing))) {
+        return null;
+      }
+      const quoted = raw.slice(0, closeIndex + 1);
+      if (quote === "'") {
+        raw = quoted.slice(1, -1).replaceAll("''", "'");
+      } else {
+        try {
+          raw = JSON.parse(quoted);
+        } catch {
+          return null;
+        }
+      }
+    } else {
+      raw = raw.replace(/\s+#.*$/, "").trim();
+      if (raw.startsWith("[") || raw.startsWith("{") || raw.startsWith("|") || raw.startsWith(">") || raw.startsWith("&") || raw.startsWith("*") || raw.startsWith("!")) return null;
+      if (["null", "~"].includes(raw.toLowerCase())) raw = null;
+    }
+    value[key] = raw;
+  }
+  return { exists: true, value };
+}
+
+function loadStartupConfig(rootDir, env = process.env) {
+  const configPath = startupConfigPath(rootDir, env);
+  const loaded = parseSimpleStartupConfig(configPath);
+  if (!loaded) return null;
+  const fileConfig = loaded.value;
+  const configValue = (...keys) => keys.map((key) => nonEmpty(fileConfig?.[key])).find(Boolean) || null;
+  const codexBin = nonEmpty(env.CODEX_BIN) || configValue("codexBin", "codex_bin") || "codex";
+  const projectCwd = nonEmpty(env.PROJECT_CWD) || configValue("projectCwd", "project_cwd") || process.cwd();
+  const host = nonEmpty(env.HOST) || configValue("host") || "127.0.0.1";
+  const portText = nonEmpty(env.PORT) || configValue("port") || "4317";
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return {
+    configPath,
+    configExists: loaded.exists,
+    codexBin: resolveConfiguredPath(codexBin, rootDir, true),
+    projectCwd: resolveConfiguredPath(projectCwd, rootDir),
+    host,
+    port,
+  };
+}
+
+function earlyStaticPath(pathname) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  if (!decoded || decoded.includes("\0") || decoded.includes("\\") || decoded.split("/").includes("..")) return null;
+  const match = STATIC_ROOTS.find(({ prefix }) => prefix && (decoded === prefix || decoded.startsWith(prefix + "/")))
+    || STATIC_ROOTS.at(-1);
+  const relative = match.prefix ? decoded.slice(match.prefix.length) : decoded;
+  const relativePath = relative === "/" || relative === "" ? "index.html" : relative.slice(1);
+  const candidate = path.resolve(match.root, relativePath);
+  const root = path.resolve(match.root);
+  if (candidate !== root && !candidate.startsWith(root + path.sep)) return null;
+  return candidate;
+}
+
+function handleEarlyRequest(req, res) {
+  const requestUrl = new URL(req.url || "/", "http://127.0.0.1");
+  if (requestUrl.pathname === "/healthz") {
+    sendEarlyJson(res, startupFailed ? 503 : 200, startupFailed
+      ? { ok: false, error: "Codex Web backend failed to start", code: "SERVER_STARTUP_FAILED" }
+      : { ok: true });
+    return;
+  }
+  if (requestUrl.pathname === "/favicon.ico") {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+  if (requestUrl.pathname.startsWith("/api/")) {
+    res.setHeader("Retry-After", "1");
+    sendEarlyJson(res, 503, {
+      error: "Codex Web backend is still starting",
+      code: "SERVER_STARTING",
+    });
+    return;
+  }
+  if (!["GET", "HEAD"].includes(req.method || "GET")) {
+    sendEarlyJson(res, 503, { error: "Codex Web backend is still starting", code: "SERVER_STARTING" });
+    return;
+  }
+  const filePath = earlyStaticPath(requestUrl.pathname);
+  if (!filePath) {
+    sendEarlyJson(res, 404, { error: "Not found", code: "NOT_FOUND" });
+    return;
+  }
+  fs.stat(filePath, (statError, stats) => {
+    if (statError || !stats.isFile()) {
+      sendEarlyJson(res, 404, { error: "Not found", code: "NOT_FOUND" });
+      return;
+    }
+    res.statusCode = 200;
+    res.setHeader("Content-Type", STATIC_CONTENT_TYPES.get(path.extname(filePath).toLowerCase()) || "application/octet-stream");
+    res.setHeader("Content-Length", String(stats.size));
+    if (req.method === "HEAD") {
+      res.end();
+      return;
+    }
+    fs.createReadStream(filePath).on("error", () => {
+      if (!res.headersSent) sendEarlyJson(res, 500, { error: "Unable to read static asset", code: "STATIC_READ_ERROR" });
+      else res.destroy();
+    }).pipe(res);
+  });
+}
+
+const server = http.createServer((req, res) => {
+  if (fullRequestHandler) {
+    fullRequestHandler(req, res);
+    return;
+  }
+  handleEarlyRequest(req, res);
+});
+
+function upgradePath(req) {
+  try {
+    return new URL(req.url || "/", "http://127.0.0.1").pathname;
+  } catch {
+    return null;
+  }
+}
+
+function handleUpgrade(req, socket, head) {
+  if (upgradePath(req) !== "/ws") {
+    socket.destroy();
+    return;
+  }
+  if (!activeWss) {
+    pendingUpgrades.push({ req, socket, head });
+    socket.once("close", () => {
+      const index = pendingUpgrades.findIndex((entry) => entry.socket === socket);
+      if (index >= 0) pendingUpgrades.splice(index, 1);
+    });
+    socket.setTimeout(15_000, () => socket.destroy());
+    return;
+  }
+  activeWss.handleUpgrade(req, socket, head, (ws) => activeWss.emit("connection", ws, req));
+}
+
+server.on("upgrade", handleUpgrade);
 
 function sendJson(ws, payload) {
-  if (ws.readyState === WebSocket.OPEN) {
+  if (WebSocketImpl && ws.readyState === WebSocketImpl.OPEN) {
     ws.send(JSON.stringify(payload));
   }
 }
 
 function compactError(error) {
+  const data = error?.code === "READ_ONLY_SNAPSHOT"
+    ? { reason: error?.data?.reason || SNAPSHOT_REASON_ACTIVE_WRITER }
+    : error?.data;
   return {
     message: error?.message || String(error),
     code: error?.code,
-    data: error?.data,
+    data,
   };
 }
 
@@ -59,6 +301,56 @@ function turnBridgeError(message, code = "INVALID_TURN_REQUEST", data = undefine
   return error;
 }
 
+function normalizeThreadId(value) {
+  const threadId = String(value || "").trim();
+  return threadId || null;
+}
+
+function captureThreadTarget(command, selectedThreadId, {
+  required = true,
+  allowDifferent = false,
+} = {}) {
+  const requestedThreadId = normalizeThreadId(command?.threadId);
+  if (requestedThreadId && selectedThreadId && requestedThreadId !== selectedThreadId && !allowDifferent) {
+    throw turnBridgeError("Thread is stale or no longer active", "STALE_THREAD", {
+      expectedThreadId: selectedThreadId,
+      receivedThreadId: requestedThreadId,
+    });
+  }
+  const targetThreadId = requestedThreadId || selectedThreadId || null;
+  if (required && !targetThreadId) throw new Error("Start or resume a thread first");
+  return targetThreadId;
+}
+
+const THREAD_SCOPED_COMMANDS = new Set([
+  "updateSettings",
+  "resumeThread",
+  "refreshThreadSnapshot",
+  "forkThread",
+  "sendMessage",
+  "steerMessage",
+  "steer",
+  "interrupt",
+  "renameThread",
+  "archiveThread",
+  "deleteThread",
+  "reviewThread",
+  "getGoal",
+  "setGoal",
+  "clearGoal",
+  "setMemoryMode",
+  "listBackgroundTerminals",
+  "cleanBackgroundTerminals",
+  "listMcp",
+  "reloadMcp",
+  "listApps",
+  "compact",
+  "approveGuardianDeniedAction",
+  "setExperiment",
+  "approval",
+  "serverRequestResponse",
+]);
+
 function getDataList(result) {
   if (Array.isArray(result)) return result;
   if (Array.isArray(result?.data)) return result.data;
@@ -67,42 +359,220 @@ function getDataList(result) {
   return [];
 }
 
-wss.on("connection", (ws) => {
-  const codex = spawn(CODEX_BIN, ["app-server", "--stdio"], {
+function initializeFullServer({
+  expressModule,
+  wsModule,
+  runtimeModule,
+  fileAccessModule,
+  threadDeleteModule,
+  threadAccessModule,
+}) {
+  const express = expressModule.default || expressModule;
+  const { WebSocketServer, WebSocket } = wsModule;
+  const {
+    FileAccessError,
+    listWorkspaceDirectory,
+    readWorkspaceImage,
+    readWorkspaceText,
+  } = fileAccessModule;
+  const { resolveDeleteThreadId } = threadDeleteModule;
+  const {
+    createSnapshotAccessMetadata,
+    resumeThreadWithFallback,
+    SNAPSHOT_REASON_ACTIVE_WRITER,
+  } = threadAccessModule;
+  const { CodexRuntimeManager, isThreadRuntimeRunning } = runtimeModule;
+
+  WebSocketImpl = WebSocket;
+  const app = express();
+  const wss = new WebSocketServer({ noServer: true });
+  const runtimeManager = new CodexRuntimeManager({
+    codexBin: CODEX_BIN,
     cwd: DEFAULT_CWD,
     env: process.env,
-    stdio: ["pipe", "pipe", "pipe"],
   });
+  activeWss = wss;
+  activeRuntimeManager = runtimeManager;
 
-  let nextRequestId = 1;
+  app.disable("x-powered-by");
+  app.get("/api/files", async (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const token = String(req.get("X-Codex-File-Token") || "").trim();
+    const root = token ? fileAccessRoots.get(token) : null;
+    if (!root) {
+      res.status(401).json({ error: "File access token is missing or expired", code: "INVALID_FILE_TOKEN" });
+      return;
+    }
+
+    const type = String(req.query.type || "list");
+    const relativePath = String(req.query.path || "");
+    try {
+      if (type === "list") {
+        res.json(await listWorkspaceDirectory(root, relativePath));
+        return;
+      }
+      if (type === "text") {
+        res.json(await readWorkspaceText(root, relativePath));
+        return;
+      }
+      if (type === "raw") {
+        const file = await readWorkspaceImage(root, relativePath);
+        res.setHeader("Content-Type", file.mime);
+        res.setHeader("Content-Length", String(file.size));
+        res.setHeader("X-Content-Type-Options", "nosniff");
+        res.send(file.content);
+        return;
+      }
+      res.status(400).json({ error: "Unsupported file request type", code: "INVALID_FILE_REQUEST" });
+    } catch (error) {
+      if (error instanceof FileAccessError) {
+        res.status(error.status).json({ error: error.message, code: error.code });
+        return;
+      }
+      console.error("File API failed", error);
+      res.status(500).json({ error: "Unable to read the requested file", code: "FILE_ACCESS_ERROR" });
+    }
+  });
+  app.use(express.static(path.join(__dirname, "public")));
+  app.use("/vendor/marked", express.static(path.join(__dirname, "node_modules", "marked")));
+  app.use("/vendor/dompurify", express.static(path.join(__dirname, "node_modules", "dompurify")));
+  app.use("/vendor/katex", express.static(path.join(__dirname, "node_modules", "katex")));
+  app.use("/vendor/lucide", express.static(path.join(__dirname, "node_modules", "lucide")));
+  app.get("/favicon.ico", (_req, res) => res.status(204).end());
+  app.get("/healthz", (_req, res) => res.json({ ok: true }));
+
+  wss.on("connection", (ws) => {
+  const clientId = runtimeManager.addClient((payload) => sendJson(ws, payload));
+  const fileAccessToken = randomUUID();
+  fileAccessRoots.set(fileAccessToken, DEFAULT_CWD);
   let initialized = false;
   let activeThreadId = null;
   let activeTurnId = null;
   let activeWriterConflict = null;
+  let activeAccessMode = null;
+  let snapshotAt = null;
+  let snapshotReason = null;
   let activeFileSearchSessionId = null;
   let pendingTurnSettings = {};
+  const settingsUpdateQueues = new Map();
   let lastThreadResponse = null;
-  const pending = new Map();
+  let threadContextScope = 0;
+  let threadTransitionScope = null;
+  const pendingServerRequests = {
+    get: (requestId) => runtimeManager.getPendingServerRequest(requestId),
+    delete: (requestId) => runtimeManager.dropServerRequest(requestId),
+  };
 
-  const stdoutLines = readline.createInterface({ input: codex.stdout });
-  const stderrLines = readline.createInterface({ input: codex.stderr });
+  function setAccessMetadata(metadata = {}) {
+    activeAccessMode = metadata.accessMode || null;
+    snapshotAt = activeAccessMode === "snapshot" ? metadata.snapshotAt || null : null;
+    snapshotReason = activeAccessMode === "snapshot" ? metadata.snapshotReason || null : null;
+  }
 
-  function writeProtocol(message) {
-    if (codex.stdin.destroyed) {
-      throw new Error("Codex app-server stdin is closed");
+  function setFileAccessRoot(value) {
+    const cwd = typeof value === "string"
+      ? value
+      : value?.thread?.cwd || value?.cwd;
+    fileAccessRoots.set(fileAccessToken, String(cwd || DEFAULT_CWD));
+  }
+
+  function clearActiveThread() {
+    threadContextScope += 1;
+    threadTransitionScope = null;
+    activeThreadId = null;
+    activeTurnId = null;
+    activeWriterConflict = null;
+    setAccessMetadata();
+    lastThreadResponse = null;
+    setFileAccessRoot(DEFAULT_CWD);
+  }
+
+  function syncSelectedRuntime() {
+    const runtime = runtimeManager.getRuntime(activeThreadId);
+    if (!runtime) return;
+    activeTurnId = runtime.activeTurnId || null;
+    activeWriterConflict = runtime.writerConflict || null;
+    setAccessMetadata(runtime);
+    pendingTurnSettings = { ...(runtime.pendingTurnSettings || {}) };
+    lastThreadResponse = runtime.latestThreadResponse || lastThreadResponse;
+    if (lastThreadResponse) setFileAccessRoot(lastThreadResponse);
+  }
+
+  function readOnlySnapshotError(threadId = activeThreadId) {
+    const runtime = runtimeManager.getRuntime(threadId);
+    const error = new Error("Thread is read-only while another Codex client controls it");
+    error.code = "READ_ONLY_SNAPSHOT";
+    error.data = {
+      reason: runtime?.snapshotReason || (threadId === activeThreadId ? snapshotReason : null) || SNAPSHOT_REASON_ACTIVE_WRITER,
+    };
+    return error;
+  }
+
+  function ensureThreadWritable(threadId = activeThreadId) {
+    ensureNoThreadTransition();
+    const runtime = runtimeManager.getRuntime(threadId);
+    const accessMode = runtime?.accessMode || (threadId === activeThreadId ? activeAccessMode : null);
+    const writerConflict = runtime?.writerConflict || (threadId === activeThreadId ? activeWriterConflict : null);
+    if (accessMode === "snapshot" || writerConflict) {
+      throw readOnlySnapshotError(threadId);
     }
-    codex.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  function notify(method, params = {}) {
-    writeProtocol({ method, params });
+  function ensureThreadDeletable(threadId) {
+    const runtime = runtimeManager.getRuntime(threadId);
+    if (!isThreadRuntimeRunning(runtime)) return;
+    const error = new Error("Cannot delete a Thread while its Turn is running");
+    error.code = "THREAD_RUNNING";
+    error.data = {
+      threadId,
+      running: Boolean(runtime.running),
+      activeTurnId: runtime.activeTurnId || null,
+    };
+    throw error;
   }
 
-  function request(method, params = {}) {
-    const id = nextRequestId++;
-    writeProtocol({ method, id, params });
-    return new Promise((resolve, reject) => {
-      pending.set(String(id), { resolve, reject, method });
+  function staleThreadContextError() {
+    const error = new Error("Thread context changed before the App Server response arrived");
+    error.code = "STALE_THREAD_CONTEXT";
+    return error;
+  }
+
+  function beginThreadTransition() {
+    if (threadTransitionScope !== null) {
+      const error = new Error("Another thread transition is already in progress");
+      error.code = "THREAD_TRANSITION_PENDING";
+      throw error;
+    }
+    threadContextScope += 1;
+    threadTransitionScope = threadContextScope;
+    return { scope: threadContextScope };
+  }
+
+  function endThreadTransition(scope) {
+    if (threadTransitionScope === scope) threadTransitionScope = null;
+  }
+
+  function ensureNoThreadTransition() {
+    if (threadTransitionScope !== null) {
+      const error = new Error("Another thread transition is already in progress");
+      error.code = "THREAD_TRANSITION_PENDING";
+      throw error;
+    }
+  }
+
+  function request(method, params = {}, {
+    scope = threadContextScope,
+    contextBound = true,
+    threadId: explicitThreadId = null,
+  } = {}) {
+    const threadId = explicitThreadId || params?.threadId || activeThreadId;
+    return runtimeManager.request(method, params, {
+      clientId,
+      scope,
+      threadId,
+    }).then((result) => {
+      if (contextBound && scope !== threadContextScope) throw staleThreadContextError();
+      return result;
     });
   }
 
@@ -149,81 +619,15 @@ wss.on("connection", (ws) => {
     }
   }
 
-  function rejectAllPending(error) {
-    for (const { reject } of pending.values()) reject(error);
-    pending.clear();
-  }
-
-  stdoutLines.on("line", (line) => {
-    if (!line.trim()) return;
-
-    let message;
-    try {
-      message = JSON.parse(line);
-    } catch {
-      sendJson(ws, {
-        type: "bridgeError",
-        message: `Invalid JSON from codex app-server: ${line}`,
-      });
+  const runtimeListener = ({ threadId, runtime, deleted }) => {
+    if (threadId !== activeThreadId) return;
+    if (deleted) {
+      clearActiveThread();
       return;
     }
-
-    if (message.id !== undefined && message.method === undefined) {
-      const waiter = pending.get(String(message.id));
-      if (waiter) {
-        pending.delete(String(message.id));
-        if (message.error) {
-          const error = new Error(message.error.message || JSON.stringify(message.error));
-          error.code = message.error.code;
-          error.data = message.error.data;
-          waiter.reject(error);
-        } else {
-          waiter.resolve(message.result);
-        }
-        return;
-      }
-    }
-
-    if (message.method === "thread/deleted" && message.params?.threadId === activeThreadId) {
-      activeThreadId = null;
-      activeTurnId = null;
-      activeWriterConflict = null;
-    }
-
-    if (message.method === "turn/started" && message.params?.threadId === activeThreadId) {
-      activeTurnId = message.params?.turn?.id || activeTurnId;
-    }
-    if (message.method === "turn/completed" && message.params?.threadId === activeThreadId) {
-      const completedId = message.params?.turn?.id;
-      if (!completedId || completedId === activeTurnId) activeTurnId = null;
-    }
-
-    sendJson(ws, { type: "codex", message });
-  });
-
-  stderrLines.on("line", (line) => {
-    console.error(`[codex app-server] ${line}`);
-    sendJson(ws, { type: "codexLog", line });
-  });
-
-  codex.on("error", (error) => {
-    rejectAllPending(error);
-    sendJson(ws, {
-      type: "bridgeError",
-      message:
-        error.code === "ENOENT"
-          ? `Cannot find '${CODEX_BIN}'. Install Codex CLI or set CODEX_BIN.`
-          : error.message,
-    });
-  });
-
-  codex.on("exit", (code, signal) => {
-    const error = new Error(
-      `codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"})`,
-    );
-    rejectAllPending(error);
-    sendJson(ws, { type: "bridgeError", message: error.message });
-  });
+    syncSelectedRuntime();
+  };
+  runtimeManager.on("runtimeUpdate", runtimeListener);
 
   async function fetchMetadata(cwd = DEFAULT_CWD, threadId = null) {
     const [models, config, account, permissionProfiles, experiments, collaborationModes] = await Promise.all([
@@ -289,31 +693,32 @@ wss.on("connection", (ws) => {
   }
 
   async function initialize() {
-    const serverInfo = await request("initialize", {
-      clientInfo: {
-        name: "codex_math_web_v4",
-        title: "Codex Math Web v4",
-        version: "0.4.0",
-      },
-      capabilities: {
-        experimentalApi: true,
-      },
-    });
-
-    notify("initialized", {});
+    const serverInfo = await runtimeManager.initialize();
     initialized = true;
-    const [metadata, recentThreads] = await Promise.all([
-      fetchMetadata(DEFAULT_CWD),
-      fetchRecentThreads(),
-    ]);
+    // Start the expensive sidebar query alongside metadata, but keep it out of
+    // the ready gate.  The browser can resume a saved Thread as soon as the
+    // metadata contract is available; the list is delivered on its existing
+    // asynchronous threadList channel below.
+    const recentThreadsPromise = fetchRecentThreads();
+    const metadata = await fetchMetadata(DEFAULT_CWD);
 
     sendJson(ws, {
       type: "ready",
       defaultCwd: DEFAULT_CWD,
+      fileAccessToken,
+      fileAccessCwd: DEFAULT_CWD,
       serverInfo,
+      runtimeSnapshot: runtimeManager.runtimeSnapshot(),
       ...metadata,
-      threadList: recentThreads.ok ? recentThreads.result : null,
-      threadListError: recentThreads.ok ? null : recentThreads.error,
+      threadListPending: true,
+    });
+
+    const recentThreads = await recentThreadsPromise;
+    sendJson(ws, {
+      type: "threadList",
+      append: false,
+      result: recentThreads.ok ? recentThreads.result : null,
+      error: recentThreads.ok ? null : recentThreads.error,
     });
   }
 
@@ -321,8 +726,9 @@ wss.on("connection", (ws) => {
     sendJson(ws, { type: "bridgeError", message: error.message });
   });
 
-  async function updateThreadSettings(command) {
-    if (!activeThreadId) throw new Error("Start or resume a thread first");
+  async function updateThreadSettings(command, selectedThreadId, requestScope = threadContextScope) {
+    const targetThreadId = captureThreadTarget(command, selectedThreadId);
+    ensureThreadWritable(targetThreadId);
 
     const requested = {};
     if (command.model !== undefined) requested.model = command.model || null;
@@ -332,28 +738,49 @@ wss.on("connection", (ws) => {
     if (command.permissions !== undefined) requested.permissions = command.permissions || null;
     if (command.personality !== undefined) requested.personality = command.personality || null;
     if (command.collaborationMode !== undefined) requested.collaborationMode = command.collaborationMode;
+    const parsedSettingsRevision = Number(command.settingsRevision);
+    const settingsRevision = Number.isSafeInteger(parsedSettingsRevision) && parsedSettingsRevision >= 0
+      ? parsedSettingsRevision
+      : null;
 
     try {
       const result = await request("thread/settings/update", {
-        threadId: activeThreadId,
+        threadId: targetThreadId,
         ...requested,
-      });
+      }, { scope: requestScope });
       pendingTurnSettings = {};
+      runtimeManager.setPendingTurnSettings(targetThreadId, pendingTurnSettings);
+      if (requested.cwd) setFileAccessRoot(requested.cwd);
       sendJson(ws, {
         type: "settingsUpdateAccepted",
+        threadId: targetThreadId,
         mode: "thread",
+        settingsRevision,
         requested,
         result,
       });
     } catch (error) {
+      if (error?.code === "STALE_THREAD_CONTEXT") throw error;
       pendingTurnSettings = { ...pendingTurnSettings, ...requested };
+      runtimeManager.setPendingTurnSettings(targetThreadId, pendingTurnSettings);
       sendJson(ws, {
         type: "settingsUpdateAccepted",
+        threadId: targetThreadId,
         mode: "nextTurnFallback",
+        settingsRevision,
         requested,
         warning: error.message,
       });
     }
+  }
+
+  function enqueueThreadSettingsUpdate(command, selectedThreadId, requestScope = threadContextScope) {
+    const targetThreadId = captureThreadTarget(command, selectedThreadId);
+    return enqueueSerialTask(
+      settingsUpdateQueues,
+      targetThreadId,
+      () => updateThreadSettings(command, selectedThreadId, requestScope),
+    );
   }
 
   ws.on("message", async (data) => {
@@ -364,6 +791,10 @@ wss.on("connection", (ws) => {
       sendJson(ws, { type: "bridgeError", message: "Invalid browser message" });
       return;
     }
+
+    const selectedThreadAtDispatch = activeThreadId;
+    const requestedThreadAtDispatch = normalizeThreadId(command.threadId);
+    const responseThreadId = requestedThreadAtDispatch || selectedThreadAtDispatch || null;
 
     try {
       if (!initialized && command.type !== "approval") {
@@ -406,94 +837,231 @@ wss.on("connection", (ws) => {
         }
 
         case "refreshMetadata": {
-          const metadata = await fetchMetadata(command.cwd || DEFAULT_CWD);
-          sendJson(ws, { type: "metadata", ...metadata });
+          const cwd = String(command.cwd || DEFAULT_CWD);
+          const metadata = await fetchMetadata(cwd);
+          setFileAccessRoot(cwd);
+          sendJson(ws, { type: "metadata", fileAccessCwd: cwd, ...metadata });
           break;
         }
 
         case "startThread": {
-          const cwd = String(command.cwd || DEFAULT_CWD);
-          const params = { cwd };
-          if (command.model) params.model = String(command.model);
-          if (command.serviceTier) params.serviceTier = String(command.serviceTier);
-          if (command.effort) {
-            params.config = { model_reasoning_effort: String(command.effort) };
-          }
-          if (command.sessionStartSource) params.sessionStartSource = String(command.sessionStartSource);
-          if (command.approvalPolicy) params.approvalPolicy = command.approvalPolicy;
-          if (command.permissions) params.permissions = command.permissions;
-          else if (command.sandbox) params.sandbox = command.sandbox;
+          const transition = beginThreadTransition();
+          try {
+            const cwd = String(command.cwd || DEFAULT_CWD);
+            const params = { cwd };
+            if (command.model) params.model = String(command.model);
+            if (command.serviceTier) params.serviceTier = String(command.serviceTier);
+            if (command.effort) {
+              params.config = { model_reasoning_effort: String(command.effort) };
+            }
+            if (command.sessionStartSource) params.sessionStartSource = String(command.sessionStartSource);
+            if (command.approvalPolicy) params.approvalPolicy = command.approvalPolicy;
+            if (command.permissions) params.permissions = command.permissions;
+            else if (command.sandbox) params.sandbox = command.sandbox;
 
-          const result = await request("thread/start", params);
-          activeThreadId = result.thread.id;
-          activeTurnId = null;
-          activeWriterConflict = null;
-          // `thread/start` does not accept collaborationMode in the current
-          // protocol. Keep the selected preset for the first turn instead of
-          // dropping it or sending an invalid parameter to App Server.
-          pendingTurnSettings = command.collaborationMode !== undefined
-            ? { collaborationMode: command.collaborationMode }
-            : {};
-          lastThreadResponse = result;
-          sendJson(ws, { type: "threadReady", mode: "start", ...result });
+            const result = await request("thread/start", params, transition);
+            const startedThreadId = normalizeThreadId(result.thread?.id);
+            if (!startedThreadId) throw new Error("App Server did not return a thread id");
+            activeThreadId = startedThreadId;
+            activeTurnId = null;
+            activeWriterConflict = null;
+            setAccessMetadata({ accessMode: "live" });
+            // `thread/start` does not accept collaborationMode in the current
+            // protocol. Keep the selected preset for the first turn instead of
+            // dropping it or sending an invalid parameter to App Server.
+            pendingTurnSettings = command.collaborationMode !== undefined
+              ? { collaborationMode: command.collaborationMode }
+              : {};
+            lastThreadResponse = result;
+            setFileAccessRoot(result);
+            runtimeManager.registerThread(result, {
+              accessMode: "live",
+              activeTurnId,
+              pendingTurnSettings,
+            });
+            sendJson(ws, {
+              type: "threadReady",
+              mode: "start",
+              operation: "start",
+              ...result,
+              threadId: startedThreadId,
+              accessMode: activeAccessMode,
+              snapshotAt,
+              snapshotReason,
+            });
+          } finally {
+            endThreadTransition(transition.scope);
+          }
           break;
         }
 
         case "resumeThread": {
-          const threadId = String(command.threadId || "").trim();
-          if (!threadId) throw new Error("threadId is required");
-          const resumed = await resumeThreadWithFallback(request, threadId);
-          const { result, writerConflict } = resumed;
-          activeThreadId = result.thread.id;
-          activeTurnId = null;
-          activeWriterConflict = writerConflict || null;
-          pendingTurnSettings = {};
-          lastThreadResponse = result;
-          sendJson(ws, {
-            type: "threadReady",
-            mode: "resume",
-            ...result,
+          const threadId = captureThreadTarget(command, selectedThreadAtDispatch, {
+            allowDifferent: true,
           });
+          if (!threadId) throw new Error("threadId is required");
+          const transition = beginThreadTransition();
+          try {
+            const knownRuntime = runtimeManager.getRuntime(threadId);
+            const knownActiveTurnId = knownRuntime?.activeTurnId || null;
+            const knownPendingTurnSettings = { ...(knownRuntime?.pendingTurnSettings || {}) };
+            const resumed = knownRuntime
+              ? {
+                result: await request("thread/read", { threadId, includeTurns: true }, transition),
+                writerConflict: knownRuntime.writerConflict || null,
+                accessMode: knownRuntime.accessMode || "live",
+                snapshotAt: knownRuntime.snapshotAt || null,
+                snapshotReason: knownRuntime.snapshotReason || null,
+              }
+              : await resumeThreadWithFallback(
+                (method, params) => request(method, params, transition),
+                threadId,
+              );
+            const {
+              result,
+              writerConflict,
+              accessMode,
+              snapshotAt: resumedSnapshotAt,
+              snapshotReason: resumedSnapshotReason,
+            } = resumed;
+            const resumedThreadId = normalizeThreadId(result.thread?.id);
+            if (!resumedThreadId || resumedThreadId !== threadId) {
+              throw turnBridgeError("App Server returned a different Thread", "THREAD_RESPONSE_MISMATCH", {
+                expectedThreadId: threadId,
+                receivedThreadId: resumedThreadId,
+              });
+            }
+            activeThreadId = resumedThreadId;
+            activeTurnId = knownActiveTurnId;
+            activeWriterConflict = writerConflict || null;
+            setAccessMetadata({
+              accessMode,
+              snapshotAt: resumedSnapshotAt,
+              snapshotReason: resumedSnapshotReason,
+            });
+            pendingTurnSettings = knownPendingTurnSettings;
+            lastThreadResponse = result;
+            setFileAccessRoot(result);
+            runtimeManager.registerThread(result, {
+              accessMode,
+              writerConflict,
+              snapshotAt: resumedSnapshotAt,
+              snapshotReason: resumedSnapshotReason,
+              activeTurnId,
+              pendingTurnSettings,
+            });
+            sendJson(ws, {
+              type: "threadReady",
+              mode: "resume",
+              operation: accessMode === "snapshot" ? "snapshot" : "resume",
+              ...result,
+              threadId,
+              accessMode: activeAccessMode,
+              snapshotAt,
+              snapshotReason,
+            });
+          } finally {
+            endThreadTransition(transition.scope);
+          }
+          break;
+        }
+
+        case "refreshThreadSnapshot": {
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          const targetAccessMode = runtimeManager.getRuntime(targetThreadId)?.accessMode
+            || (targetThreadId === selectedThreadAtDispatch ? activeAccessMode : null);
+          if (targetAccessMode !== "snapshot") {
+            throw new Error("Thread is not in snapshot mode");
+          }
+          const transition = beginThreadTransition();
+          try {
+            const result = await request("thread/read", {
+              threadId: targetThreadId,
+              includeTurns: true,
+            }, transition);
+            const refreshed = createSnapshotAccessMetadata();
+            setAccessMetadata(refreshed);
+            activeTurnId = null;
+            lastThreadResponse = result;
+            setFileAccessRoot(result);
+            runtimeManager.registerThread(result, {
+              accessMode: "snapshot",
+              snapshotAt,
+              snapshotReason,
+              activeTurnId: null,
+            });
+            sendJson(ws, {
+              type: "threadReady",
+              mode: "snapshot",
+              operation: "snapshot",
+              ...result,
+              threadId: targetThreadId,
+              accessMode: activeAccessMode,
+              snapshotAt,
+              snapshotReason,
+            });
+          } finally {
+            endThreadTransition(transition.scope);
+          }
           break;
         }
 
         case "forkThread": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
-          const result = await request("thread/fork", { threadId: activeThreadId });
-          activeThreadId = result.thread.id;
-          activeTurnId = null;
-          activeWriterConflict = null;
-          pendingTurnSettings = {};
-          lastThreadResponse = result;
-          sendJson(ws, { type: "threadReady", mode: "fork", ...result });
+          const sourceThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          const transition = beginThreadTransition();
+          try {
+            const result = await request("thread/fork", { threadId: sourceThreadId }, transition);
+            const forkedThreadId = normalizeThreadId(result.thread?.id);
+            if (!forkedThreadId) throw new Error("App Server did not return a forked thread id");
+            activeThreadId = forkedThreadId;
+            activeTurnId = null;
+            activeWriterConflict = null;
+            setAccessMetadata({ accessMode: "live" });
+            pendingTurnSettings = {};
+            lastThreadResponse = result;
+            setFileAccessRoot(result);
+            runtimeManager.registerThread(result, {
+              accessMode: "live",
+              activeTurnId: null,
+              pendingTurnSettings,
+            });
+            sendJson(ws, {
+              type: "threadReady",
+              mode: "fork",
+              operation: "fork",
+              ...result,
+              threadId: forkedThreadId,
+              accessMode: activeAccessMode,
+              snapshotAt,
+              snapshotReason,
+            });
+          } finally {
+            endThreadTransition(transition.scope);
+          }
           break;
         }
 
         case "updateSettings": {
-          await updateThreadSettings(command);
+          await enqueueThreadSettingsUpdate(command, selectedThreadAtDispatch, threadContextScope);
           break;
         }
 
         case "sendMessage": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
           const requestId = turnBridgeRequestId(command);
-          const requestedThreadId = String(command.threadId || "").trim();
-          if (requestedThreadId && requestedThreadId !== activeThreadId) {
-            throw turnBridgeError("Thread is stale or no longer active", "STALE_THREAD", {
-              expectedThreadId: activeThreadId,
-              receivedThreadId: requestedThreadId,
-            });
-          }
-          if (activeWriterConflict) throw activeWriterConflict;
+          ensureThreadWritable(targetThreadId);
           const input = browserUserInput(command);
 
           const params = {
-            threadId: activeThreadId,
+            threadId: targetThreadId,
             clientUserMessageId: String(command.clientUserMessageId || "").trim() || randomUUID(),
             input,
           };
 
-          const requested = { ...pendingTurnSettings };
+          const requested = {
+            ...(runtimeManager.getRuntime(targetThreadId)?.pendingTurnSettings
+              || (targetThreadId === selectedThreadAtDispatch ? pendingTurnSettings : {})),
+          };
           if (command.model) requested.model = command.model;
           if (command.effort) requested.effort = command.effort;
           if (command.serviceTier !== undefined) requested.serviceTier = command.serviceTier;
@@ -508,146 +1076,177 @@ wss.on("connection", (ws) => {
           if (requested.collaborationMode) params.collaborationMode = requested.collaborationMode;
 
           const result = await request("turn/start", params);
-          activeTurnId = result.turn?.id || activeTurnId;
+          const acceptedTurnId = normalizeThreadId(result.turn?.id)
+            || runtimeManager.getRuntime(targetThreadId)?.activeTurnId
+            || null;
+          activeTurnId = acceptedTurnId;
           pendingTurnSettings = {};
-          sendJson(ws, { type: "turnAccepted", requestId, accepted: true, ...result });
+          runtimeManager.updateRuntime(targetThreadId, {
+            activeTurnId: acceptedTurnId,
+            running: true,
+            status: "active",
+            pendingTurnSettings: {},
+          });
+          sendJson(ws, { type: "turnAccepted", requestId, accepted: true, ...result, threadId: targetThreadId });
           break;
         }
 
         case "steerMessage":
         case "steer": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(targetThreadId);
           const requestId = turnBridgeRequestId(command);
-          const requestedThreadId = String(command.threadId || "").trim();
           const expectedTurnId = String(command.expectedTurnId || "").trim();
-          if (!requestedThreadId || requestedThreadId !== activeThreadId) {
-            throw turnBridgeError("Thread is stale or no longer active", "STALE_THREAD", {
-              expectedThreadId: activeThreadId,
-              receivedThreadId: requestedThreadId || null,
-            });
-          }
-          if (!expectedTurnId || !activeTurnId || expectedTurnId !== activeTurnId) {
+          const targetTurnId = runtimeManager.getRuntime(targetThreadId)?.activeTurnId
+            || (targetThreadId === selectedThreadAtDispatch ? activeTurnId : null);
+          if (!expectedTurnId || !targetTurnId || expectedTurnId !== targetTurnId) {
             throw turnBridgeError("The active turn changed before steering was accepted", "STALE_TURN", {
-              expectedTurnId: activeTurnId,
+              expectedTurnId: targetTurnId,
               receivedTurnId: expectedTurnId || null,
             });
           }
           const input = browserUserInput(command);
           const params = {
-            threadId: activeThreadId,
+            threadId: targetThreadId,
             expectedTurnId,
             clientUserMessageId: String(command.clientUserMessageId || "").trim() || randomUUID(),
             input,
           };
           const result = await request("turn/steer", params);
-          sendJson(ws, { type: "steerAccepted", requestId, accepted: true, ...result });
+          sendJson(ws, { type: "steerAccepted", requestId, accepted: true, ...result, threadId: targetThreadId });
           break;
         }
 
         case "interrupt": {
-          const turnId = String(command.turnId || activeTurnId || "").trim();
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch, {
+            allowDifferent: true,
+          });
+          const targetRuntime = runtimeManager.getRuntime(targetThreadId);
+          const turnId = String(command.turnId || targetRuntime?.activeTurnId || (targetThreadId === selectedThreadAtDispatch ? activeTurnId : "")).trim();
+          ensureThreadWritable(targetThreadId);
           if (!turnId) throw new Error("No active turn to interrupt");
-          await request("turn/interrupt", { threadId: activeThreadId, turnId });
+          await request("turn/interrupt", { threadId: targetThreadId, turnId }, {
+            contextBound: targetThreadId === selectedThreadAtDispatch,
+          });
+          sendJson(ws, { type: "interruptAccepted", threadId: targetThreadId, turnId });
           break;
         }
 
         case "renameThread": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(targetThreadId);
           const name = String(command.name || "").trim();
           if (!name) throw new Error("Thread name is required");
-          const result = await request("thread/name/set", { threadId: activeThreadId, name });
-          sendJson(ws, { type: "threadRenamed", name, result });
+          const result = await request("thread/name/set", { threadId: targetThreadId, name });
+          sendJson(ws, { type: "threadRenamed", threadId: targetThreadId, name, result });
           break;
         }
 
         case "archiveThread": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
-          const threadId = activeThreadId;
+          const threadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(threadId);
           const result = await request("thread/archive", { threadId });
-          activeThreadId = null;
-          activeTurnId = null;
-          activeWriterConflict = null;
+          runtimeManager.forgetThread(threadId);
+          clearActiveThread();
           sendJson(ws, { type: "threadArchived", threadId, result });
           break;
         }
 
         case "deleteThread": {
-          const threadId = resolveDeleteThreadId(command.threadId);
+          const threadId = normalizeThreadId(resolveDeleteThreadId(command.threadId));
           if (!threadId) throw new Error("threadId is required");
+          // A snapshot only locks mutations to the selected thread. Deleting
+          // a different sidebar entry does not take ownership of that thread.
+          ensureThreadDeletable(threadId);
+          ensureThreadWritable(threadId);
+          const wasSelectedAtDispatch = threadId === selectedThreadAtDispatch;
           const requestId = String(command.requestId || "").trim() || null;
-          const result = await request("thread/delete", { threadId });
-          if (threadId === activeThreadId) {
-            activeThreadId = null;
-            activeTurnId = null;
-            activeWriterConflict = null;
+          const result = await request("thread/delete", { threadId }, {
+            contextBound: threadId === selectedThreadAtDispatch,
+          });
+          if (wasSelectedAtDispatch) {
+            runtimeManager.forgetThread(threadId);
+            clearActiveThread();
           }
           sendJson(ws, { type: "threadDeleted", threadId, requestId, result });
           break;
         }
 
         case "reviewThread": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(targetThreadId);
           const instructions = String(command.instructions || "").trim();
           const target = instructions
             ? { type: "custom", instructions }
             : { type: "uncommittedChanges" };
           const result = await request("review/start", {
-            threadId: activeThreadId,
+            threadId: targetThreadId,
             delivery: "inline",
             target,
           });
-          activeTurnId = result.turn?.id || activeTurnId;
-          sendJson(ws, { type: "reviewAccepted", ...result });
+          const acceptedTurnId = normalizeThreadId(result.turn?.id)
+            || runtimeManager.getRuntime(targetThreadId)?.activeTurnId
+            || null;
+          activeTurnId = acceptedTurnId;
+          runtimeManager.updateRuntime(targetThreadId, {
+            activeTurnId: acceptedTurnId,
+            running: true,
+            status: "active",
+          });
+          sendJson(ws, { type: "reviewAccepted", ...result, threadId: targetThreadId });
           break;
         }
 
         case "getGoal": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
-          const result = await request("thread/goal/get", { threadId: activeThreadId });
-          sendJson(ws, { type: "goalResult", action: "get", result });
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          const result = await request("thread/goal/get", { threadId: targetThreadId });
+          sendJson(ws, { type: "goalResult", threadId: targetThreadId, action: "get", result });
           break;
         }
 
         case "setGoal": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(targetThreadId);
           const objective = String(command.objective || "").trim();
           if (!objective) throw new Error("Goal objective is required");
           const result = await request("thread/goal/set", {
-            threadId: activeThreadId,
+            threadId: targetThreadId,
             objective,
             status: "active",
           });
-          sendJson(ws, { type: "goalResult", action: "set", result });
+          sendJson(ws, { type: "goalResult", threadId: targetThreadId, action: "set", result });
           break;
         }
 
         case "clearGoal": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
-          const result = await request("thread/goal/clear", { threadId: activeThreadId });
-          sendJson(ws, { type: "goalResult", action: "clear", result });
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(targetThreadId);
+          const result = await request("thread/goal/clear", { threadId: targetThreadId });
+          sendJson(ws, { type: "goalResult", threadId: targetThreadId, action: "clear", result });
           break;
         }
 
         case "setMemoryMode": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(targetThreadId);
           const mode = command.mode === "disabled" ? "disabled" : "enabled";
-          const result = await request("thread/memoryMode/set", { threadId: activeThreadId, mode });
-          sendJson(ws, { type: "memoryModeUpdated", mode, result });
+          const result = await request("thread/memoryMode/set", { threadId: targetThreadId, mode });
+          sendJson(ws, { type: "memoryModeUpdated", threadId: targetThreadId, mode, result });
           break;
         }
 
         case "listBackgroundTerminals": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
-          const result = await request("thread/backgroundTerminals/list", { threadId: activeThreadId });
-          sendJson(ws, { type: "backgroundTerminalsResult", result });
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          const result = await request("thread/backgroundTerminals/list", { threadId: targetThreadId });
+          sendJson(ws, { type: "backgroundTerminalsResult", threadId: targetThreadId, result });
           break;
         }
 
         case "cleanBackgroundTerminals": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
-          const result = await request("thread/backgroundTerminals/clean", { threadId: activeThreadId });
-          sendJson(ws, { type: "backgroundTerminalsCleaned", result });
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(targetThreadId);
+          const result = await request("thread/backgroundTerminals/clean", { threadId: targetThreadId });
+          sendJson(ws, { type: "backgroundTerminalsCleaned", threadId: targetThreadId, result });
           break;
         }
 
@@ -658,19 +1257,24 @@ wss.on("connection", (ws) => {
         }
 
         case "listMcp": {
+          const targetThreadId = command.threadId
+            ? captureThreadTarget(command, selectedThreadAtDispatch)
+            : selectedThreadAtDispatch;
           const params = { cursor: null, limit: 100 };
-          if (activeThreadId) params.threadId = activeThreadId;
+          if (targetThreadId) params.threadId = targetThreadId;
           const result = await request("mcpServerStatus/list", params);
-          sendJson(ws, { type: "mcpResult", result, verbose: Boolean(command.verbose), reloaded: false });
+          sendJson(ws, { type: "mcpResult", threadId: targetThreadId, result, verbose: Boolean(command.verbose), reloaded: false });
           break;
         }
 
         case "reloadMcp": {
-          await request("config/mcpServer/reload", {});
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch, { required: false });
+          ensureThreadWritable(targetThreadId);
+          await request("config/mcpServer/reload", {}, { threadId: targetThreadId });
           const params = { cursor: null, limit: 100 };
-          if (activeThreadId) params.threadId = activeThreadId;
+          if (targetThreadId) params.threadId = targetThreadId;
           const result = await request("mcpServerStatus/list", params);
-          sendJson(ws, { type: "mcpResult", result, verbose: Boolean(command.verbose), reloaded: true });
+          sendJson(ws, { type: "mcpResult", threadId: targetThreadId, result, verbose: Boolean(command.verbose), reloaded: true });
           break;
         }
 
@@ -689,10 +1293,13 @@ wss.on("connection", (ws) => {
         }
 
         case "listApps": {
+          const targetThreadId = command.threadId
+            ? captureThreadTarget(command, selectedThreadAtDispatch)
+            : selectedThreadAtDispatch;
           const params = { cursor: null, limit: 100, forceRefetch: Boolean(command.forceRefetch) };
-          if (activeThreadId) params.threadId = activeThreadId;
+          if (targetThreadId) params.threadId = targetThreadId;
           const result = await request("app/list", params);
-          sendJson(ws, { type: "appsResult", result });
+          sendJson(ws, { type: "appsResult", threadId: targetThreadId, result });
           break;
         }
 
@@ -720,38 +1327,40 @@ wss.on("connection", (ws) => {
         }
 
         case "compact": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
-          const result = await request("thread/compact/start", { threadId: activeThreadId });
-          sendJson(ws, { type: "compactAccepted", result });
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(targetThreadId);
+          const result = await request("thread/compact/start", { threadId: targetThreadId });
+          sendJson(ws, { type: "compactAccepted", result, threadId: targetThreadId });
           break;
         }
 
         case "approveGuardianDeniedAction": {
-          if (!activeThreadId) throw new Error("Start or resume a thread first");
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch);
+          ensureThreadWritable(targetThreadId);
           if (!command.event || typeof command.event !== "object") {
             throw new Error("No auto-review denial is available to retry");
           }
           const result = await request("thread/approveGuardianDeniedAction", {
-            threadId: activeThreadId,
+            threadId: targetThreadId,
             event: command.event,
           });
-          sendJson(ws, { type: "guardianDeniedActionApproved", result });
+          sendJson(ws, { type: "guardianDeniedActionApproved", threadId: targetThreadId, result });
           break;
         }
 
         case "setExperiment": {
+          const targetThreadId = captureThreadTarget(command, selectedThreadAtDispatch, { required: false });
+          ensureThreadWritable(targetThreadId);
           const name = String(command.name || "").trim();
           if (!name) throw new Error("Experimental feature name is required");
           const enabled = Boolean(command.enabled);
           const result = await request("experimentalFeature/enablement/set", {
             enablement: { [name]: enabled },
-          });
-          const listed = await safeRequest(
-            "experimentalFeature/list",
-            activeThreadId ? { threadId: activeThreadId } : {},
-          );
+          }, { threadId: targetThreadId });
+          const listed = await safeRequest("experimentalFeature/list", targetThreadId ? { threadId: targetThreadId } : {});
           sendJson(ws, {
             type: "experimentalUpdated",
+            threadId: targetThreadId,
             name,
             enabled,
             result,
@@ -763,18 +1372,44 @@ wss.on("connection", (ws) => {
 
         case "approval": {
           if (command.requestId === undefined) throw new Error("Approval requestId is required");
-          writeProtocol({
-            id: command.requestId,
-            result: { decision: command.decision },
+          const pendingRequest = pendingServerRequests.get(String(command.requestId));
+          if (!pendingRequest) throw new Error("Approval request is stale or no longer pending");
+          const approvalThreadId = captureThreadTarget(command, selectedThreadAtDispatch, {
+            required: false,
+            allowDifferent: true,
+          }) || pendingRequest.threadId || null;
+          ensureThreadWritable(approvalThreadId || pendingRequest.threadId);
+          runtimeManager.respondServerRequest(
+            command.requestId,
+            { decision: command.decision },
+            { clientId, threadId: approvalThreadId },
+          );
+          sendJson(ws, {
+            type: "approvalAccepted",
+            threadId: approvalThreadId,
+            requestId: String(command.requestId),
           });
           break;
         }
 
         case "serverRequestResponse": {
           if (command.requestId === undefined) throw new Error("Server requestId is required");
-          writeProtocol({
-            id: command.requestId,
-            result: command.result,
+          const pendingRequest = pendingServerRequests.get(String(command.requestId));
+          if (!pendingRequest) throw new Error("Server request is stale or no longer pending");
+          const responseThreadId = captureThreadTarget(command, selectedThreadAtDispatch, {
+            required: false,
+            allowDifferent: true,
+          }) || pendingRequest.threadId || null;
+          ensureThreadWritable(responseThreadId || pendingRequest.threadId);
+          runtimeManager.respondServerRequest(
+            command.requestId,
+            command.result,
+            { clientId, threadId: responseThreadId },
+          );
+          sendJson(ws, {
+            type: "serverRequestResponseAccepted",
+            threadId: responseThreadId,
+            requestId: String(command.requestId),
           });
           break;
         }
@@ -784,8 +1419,13 @@ wss.on("connection", (ws) => {
             type: "debugState",
             activeThreadId,
             activeTurnId,
+            accessMode: activeAccessMode,
+            snapshotAt,
+            snapshotReason,
             pendingTurnSettings,
             lastThreadResponse,
+            selectedThreadId: activeThreadId,
+            runtimes: runtimeManager.runtimeSnapshot(),
           });
           break;
         }
@@ -796,10 +1436,12 @@ wss.on("connection", (ws) => {
     } catch (error) {
       const isTurnBridge = ["sendMessage", "steerMessage", "steer"].includes(command?.type);
       const requestId = isTurnBridge || command?.type === "deleteThread" ? String(command.requestId || "").trim() : "";
+      const isThreadScoped = THREAD_SCOPED_COMMANDS.has(command?.type);
       if (isTurnBridge) {
         sendJson(ws, {
           type: ["steerMessage", "steer"].includes(command.type) ? "steerAccepted" : "turnAccepted",
           requestId: requestId || turnBridgeRequestId(command),
+          threadId: responseThreadId,
           accepted: false,
           error: compactError(error),
         });
@@ -809,20 +1451,84 @@ wss.on("connection", (ws) => {
         type: "bridgeError",
         message: error.message,
         details: compactError(error),
+        ...(isThreadScoped ? { threadId: responseThreadId } : {}),
         ...(requestId ? { requestId } : {}),
       });
     }
   });
 
   ws.on("close", () => {
-    stdoutLines.close();
-    stderrLines.close();
-    rejectAllPending(new Error("Browser connection closed"));
-    codex.kill("SIGTERM");
+    fileAccessRoots.delete(fileAccessToken);
+    runtimeManager.off("runtimeUpdate", runtimeListener);
+    runtimeManager.removeClient(clientId);
   });
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Codex Math Web v4: http://${HOST}:${PORT}`);
-  console.log(`Default project cwd: ${DEFAULT_CWD}`);
-});
+  fullRequestHandler = app;
+  for (const pending of pendingUpgrades.splice(0)) {
+    if (pending.socket.destroyed) continue;
+    pending.socket.setTimeout(0);
+    wss.handleUpgrade(pending.req, pending.socket, pending.head, (ws) => wss.emit("connection", ws, pending.req));
+  }
+}
+
+server.on("close", () => activeRuntimeManager?.shutdown());
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    activeRuntimeManager?.shutdown();
+    for (const client of activeWss?.clients || []) client.close();
+    for (const pending of pendingUpgrades.splice(0)) pending.socket.destroy();
+    if (server.listening) server.close();
+  });
+}
+
+void (async () => {
+  try {
+    SERVER_CONFIG = loadStartupConfig(__dirname);
+    if (!SERVER_CONFIG) {
+      const { loadServerConfig } = await import("./server-config.mjs");
+      SERVER_CONFIG = loadServerConfig({ rootDir: __dirname });
+    }
+    HOST = SERVER_CONFIG.host;
+    PORT = SERVER_CONFIG.port;
+    CODEX_BIN = SERVER_CONFIG.codexBin;
+    DEFAULT_CWD = SERVER_CONFIG.projectCwd;
+
+    server.listen(PORT, HOST, () => {
+      console.log("Codex Math Web v4: http://" + HOST + ":" + PORT);
+      console.log("Default project cwd: " + DEFAULT_CWD);
+    });
+
+    const [
+      expressModule,
+      wsModule,
+      runtimeModule,
+      fileAccessModule,
+      threadDeleteModule,
+      threadAccessModule,
+    ] = await Promise.all([
+      import("express"),
+      import("ws"),
+      import("./codex-runtime-manager.mjs"),
+      import("./file-access.mjs"),
+      import("./public/thread-delete-data.js"),
+      import("./public/thread-access.js"),
+    ]);
+    initializeFullServer({
+      expressModule,
+      wsModule,
+      runtimeModule,
+      fileAccessModule,
+      threadDeleteModule,
+      threadAccessModule,
+    });
+  } catch (error) {
+    console.error("Codex Web startup failed: " + error.message);
+    startupFailed = true;
+    activeWss = null;
+    for (const pending of pendingUpgrades.splice(0)) pending.socket.destroy();
+    if (server.listening) server.close();
+    process.exitCode = 1;
+  }
+})();

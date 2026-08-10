@@ -1,7 +1,9 @@
 import DOMPurify from "/vendor/dompurify/dist/purify.es.mjs";
 import katex from "/vendor/katex/dist/katex.mjs";
 import { marked } from "/vendor/marked/lib/marked.esm.js";
-import { extractMath, findStableMarkdownBoundary, renderMathSlots } from "/math-renderer.js";
+import { createMathRenderCache, extractMath, findStableMarkdownBoundary, renderMathSlots, scheduleMathSlots } from "/math-renderer.js";
+import { bridgeClient } from "/bridge-client.js";
+import { createKeyedFrameScheduler, scheduleIdleTask, scheduleTimeSliced } from "/render-scheduler.js";
 import { guardianEventFromNotification, prioritizeSlashMatches, resolveSlashSelection } from "/slash-input.js";
 import { slashAliases, slashCommands } from "/slash-commands.js";
 import { currentApproval, enqueueApproval, removeApproval as removeQueuedApproval } from "/approval-data.js";
@@ -9,15 +11,41 @@ import { codexVersion, formatCompactNumber, providerStatus, threadTokenStats, un
 import { formatMcpInventory, normalizeMcpInventory } from "/mcp-data.js";
 import { compactThreadCwd, filterThreads, formatThreadTime, groupThreads, mergeThreadPages, threadTitle } from "/thread-list-data.js";
 import { removeThreadById, removeThreadFromNavigation } from "/thread-delete-data.js";
-import { composeUserInput, displayInput, makeMention, MAX_IMAGES, validateImage } from "/composer-input.js";
+import { composeUserInput, displayInput, makeMention, MAX_IMAGES, presentUserInput, validateImage } from "/composer-input.js";
 import { diffRowMarker, normalizeFileChanges, visibleDiffRows } from "/diff-data.js";
 import { normalizeFileSearchFiles } from "/file-search-data.js";
-import { countOutputLines, normalizeToolStatus, presentCommand, searchActivityLabel, tailOutputLines, toolInputPreview } from "/command-presentation.js";
+import {
+  browserFileName,
+  browserParentPath,
+  closeBrowserFileTab,
+  formatBrowserFileSize,
+  isBrowserImagePath,
+  normalizeBrowserFilePath,
+  openBrowserFileTab,
+  resolveWorkspaceFileHref,
+  sourceFileLines,
+  toggleRightPanelMode,
+} from "/file-browser-data.js";
+import { countOutputLines, normalizeToolStatus, presentAgentActivity, presentCommand, searchActivityLabel, summarizeProcessActivities, tailOutputLines, toolInputPreview } from "/command-presentation.js";
 import { buildConversationBlocks, buildProcessDetailsForTurns, mergeCachedTools } from "/conversation-blocks.js";
 import { buildProcessDetails, isDisplayableProcessItem, isToolCallItem, normalizeDisplayStatus, presentTool, resolveModelDisplayName } from "/message-display.js";
 import { createQueueEntry, isQueueEntryRetryable, nextQueueEntry, queueForThread, queueReducer } from "/queue-data.js";
 import { normalizeThread } from "/thread-items.js";
 import { isNotificationForThread } from "/notification-scope.js";
+import {
+  applyRuntimeSnapshot,
+  canBeginThreadSelection,
+  createThreadRuntimeStore,
+  getThreadRuntime,
+  isThreadRuntimeBusy,
+  markThreadRuntimeRead,
+  readSelectedThread,
+  runtimeIndicator,
+  runtimeThreadIdFromNotification,
+  selectThreadRuntime,
+  updateThreadRuntime,
+  writeSelectedThread,
+} from "/thread-runtime-state.js";
 import {
   canImplementPlan,
   normalizePlanSnapshot,
@@ -32,9 +60,33 @@ import {
   resetUserInputRequest,
   USER_INPUT_OTHER,
 } from "/user-input-data.js";
-import { createSessionSettings, navigateThread, pushThreadNavigation, resolveReasoningEffort, shouldFollowScroll } from "/session-state.js";
+import {
+  buildCollaborationModePayload,
+  createSessionSettings,
+  navigateThread,
+  pushThreadNavigation,
+  retireSettingsRequest,
+  resolveReasoningEffort,
+  shouldApplySettingsResponse,
+  shouldFollowScroll,
+} from "/session-state.js";
 import { formatActivityDuration, isActiveTurnStatus, resolveTurnDurationMs, timestampToMs } from "/turn-activity.js";
+import { enhanceMarkdownCodeBlocks } from "/markdown-code-blocks.js";
+import { accessControlState, snapshotBannerText as formatSnapshotBannerText } from "/access-presentation.js";
+import { reasoningText } from "/protocol-text.js";
+import {
+  createProtocolState,
+  getProtocolItem,
+  reduceProtocolState,
+  toProtocolSnapshot,
+} from "/protocol-state.js";
 import { renderIcons } from "/icons.js";
+import {
+  activeConversationTurnIndex,
+  conversationPreviewText,
+  layoutConversationMinimap,
+  nearestConversationMinimapIndex,
+} from "/conversation-minimap.js";
 
 marked.setOptions({ gfm: true, breaks: false });
 
@@ -54,14 +106,20 @@ const threadSearchInput = $("#threadSearchInput");
 const threadList = $("#threadList");
 const threadListStatus = $("#threadListStatus");
 const statusButton = $("#statusButton");
-const threadIdInput = $("#threadIdInput");
-const resumeButton = $("#resumeButton");
 const sessionSummary = $("#sessionSummary");
 const directorySummary = $("#directorySummary");
 const runStatus = $("#runStatus");
 const contextSummary = $("#contextSummary");
+const snapshotBanner = $("#snapshotBanner");
+const snapshotBannerText = $("#snapshotBannerText");
+const refreshSnapshotButton = $("#refreshSnapshotButton");
+const conversationView = $("#conversationView");
 const chat = $("#chat");
 const chatEmptyState = $("#chatEmptyState");
+const chatMinimap = $("#chatMinimap");
+const chatMinimapRail = $("#chatMinimapRail");
+const chatMinimapLine = $("#chatMinimapLine");
+const conversationOutline = $("#conversationOutline");
 const approvalArea = $("#approvalArea");
 const composer = $(".composer");
 const turnActivity = $("#turnActivity");
@@ -87,6 +145,16 @@ const deleteThreadDialogTitle = $("#deleteThreadDialogTitle");
 const deleteThreadDialogCwd = $("#deleteThreadDialogCwd");
 const confirmDeleteThreadButton = $("#confirmDeleteThreadButton");
 const inspector = $("#inspector");
+const rightPanel = $("#rightPanel");
+const rightPanelResizeHandle = $("#rightPanelResizeHandle");
+const filePanelButton = $("#filePanelButton");
+const filePanel = $("#filePanel");
+const fileTabs = $("#fileTabs");
+const fileViewer = $("#fileViewer");
+const explorerShell = $("#explorerShell");
+const explorerTree = $("#explorerTree");
+const explorerToggleButton = $("#explorerToggleButton");
+const refreshExplorerButton = $("#refreshExplorerButton");
 const inspectorModelSelect = $("#inspectorModelSelect");
 const inspectorEffortSelect = $("#inspectorEffortSelect");
 const inspectorCollaborationModeSelect = $("#inspectorCollaborationModeSelect");
@@ -112,15 +180,8 @@ const sidebarToggleButton = $("#mobileSidebarButton");
 const drawerBackdrop = $("#drawerBackdrop");
 const cwdDialog = $("#cwdDialog");
 const cwdDialogInput = $("#cwdDialogInput");
-const inspectorTitle = $("#inspectorTitle");
-const outlineTab = $("#outlineTab");
-const sessionTab = $("#sessionTab");
-const outlinePanel = $("#outlinePanel");
-const sessionPanel = $("#sessionPanel");
-const outlineCount = $("#outlineCount");
-const conversationOutline = $("#conversationOutline");
-const outlineBottomButton = $("#outlineBottomButton");
-const mathRenderCache = new Map();
+const mathRenderCache = createMathRenderCache();
+const bridge = globalThis.codexBridge || globalThis.codexWebBridge || bridgeClient;
 
 const state = {
   ready: false,
@@ -132,6 +193,13 @@ const state = {
   collaborationModes: [],
   metadataErrors: {},
   threadId: null,
+  selectedThreadId: null,
+  selectionPending: false,
+  threadRuntimes: createThreadRuntimeStore(),
+  reconnecting: false,
+  accessMode: null,
+  snapshotAt: null,
+  snapshotReason: null,
   activeTurnId: null,
   running: false,
   threadStatus: "notLoaded",
@@ -142,6 +210,7 @@ const state = {
   latestDiff: "",
   messageNodes: new Map(),
   toolNodes: new Map(),
+  activityNodes: new Map(),
   processNodes: new Map(),
   planSnapshots: new Map(),
   planNodes: new Map(),
@@ -169,6 +238,9 @@ const state = {
   deleteDialogThreadId: null,
   userInputRequest: null,
   sessionSettings: createSessionSettings(),
+  pendingSettingsThreadId: null,
+  settingsRequestSequence: 0,
+  latestSettingsRequests: new Map(),
   activeView: "conversation",
   threadView: normalizeThread({}),
   commandItems: new Map(),
@@ -176,6 +248,12 @@ const state = {
   searchNodes: new Map(),
   commandObservedStartMs: new Map(),
   conversationOrder: [],
+  processEpochs: new Map(),
+  conversationNodeMeta: new Map(),
+  conversationNodeOrdinal: 0,
+  conversationFallbackAnchor: null,
+  conversationFallbackIndex: 0,
+  historyOrderRanks: new Map(),
   toolCacheItems: new Map(),
   toolCacheSequence: 0,
   toolCacheSaveTimer: null,
@@ -219,12 +297,62 @@ const state = {
   queueDispatch: null,
   ignoredQueueRequestIds: new Set(),
   steerRequestInputs: new Map(),
+  steerRequestThreads: new Map(),
   historicalProcessAnswerIds: new Set(),
-  outlineObserver: null,
+  protocolState: createProtocolState(),
+  pendingServerRequests: new Map(),
   outlineNodes: new Map(),
+  outlineTurns: [],
+  outlineLayout: null,
+  outlineRenderTimer: null,
+  outlinePreviewHideTimer: null,
+  outlineActiveLock: null,
+  locatedOutlineMessageId: null,
   activeOutlineNode: null,
   activeOutlineMessageId: null,
+  fileAccessToken: null,
+  defaultCwd: null,
+  fileWorkspaceCwd: null,
+  rightPanelMode: "closed",
+  fileTabs: [],
+  activeFilePath: null,
+  fileViewData: new Map(),
+  fileViewModes: new Map(),
+  fileViewRequest: 0,
+  explorerRequestGeneration: 0,
+  explorerRefreshTimer: null,
+  explorerIdleCancel: null,
+  explorerChildren: new Map(),
+  explorerExpanded: new Set(),
+  explorerLoading: new Set(),
+  explorerErrors: new Map(),
+  historyRestoreGeneration: 0,
+  historyRestoreJob: null,
+  historyRestoring: false,
+  historyLatestScrollPending: false,
+  historyRestoreScrollBaseline: null,
+  historyRestoreScrollInterrupted: false,
+  historySwitchTargetId: null,
+  conversationReconcilePending: false,
+  historyObserverMuted: false,
+  historyObserverReleaseTimer: null,
+  threadListStructureKey: "",
+  threadRowNodes: new Map(),
 };
+
+const historyCancelSendHook = Symbol.for("codex.historyCancelSendHook");
+if (typeof bridge.send === "function" && !bridge[historyCancelSendHook]) {
+  const bridgeSend = bridge.send.bind(bridge);
+  bridge.send = (payload) => {
+    if (payload?.type !== "resumeThread") return bridgeSend(payload);
+    state.historySwitchTargetId = String(payload.threadId || "").trim() || null;
+    cancelHistoryRestore();
+    const sent = bridgeSend(payload);
+    if (!sent) state.historySwitchTargetId = null;
+    return sent;
+  };
+  bridge[historyCancelSendHook] = true;
+}
 
 renderIcons();
 
@@ -290,17 +418,15 @@ renderIcons();
   ["/pet", "/pets"],
 ]);*/
 
-const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-const socket = new WebSocket(`${wsProtocol}//${location.host}/ws`);
+let socket = bridge;
 
 function send(payload) {
-  if (socket.readyState !== WebSocket.OPEN) {
+  if (!socket || socket.readyState !== 1) {
     addSystemMessage("WebSocket is not connected.", "error");
     return false;
   }
   try {
-    socket.send(JSON.stringify(payload));
-    return true;
+    return socket.send(payload) !== false;
   } catch {
     addSystemMessage("WebSocket is not connected.", "error");
     return false;
@@ -313,6 +439,371 @@ function setConnection(text, online) {
   connectionStatus.prepend(dot);
   connectionStatus.className = `connection-badge ${online ? "status-online" : "status-offline"}`;
   inspectorConnection.textContent = text;
+}
+
+function selectedRuntime() {
+  return getThreadRuntime(state.threadRuntimes, state.threadId, false);
+}
+
+function settingsRequestFor(threadId = state.threadId) {
+  const id = String(threadId || "").trim();
+  return id ? state.latestSettingsRequests.get(id) || null : null;
+}
+
+function settingsResponseIsCurrent(threadId, response, responseRevision = null) {
+  const latest = settingsRequestFor(threadId);
+  if (!latest) return true;
+  return shouldApplySettingsResponse({
+    response,
+    expected: latest.settings,
+    responseRevision,
+    latestRevision: latest.revision,
+  });
+}
+
+function persistSelectedThread(threadId) {
+  state.selectedThreadId = threadId || null;
+  writeSelectedThread(sessionStorage, state.selectedThreadId);
+}
+
+function captureSelectedRuntime() {
+  if (!state.threadId) return null;
+  return updateThreadRuntime(state.threadRuntimes, state.threadId, {
+    activeTurnId: state.activeTurnId,
+    status: state.threadStatus,
+    running: state.running,
+    accessMode: state.accessMode,
+    snapshotAt: state.snapshotAt,
+    snapshotReason: state.snapshotReason,
+    latestThread: state.threadView,
+    pendingServerRequests: [...state.pendingServerRequests.entries()].map(([id, request]) => ({ id, ...request })),
+    pendingTurnSettings: selectedRuntime()?.pendingTurnSettings || {},
+    unread: false,
+  }, { markUnread: false });
+}
+
+function syncRuntimeFromCurrentState() {
+  const runtime = selectedRuntime();
+  if (!runtime) return;
+  runtime.activeTurnId = state.activeTurnId;
+  runtime.status = state.threadStatus;
+  runtime.running = state.running;
+  runtime.accessMode = state.accessMode;
+  runtime.snapshotAt = state.snapshotAt;
+  runtime.snapshotReason = state.snapshotReason;
+  runtime.latestThread = state.threadView;
+  runtime.pendingServerRequests = [...state.pendingServerRequests.entries()].map(([id, request]) => ({ id, ...request }));
+}
+
+function runtimeNotificationPatch(message) {
+  const params = message?.params || {};
+  const method = String(message?.method || "");
+  const patch = {
+    lastEventAt: new Date().toISOString(),
+    latestNotification: { method, params },
+  };
+  if (method === "turn/started") {
+    patch.running = true;
+    patch.status = "active";
+    patch.activeTurnId = params.turn?.id || params.turnId || null;
+  } else if (method === "turn/completed") {
+    patch.running = false;
+    patch.status = params.turn?.status || "idle";
+    patch.activeTurnId = null;
+    patch.latestTurn = params.turn || null;
+  } else if (method === "thread/status/changed") {
+    patch.status = params.status || "unknown";
+    patch.running = params.status === "active" || Boolean(params.activeTurnId);
+    patch.activeTurnId = params.activeTurnId || null;
+  } else if (method === "thread/tokenUsage/updated") {
+    patch.tokenUsage = params.tokenUsage || params.token_usage || null;
+  } else if (method === "thread/archived" || method === "thread/closed") {
+    patch.running = false;
+    patch.status = method === "thread/archived" ? "archived" : "closed";
+    patch.activeTurnId = null;
+  }
+  return patch;
+}
+
+function rememberRuntimeNotification(message) {
+  const threadId = runtimeThreadIdFromNotification(message);
+  if (!threadId) return null;
+  const runtime = updateThreadRuntime(state.threadRuntimes, threadId, runtimeNotificationPatch(message));
+  if (message.method === "serverRequest/resolved") {
+    const requestId = String(message.params?.requestId ?? "");
+    runtime.pendingServerRequests = (runtime.pendingServerRequests || [])
+      .filter((request) => String(request.id) !== requestId);
+  }
+  const notification = runtime.latestNotification;
+  runtime.pendingNotifications = [...(runtime.pendingNotifications || []), notification].slice(-120);
+  renderThreadList();
+  return runtime;
+}
+
+function rememberPendingRuntimeRequest(message, threadId) {
+  if (!threadId || message?.id === undefined) return null;
+  const runtime = getThreadRuntime(state.threadRuntimes, threadId);
+  const entry = {
+    id: String(message.id),
+    method: message.method,
+    threadId,
+    turnId: message.params?.turnId || runtime.activeTurnId || null,
+    message,
+  };
+  const pending = [...(runtime.pendingServerRequests || []).filter((item) => String(item.id) !== entry.id), entry];
+  const next = updateThreadRuntime(state.threadRuntimes, threadId, {
+    pendingServerRequests: pending,
+    running: runtime.running,
+    status: runtime.status,
+  });
+  renderThreadList();
+  return next;
+}
+
+function applyRuntimeMessage(payload) {
+  const changed = applyRuntimeSnapshot(state.threadRuntimes, payload);
+  if (payload.deleted) {
+    renderThreadList();
+    return [];
+  }
+  if (payload.selectedThreadId) {
+    state.selectedThreadId = payload.selectedThreadId;
+  }
+  let staleUserInput = false;
+  for (const runtime of changed) {
+    if (runtime.threadId === state.selectedThreadId || runtime.threadId === state.threadId) markThreadRuntimeRead(state.threadRuntimes, runtime.threadId);
+    if (runtime.threadId === state.threadId && Array.isArray(runtime.pendingServerRequests)) {
+      const pendingIds = new Set(runtime.pendingServerRequests.map((request) => String(request.id ?? request.requestId)));
+      for (const [requestId, request] of state.pendingServerRequests) {
+        if (request.threadId === runtime.threadId && !pendingIds.has(String(requestId))) {
+          state.pendingServerRequests.delete(requestId);
+          state.approvals = removeQueuedApproval(state.approvals, requestId);
+          if (state.userInputRequest?.requestId !== undefined && String(state.userInputRequest.requestId) === String(requestId)) {
+            staleUserInput = true;
+          }
+        }
+      }
+    }
+  }
+  if (staleUserInput) clearUserInputRequest();
+  if (changed.length) {
+    const runtime = selectedRuntime();
+    if (runtime && runtime.latestThread && runtime.threadId === state.threadId) {
+      state.running = runtime.running;
+      state.activeTurnId = runtime.activeTurnId;
+      state.threadStatus = runtime.status;
+    }
+    const usage = runtime?.tokenUsage || runtime?.latestEvent?.params?.tokenUsage || runtime?.latestEvent?.params?.token_usage;
+    if (runtime?.threadId === state.threadId && usage) {
+      state.tokenUsage = usage;
+      state.tokenUsageThreadId = runtime.threadId;
+      renderContextUsage();
+    }
+    renderThreadList();
+    updateControls();
+  }
+  return changed;
+}
+
+function restorePendingRuntimeRequests(runtime) {
+  for (const request of runtime?.pendingServerRequests || []) {
+    const message = request.message || request;
+    if (message?.id === undefined || !message.method) continue;
+    state.pendingServerRequests.set(String(message.id), {
+      method: message.method,
+      threadId: message.params?.threadId || runtime.threadId,
+      turnId: message.params?.turnId || runtime.activeTurnId,
+      message,
+    });
+    if (message.method === "item/tool/requestUserInput") openUserInputRequest(message);
+    else if (message.method === "item/commandExecution/requestApproval" || message.method === "item/fileChange/requestApproval") addApproval(message);
+  }
+}
+
+function prepareThreadSelection(threadId) {
+  const id = String(threadId || "").trim();
+  if (!id || id === state.threadId) return;
+  const previousId = state.threadId;
+  captureSelectedRuntime();
+  if (previousId) {
+    saveThreadUi();
+    saveToolCache();
+  }
+  state.threadId = id;
+  state.selectedThreadId = id;
+  state.selectionPending = true;
+  const runtime = selectThreadRuntime(state.threadRuntimes, id, { markRead: true });
+  state.activeTurnId = runtime?.activeTurnId || null;
+  state.running = Boolean(runtime?.running);
+  state.threadStatus = runtime?.status || "notLoaded";
+  state.accessMode = runtime?.accessMode || null;
+  state.snapshotAt = runtime?.snapshotAt || null;
+  state.snapshotReason = runtime?.snapshotReason || null;
+  state.threadMeta = {};
+  state.threadView = normalizeThread({});
+  clearPendingRenderTimers();
+  chat.replaceChildren(chatEmptyState);
+  state.messageNodes.clear();
+  state.toolNodes.clear();
+  state.activityNodes.clear();
+  state.processNodes.clear();
+  state.searchNodes.clear();
+  state.planSnapshots.clear();
+  state.planNodes.clear();
+  state.planDeltaBuffers.clear();
+  state.protocolState = createProtocolState();
+  state.approvals = [];
+  state.pendingServerRequests.clear();
+  clearTurnActivity();
+  persistSelectedThread(id);
+  renderConversationOutline();
+  renderThreadList();
+  updateControls();
+}
+
+function prepareNewThreadSelection() {
+  captureSelectedRuntime();
+  if (state.threadId) {
+    saveThreadUi();
+    saveToolCache();
+  }
+  state.threadId = null;
+  state.selectedThreadId = null;
+  state.selectionPending = true;
+  state.activeTurnId = null;
+  state.running = false;
+  state.threadStatus = "notLoaded";
+  state.threadMeta = {};
+  state.threadView = normalizeThread({});
+  clearPendingRenderTimers();
+  chat.replaceChildren(chatEmptyState);
+  state.messageNodes.clear();
+  state.toolNodes.clear();
+  state.activityNodes.clear();
+  state.processNodes.clear();
+  state.searchNodes.clear();
+  state.planSnapshots.clear();
+  state.planNodes.clear();
+  state.planDeltaBuffers.clear();
+  state.protocolState = createProtocolState();
+  state.approvals = [];
+  state.pendingServerRequests.clear();
+  clearTurnActivity();
+  persistSelectedThread(null);
+  renderConversationOutline();
+  renderThreadList();
+  updateControls();
+}
+
+function payloadThreadId(payload) {
+  return String(payload?.threadId || payload?.thread?.id || payload?.turn?.threadId || payload?.result?.thread?.id || "").trim() || null;
+}
+
+function canonicalThreadSnapshot(payload) {
+  const source = payload?.thread && typeof payload.thread === "object" ? payload.thread : {};
+  const turns = Array.isArray(payload?.turns)
+    ? payload.turns
+    : Array.isArray(source.turns)
+      ? source.turns
+      : null;
+  if (!turns) return source;
+  return { ...source, turns };
+}
+
+function canonicalizeThreadReadyPayload(payload) {
+  if (payload?.type !== "threadReady") return payload;
+  const hasThread = payload.thread && typeof payload.thread === "object";
+  const hasTurns = Array.isArray(payload.turns) || Array.isArray(payload.thread?.turns);
+  if (!hasThread && !hasTurns) return payload;
+  return { ...payload, thread: canonicalThreadSnapshot(payload) };
+}
+
+function handleBackgroundBridgePayload(payload, threadId) {
+  const runtime = getThreadRuntime(state.threadRuntimes, threadId);
+  const patch = { lastEventAt: new Date().toISOString() };
+  patch.latestBridgeResponse = payload;
+  if (["turnAccepted", "reviewAccepted"].includes(payload.type)) {
+    patch.running = payload.accepted === false ? false : true;
+    patch.status = patch.running ? "active" : "idle";
+    patch.activeTurnId = payload.accepted === false ? null : payload.turn?.id || runtime.activeTurnId;
+  } else if (payload.type === "steerAccepted") {
+    patch.running = payload.accepted !== false;
+    patch.status = patch.running ? "active" : "idle";
+    patch.activeTurnId = payload.turn?.id || runtime.activeTurnId;
+  } else if (payload.type === "threadReady") {
+    patch.latestThread = payload.thread || runtime.latestThread || null;
+    patch.latestSnapshot = payload;
+    patch.accessMode = payload.accessMode || runtime.accessMode;
+    patch.snapshotAt = payload.snapshotAt || null;
+    patch.snapshotReason = payload.snapshotReason || null;
+    patch.error = null;
+  } else if (payload.type === "settingsUpdateAccepted") {
+    const requested = payload.requested && typeof payload.requested === "object" ? payload.requested : {};
+    if (!settingsResponseIsCurrent(threadId, requested, payload.settingsRevision)) return;
+    retireSettingsRequest(state.latestSettingsRequests, threadId, requested, payload.settingsRevision);
+    patch.latestSettings = requested;
+    patch.pendingTurnSettings = payload.mode === "thread"
+      ? {}
+      : { ...(runtime.pendingTurnSettings || {}), ...requested };
+  } else if (payload.type === "threadRenamed") {
+    const name = payload.name ?? payload.threadName ?? "";
+    patch.name = name;
+    patch.latestThread = { ...(runtime.latestThread || {}), name };
+    const index = state.threads.findIndex((thread) => thread.id === threadId);
+    if (index >= 0) state.threads[index] = { ...state.threads[index], name };
+  } else if (payload.type === "serverRequestsExpired") {
+    const expired = new Set((payload.requestIds || []).map((requestId) => String(requestId)));
+    patch.pendingServerRequests = (runtime.pendingServerRequests || [])
+      .filter((request) => !expired.has(String(request.id ?? request.requestId)));
+    patch.error = { message: payload.message || "Pending Codex requests expired.", details: null };
+  } else if (payload.type === "mcpResult") {
+    patch.latestMcpResult = payload.result;
+  } else if (payload.type === "threadArchived") {
+    patch.running = false;
+    patch.status = "archived";
+    patch.activeTurnId = null;
+  } else if (payload.type === "bridgeError") {
+    patch.error = { message: payload.message, details: payload.details || null };
+    const targetDispatch = state.queueDispatch?.threadId === threadId
+      && state.queueDispatch?.requestId === payload.requestId
+      ? state.queueDispatch
+      : null;
+    const mappedEntryId = state.queueRequestIds.get(payload.requestId);
+    const targetEntry = state.queueEntries.find((entry) => entry.threadId === threadId
+      && (entry.id === mappedEntryId || entry.requestId === payload.requestId));
+    if (payload.requestId && (targetEntry || targetDispatch)) {
+      const entryId = targetEntry?.id || targetDispatch?.entryId;
+      failQueueEntry(entryId, payload.message || "Queue request failed.");
+      state.queueRequestIds.delete(payload.requestId);
+      if (targetDispatch) state.queueDispatch = null;
+    }
+  }
+  updateThreadRuntime(state.threadRuntimes, threadId, patch);
+
+  if (["turnAccepted", "steerAccepted"].includes(payload.type) && payload.requestId) {
+    if (payload.type === "steerAccepted" && state.steerRequestThreads.get(payload.requestId) === threadId) {
+      state.steerRequestInputs.delete(payload.requestId);
+      state.steerRequestThreads.delete(payload.requestId);
+    }
+    const dispatch = state.queueDispatch?.threadId === threadId
+      && state.queueDispatch?.requestId === payload.requestId
+      ? state.queueDispatch
+      : null;
+    const mappedEntryId = state.queueRequestIds.get(payload.requestId);
+    const targetEntry = state.queueEntries.find((entry) => entry.threadId === threadId
+      && (entry.id === mappedEntryId || entry.requestId === payload.requestId));
+    const queuedId = targetEntry?.id || dispatch?.entryId;
+    if (queuedId) state.queueRequestIds.delete(payload.requestId);
+    if (dispatch) state.queueDispatch = null;
+    if (queuedId) {
+      if (payload.accepted === false) failQueueEntry(queuedId, payload.error?.message || "Turn was not accepted");
+      else {
+        updateQueue({ type: "accepted", id: queuedId, requestId: payload.requestId });
+        updateQueue({ type: "remove", id: queuedId });
+      }
+    }
+  }
+  renderThreadList();
 }
 
 function shortPath(value) {
@@ -431,17 +922,12 @@ function collaborationModePayload(value = collaborationModeSelect.value) {
   const mode = String(value || "").trim();
   if (!mode) return null;
   const preset = collaborationModePreset(mode);
-  const presetMode = preset?.mode || mode;
-  const presetModel = preset?.model || currentModelLabel();
-  const presetEffort = preset?.reasoning_effort ?? displayEffortLabel();
-  return {
-    mode: presetMode,
-    settings: {
-      model: String(presetModel || modelSelect.value || ""),
-      reasoning_effort: presetEffort && presetEffort !== "default" ? String(presetEffort) : null,
-      developer_instructions: null,
-    },
-  };
+  return buildCollaborationModePayload({
+    value: mode,
+    preset,
+    model: modelSelect.value,
+    effort: displayEffortLabel(),
+  });
 }
 
 function collaborationModeLabel(preset) {
@@ -661,14 +1147,726 @@ function currentCwd() {
   return state.threadMeta.cwd || cwdInput.value || "";
 }
 
+function iconElement(name, className = "") {
+  const icon = document.createElement("i");
+  icon.dataset.icon = name;
+  if (className) icon.className = className;
+  return icon;
+}
+
+function workspaceAbsolutePath(relativePath) {
+  const cwd = String(state.fileWorkspaceCwd || currentCwd() || "").replace(/[\\/]+$/, "");
+  const path = normalizeBrowserFilePath(relativePath);
+  if (!cwd || path === null) return path || "";
+  const separator = cwd.includes("\\") && !cwd.includes("/") ? "\\" : "/";
+  return `${cwd}${separator}${path.replaceAll("/", separator)}`;
+}
+
+function revokeFileViewData(data) {
+  if (data?.kind === "image" && data.url) URL.revokeObjectURL(data.url);
+}
+
+function clearFileViewCache() {
+  for (const data of state.fileViewData.values()) revokeFileViewData(data);
+  state.fileViewData.clear();
+  state.fileViewModes.clear();
+  state.fileViewRequest += 1;
+}
+
+function setRightPanelMode(mode, { persist = true } = {}) {
+  const nextMode = ["files", "inspector"].includes(mode) ? mode : "closed";
+  state.rightPanelMode = nextMode;
+  rightPanel.dataset.mode = nextMode;
+  rightPanel.classList.toggle("closed", nextMode === "closed");
+  filePanelButton.classList.toggle("active", nextMode === "files");
+  filePanelButton.setAttribute("aria-expanded", String(nextMode === "files"));
+  filePanelButton.setAttribute("aria-label", nextMode === "files" ? "Hide file panel" : "Show file panel");
+  filePanelButton.title = filePanelButton.getAttribute("aria-label");
+  const inspectorButton = $("#inspectorButton");
+  inspectorButton.classList.toggle("active", nextMode === "inspector");
+  inspectorButton.setAttribute("aria-expanded", String(nextMode === "inspector"));
+  if (persist) {
+    localStorage.setItem("codexRightPanelMode", nextMode);
+    localStorage.setItem("codexInspectorOpen", String(nextMode === "inspector"));
+  }
+  updateBackdrop();
+  if (nextMode === "files") {
+    renderFileTabs();
+    renderFileViewer();
+  } else if (nextMode === "inspector") {
+    state.mcpDialogRequested = false;
+    send({ type: "listMcp", threadId: state.threadId, verbose: false });
+  }
+  requestAnimationFrame(measureConversationMinimap);
+}
+
+function toggleFilePanel(force) {
+  const mode = force === true
+    ? "files"
+    : force === false
+      ? "closed"
+      : toggleRightPanelMode(state.rightPanelMode, "files");
+  setRightPanelMode(mode);
+}
+
+function setFilePanelWidth(value, { persist = false } = {}) {
+  const width = Math.min(640, Math.max(360, Math.round(Number(value) || 480)));
+  document.documentElement.style.setProperty("--file-panel-width", `${width}px`);
+  rightPanelResizeHandle.setAttribute("aria-valuemin", "360");
+  rightPanelResizeHandle.setAttribute("aria-valuemax", "640");
+  rightPanelResizeHandle.setAttribute("aria-valuenow", String(width));
+  if (persist) localStorage.setItem("codexFilePanelWidth", String(width));
+  return width;
+}
+
+function beginFilePanelResize(event) {
+  if (state.rightPanelMode !== "files" || window.innerWidth < 1360) return;
+  event.preventDefault();
+  rightPanel.classList.add("resizing");
+  rightPanelResizeHandle.setPointerCapture?.(event.pointerId);
+  const move = (moveEvent) => setFilePanelWidth(window.innerWidth - moveEvent.clientX);
+  const finish = () => {
+    rightPanel.classList.remove("resizing");
+    rightPanelResizeHandle.removeEventListener("pointermove", move);
+    rightPanelResizeHandle.removeEventListener("pointerup", finish);
+    rightPanelResizeHandle.removeEventListener("pointercancel", finish);
+    setFilePanelWidth(rightPanelResizeHandle.getAttribute("aria-valuenow"), { persist: true });
+  };
+  rightPanelResizeHandle.addEventListener("pointermove", move);
+  rightPanelResizeHandle.addEventListener("pointerup", finish);
+  rightPanelResizeHandle.addEventListener("pointercancel", finish);
+}
+
+function resetFileWorkspace(cwd, { keepPanel = true, force = false } = {}) {
+  const nextCwd = String(cwd || "").replace(/[\\/]+$/, "");
+  if (!force && nextCwd === state.fileWorkspaceCwd && state.explorerChildren.size) return;
+  state.fileWorkspaceCwd = nextCwd;
+  state.explorerRequestGeneration += 1;
+  if (state.explorerIdleCancel) {
+    state.explorerIdleCancel();
+    state.explorerIdleCancel = null;
+  }
+  if (state.explorerRefreshTimer) {
+    clearTimeout(state.explorerRefreshTimer);
+    state.explorerRefreshTimer = null;
+  }
+  clearFileViewCache();
+  state.fileTabs = [];
+  state.activeFilePath = null;
+  state.explorerChildren.clear();
+  state.explorerExpanded.clear();
+  state.explorerLoading.clear();
+  state.explorerErrors.clear();
+  renderFileTabs();
+  renderFileViewer();
+  renderExplorerTree();
+  if (!keepPanel && state.rightPanelMode === "files") setRightPanelMode("closed");
+  if (state.fileAccessToken && nextCwd) {
+    const generation = state.explorerRequestGeneration;
+    state.explorerIdleCancel = scheduleIdleTask(() => {
+      state.explorerIdleCancel = null;
+      if (generation !== state.explorerRequestGeneration) return;
+      loadExplorerDirectory("");
+    }, { timeout: 180 });
+  }
+}
+
+async function fileApiRequest(type, filePath, { raw = false } = {}) {
+  if (!state.fileAccessToken) throw new Error("File access is not ready. Reconnect and try again.");
+  const params = new URLSearchParams({ type, path: normalizeBrowserFilePath(filePath) ?? "" });
+  const response = await fetch(`/api/files?${params}`, {
+    headers: { "X-Codex-File-Token": state.fileAccessToken },
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const error = new Error(body.error || `File request failed (HTTP ${response.status})`);
+    error.code = body.code || "FILE_REQUEST_FAILED";
+    error.status = response.status;
+    throw error;
+  }
+  return raw ? response.blob() : response.json();
+}
+
+async function loadExplorerDirectory(directoryPath, { force = false } = {}) {
+  const path = normalizeBrowserFilePath(directoryPath) ?? "";
+  if (!force && state.explorerChildren.has(path)) return;
+  if (state.explorerLoading.has(path)) return;
+  state.explorerLoading.add(path);
+  state.explorerErrors.delete(path);
+  const generation = state.explorerRequestGeneration;
+  renderExplorerTree();
+  try {
+    const result = await fileApiRequest("list", path);
+    if (generation !== state.explorerRequestGeneration) return;
+    state.explorerChildren.set(path, Array.isArray(result.entries) ? result.entries : []);
+    if (result.truncated) state.explorerErrors.set(path, "Only the first 2,000 entries are shown.");
+  } catch (error) {
+    if (generation !== state.explorerRequestGeneration) return;
+    state.explorerErrors.set(path, error.message);
+  } finally {
+    if (generation === state.explorerRequestGeneration) {
+      state.explorerLoading.delete(path);
+      renderExplorerTree();
+    }
+  }
+}
+
+function refreshExplorer({ refreshActiveFile = false } = {}) {
+  if (!state.fileAccessToken || !state.fileWorkspaceCwd) return;
+  const directories = ["", ...state.explorerExpanded];
+  state.explorerRequestGeneration += 1;
+  if (state.explorerIdleCancel) {
+    state.explorerIdleCancel();
+    state.explorerIdleCancel = null;
+  }
+  state.explorerChildren.clear();
+  state.explorerLoading.clear();
+  state.explorerErrors.clear();
+  renderExplorerTree();
+  const generation = state.explorerRequestGeneration;
+  state.explorerIdleCancel = scheduleIdleTask(() => {
+    state.explorerIdleCancel = null;
+    if (generation !== state.explorerRequestGeneration) return;
+    for (const directory of directories) loadExplorerDirectory(directory, { force: true });
+    if (refreshActiveFile && state.activeFilePath) loadFileView(state.activeFilePath, { force: true });
+  }, { timeout: 180 });
+}
+
+function scheduleFileWorkspaceRefresh() {
+  if (state.explorerRefreshTimer) clearTimeout(state.explorerRefreshTimer);
+  state.explorerRefreshTimer = setTimeout(() => {
+    state.explorerRefreshTimer = null;
+    refreshExplorer({ refreshActiveFile: true });
+  }, 180);
+}
+
+function addFileMention(filePath) {
+  const path = normalizeBrowserFilePath(filePath);
+  if (!path) return;
+  chooseMention({ path: workspaceAbsolutePath(path), name: browserFileName(path) });
+}
+
+function renderExplorerEntry(entry, depth, container) {
+  const expanded = entry.isDirectory && state.explorerExpanded.has(entry.path);
+  const row = document.createElement("div");
+  row.className = `explorer-row${expanded ? " expanded" : ""}${state.activeFilePath === entry.path ? " active" : ""}`;
+  row.style.setProperty("--explorer-depth", String(depth));
+  row.dataset.path = entry.path;
+  row.setAttribute("role", "treeitem");
+  row.setAttribute("tabindex", "0");
+  if (entry.isDirectory) row.setAttribute("aria-expanded", String(expanded));
+  row.title = workspaceAbsolutePath(entry.path);
+  row.append(entry.isDirectory
+    ? iconElement("chevron-right", "explorer-chevron")
+    : Object.assign(document.createElement("span"), { className: "explorer-spacer" }));
+  row.append(iconElement(entry.isDirectory ? (expanded ? "folder-open" : "folder") : "file-code", "explorer-file-icon"));
+  const label = document.createElement("span");
+  label.className = "explorer-row-label";
+  label.textContent = entry.name;
+  row.append(label);
+
+  if (!entry.isDirectory) {
+    const mention = document.createElement("button");
+    mention.type = "button";
+    mention.className = "explorer-mention";
+    mention.title = `Mention ${entry.name}`;
+    mention.setAttribute("aria-label", mention.title);
+    mention.append(iconElement("at-sign"));
+    mention.addEventListener("click", (event) => {
+      event.stopPropagation();
+      addFileMention(entry.path);
+    });
+    row.append(mention);
+  }
+
+  const activate = () => {
+    if (entry.isDirectory) {
+      if (expanded) state.explorerExpanded.delete(entry.path);
+      else {
+        state.explorerExpanded.add(entry.path);
+        loadExplorerDirectory(entry.path);
+      }
+      renderExplorerTree();
+    } else {
+      openFileInPanel(entry.path);
+    }
+  };
+  row.addEventListener("click", activate);
+  row.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    activate();
+  });
+  renderIcons(row);
+  container.append(row);
+
+  if (!expanded) return;
+  const children = state.explorerChildren.get(entry.path);
+  if (state.explorerLoading.has(entry.path)) {
+    const loading = document.createElement("div");
+    loading.className = "explorer-loading";
+    loading.style.setProperty("--explorer-depth", String(depth + 1));
+    loading.textContent = "Loading...";
+    container.append(loading);
+  } else if (children) {
+    for (const child of children) renderExplorerEntry(child, depth + 1, container);
+  }
+  const error = state.explorerErrors.get(entry.path);
+  if (error) {
+    const notice = document.createElement("div");
+    notice.className = "explorer-loading";
+    notice.style.setProperty("--explorer-depth", String(depth + 1));
+    notice.textContent = error;
+    container.append(notice);
+  }
+}
+
+function renderExplorerTree() {
+  explorerTree.replaceChildren();
+  if (!state.fileAccessToken || !state.fileWorkspaceCwd) {
+    const empty = document.createElement("div");
+    empty.className = "explorer-empty";
+    empty.textContent = "Open a Thread to browse its working directory.";
+    explorerTree.append(empty);
+    return;
+  }
+  if (state.explorerLoading.has("") && !state.explorerChildren.has("")) {
+    const loading = document.createElement("div");
+    loading.className = "explorer-empty";
+    loading.textContent = "Loading workspace files...";
+    explorerTree.append(loading);
+    return;
+  }
+  const entries = state.explorerChildren.get("");
+  if (entries) {
+    for (const entry of entries) renderExplorerEntry(entry, 0, explorerTree);
+  }
+  const error = state.explorerErrors.get("");
+  if (error) {
+    const notice = document.createElement("div");
+    notice.className = "explorer-empty";
+    notice.textContent = error;
+    explorerTree.append(notice);
+  } else if (entries && !entries.length) {
+    const empty = document.createElement("div");
+    empty.className = "explorer-empty";
+    empty.textContent = "This workspace has no browsable files.";
+    explorerTree.append(empty);
+  }
+}
+
+function emptyFileViewer() {
+  const empty = document.createElement("div");
+  empty.className = "file-viewer-empty";
+  empty.append(iconElement("file"));
+  const label = document.createElement("span");
+  label.textContent = "Open a file from Explorer or a message link.";
+  empty.append(label);
+  renderIcons(empty);
+  return empty;
+}
+
+function renderFileTabs() {
+  fileTabs.replaceChildren();
+  for (const tab of state.fileTabs) {
+    const item = document.createElement("div");
+    item.className = `file-tab${tab.path === state.activeFilePath ? " active" : ""}`;
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "file-tab-main";
+    select.setAttribute("role", "tab");
+    select.setAttribute("aria-selected", String(tab.path === state.activeFilePath));
+    select.title = workspaceAbsolutePath(tab.path);
+    select.textContent = tab.label;
+    select.addEventListener("click", () => selectFileTab(tab.path));
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "file-tab-close";
+    close.title = `Close ${tab.label}`;
+    close.setAttribute("aria-label", close.title);
+    close.append(iconElement("x"));
+    close.addEventListener("click", () => closeFileTab(tab.path));
+    item.append(select, close);
+    renderIcons(item);
+    fileTabs.append(item);
+  }
+}
+
+function fileViewerState(message, { error = false, retry = null } = {}) {
+  const stateNode = document.createElement("div");
+  stateNode.className = `file-viewer-state${error ? " error" : ""}`;
+  const label = document.createElement("span");
+  label.textContent = message;
+  stateNode.append(label);
+  if (retry) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Retry";
+    button.addEventListener("click", retry);
+    stateNode.append(button);
+  }
+  return stateNode;
+}
+
+function renderFileToolbar(data) {
+  const toolbar = document.createElement("div");
+  toolbar.className = "file-viewer-toolbar";
+  const path = document.createElement("code");
+  path.className = "file-viewer-path";
+  path.textContent = state.activeFilePath;
+  path.title = workspaceAbsolutePath(state.activeFilePath);
+  const meta = document.createElement("span");
+  meta.className = "file-viewer-meta";
+  meta.textContent = `${data.language || data.mime || "file"} · ${formatBrowserFileSize(data.size)}`;
+  toolbar.append(path, meta);
+
+  if (data.kind === "text" && data.language === "markdown") {
+    const modes = document.createElement("div");
+    modes.className = "file-viewer-modes";
+    const activeMode = state.fileViewModes.get(state.activeFilePath) || "preview";
+    for (const mode of ["source", "preview"]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `file-viewer-mode${mode === activeMode ? " active" : ""}`;
+      button.textContent = mode === "source" ? "Source" : "Preview";
+      button.addEventListener("click", () => {
+        state.fileViewModes.set(state.activeFilePath, mode);
+        renderFileViewer();
+      });
+      modes.append(button);
+    }
+    toolbar.append(modes);
+  }
+
+  const mention = document.createElement("button");
+  mention.type = "button";
+  mention.className = "inline-icon";
+  mention.title = "Mention this file";
+  mention.setAttribute("aria-label", mention.title);
+  mention.append(iconElement("at-sign"));
+  mention.addEventListener("click", () => addFileMention(state.activeFilePath));
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.className = "inline-icon";
+  copy.title = "Copy full path";
+  copy.setAttribute("aria-label", copy.title);
+  copy.append(iconElement("copy"));
+  copy.addEventListener("click", () => copyField(workspaceAbsolutePath(state.activeFilePath)));
+  const refresh = document.createElement("button");
+  refresh.type = "button";
+  refresh.className = "inline-icon";
+  refresh.title = "Refresh file";
+  refresh.setAttribute("aria-label", refresh.title);
+  refresh.append(iconElement("refresh-cw"));
+  refresh.addEventListener("click", () => loadFileView(state.activeFilePath, { force: true }));
+  toolbar.append(mention, copy, refresh);
+  renderIcons(toolbar);
+  return toolbar;
+}
+
+function renderSourceFile(content) {
+  const source = document.createElement("div");
+  source.className = "file-source";
+  sourceFileLines(content).forEach((text, index) => {
+    const line = document.createElement("div");
+    line.className = "file-source-line";
+    const number = document.createElement("span");
+    number.className = "file-source-number";
+    number.textContent = String(index + 1);
+    const code = document.createElement("span");
+    code.className = "file-source-code";
+    code.textContent = text || " ";
+    line.append(number, code);
+    source.append(line);
+  });
+  return source;
+}
+
+function renderFileViewer() {
+  fileViewer.replaceChildren();
+  if (!state.activeFilePath) {
+    fileViewer.append(emptyFileViewer());
+    return;
+  }
+  const data = state.fileViewData.get(state.activeFilePath);
+  if (!data) {
+    fileViewer.append(fileViewerState("Loading file..."));
+    return;
+  }
+  if (data.kind === "error") {
+    fileViewer.append(fileViewerState(data.message, {
+      error: true,
+      retry: () => loadFileView(state.activeFilePath, { force: true }),
+    }));
+    return;
+  }
+
+  fileViewer.append(renderFileToolbar(data));
+  const content = document.createElement("div");
+  content.className = "file-viewer-content";
+  if (data.kind === "image") {
+    const imageWrap = document.createElement("div");
+    imageWrap.className = "file-image-view";
+    const image = document.createElement("img");
+    image.src = data.url;
+    image.alt = browserFileName(state.activeFilePath);
+    imageWrap.append(image);
+    content.append(imageWrap);
+  } else if (data.language === "markdown" && (state.fileViewModes.get(state.activeFilePath) || "preview") === "preview") {
+    const preview = document.createElement("article");
+    preview.className = "markdown-body file-markdown-preview";
+    preview.dataset.fileLinkBase = browserParentPath(state.activeFilePath);
+    renderMarkdown(preview, data.content);
+    content.append(preview);
+  } else {
+    content.append(renderSourceFile(data.content));
+  }
+  fileViewer.append(content);
+}
+
+async function loadFileView(filePath, { force = false } = {}) {
+  const path = normalizeBrowserFilePath(filePath);
+  if (!path) return;
+  if (!force && state.fileViewData.has(path)) {
+    renderFileViewer();
+    return;
+  }
+  if (force) {
+    revokeFileViewData(state.fileViewData.get(path));
+    state.fileViewData.delete(path);
+  }
+  const request = ++state.fileViewRequest;
+  renderFileViewer();
+  try {
+    let data;
+    if (isBrowserImagePath(path)) {
+      const blob = await fileApiRequest("raw", path, { raw: true });
+      data = { kind: "image", url: URL.createObjectURL(blob), mime: blob.type, size: blob.size };
+    } else {
+      data = { kind: "text", ...await fileApiRequest("text", path) };
+      if (data.language === "markdown" && !state.fileViewModes.has(path)) state.fileViewModes.set(path, "preview");
+    }
+    if (request !== state.fileViewRequest || path !== state.activeFilePath) {
+      revokeFileViewData(data);
+      return;
+    }
+    state.fileViewData.set(path, data);
+  } catch (error) {
+    if (request !== state.fileViewRequest || path !== state.activeFilePath) return;
+    state.fileViewData.set(path, { kind: "error", message: error.message, code: error.code });
+  }
+  renderFileViewer();
+}
+
+function selectFileTab(filePath) {
+  const path = normalizeBrowserFilePath(filePath);
+  if (!path) return;
+  state.activeFilePath = path;
+  renderFileTabs();
+  renderExplorerTree();
+  loadFileView(path);
+}
+
+function openFileInPanel(filePath) {
+  const path = normalizeBrowserFilePath(filePath);
+  if (!path) return false;
+  const opened = openBrowserFileTab(state.fileTabs, path);
+  state.fileTabs = opened.tabs;
+  state.activeFilePath = opened.activePath;
+  setRightPanelMode("files");
+  renderExplorerTree();
+  loadFileView(path);
+  return true;
+}
+
+function closeFileTab(filePath) {
+  const closed = closeBrowserFileTab(state.fileTabs, state.activeFilePath, filePath);
+  const removed = state.fileViewData.get(filePath);
+  revokeFileViewData(removed);
+  state.fileViewData.delete(filePath);
+  state.fileViewModes.delete(filePath);
+  state.fileTabs = closed.tabs;
+  state.activeFilePath = closed.activePath;
+  state.fileViewRequest += 1;
+  renderFileTabs();
+  renderExplorerTree();
+  if (!state.fileTabs.length) {
+    setRightPanelMode("closed");
+    renderFileViewer();
+  } else {
+    loadFileView(state.activeFilePath);
+  }
+}
+
+function resolveFileLink(href, basePath = "") {
+  const raw = String(href || "");
+  const cwd = state.fileWorkspaceCwd || currentCwd();
+  if (basePath && !raw.startsWith("/") && !/^[a-zA-Z]:[\\/]/.test(raw) && !/^file:/i.test(raw)) {
+    return resolveWorkspaceFileHref(`${basePath}/${raw}`, cwd);
+  }
+  return resolveWorkspaceFileHref(raw, cwd);
+}
+
+function openFileLinkFromEvent(event) {
+  const anchor = event.target.closest?.("a[href]");
+  if (!anchor) return false;
+  const base = anchor.closest("[data-file-link-base]")?.dataset.fileLinkBase || "";
+  const path = resolveFileLink(anchor.getAttribute("href"), base);
+  if (path === null || path === "") return false;
+  event.preventDefault();
+  openFileInPanel(path);
+  return true;
+}
+
 function stopActivityTimer() {
   if (!state.activityTimer) return;
   clearInterval(state.activityTimer);
   state.activityTimer = null;
 }
 
+function isSnapshotMode() {
+  return state.accessMode === "snapshot";
+}
+
+function isThreadWritable() {
+  const lifecycle = String(state.threadStatus || "").toLowerCase();
+  return !isSnapshotMode()
+    && state.threadMeta?.archived !== true
+    && state.threadMeta?.closed !== true
+    && !["archived", "closed"].includes(lifecycle);
+}
+
+function requireWritable(action = "perform this action") {
+  if (isThreadWritable()) return true;
+  const message = isSnapshotMode()
+    ? `Cannot ${action} while this thread is a read-only snapshot. Refresh or fork it first.`
+    : `Cannot ${action} because this thread is ${String(state.threadStatus || "closed")}.`;
+  addSystemMessage(message, "warning");
+  return false;
+}
+
+function snapshotTimeLabel(value) {
+  const ms = timestampToMs(value);
+  if (!Number.isFinite(ms)) return "unknown time";
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(ms));
+}
+
+function renderSnapshotBanner() {
+  if (!snapshotBanner) return;
+  const visible = isSnapshotMode() && Boolean(state.threadId);
+  snapshotBanner.classList.toggle("hidden", !visible);
+  if (!visible) return;
+  snapshotBannerText.textContent = formatSnapshotBannerText({
+    accessMode: state.accessMode,
+    snapshotAt: state.snapshotAt,
+    snapshotReason: state.snapshotReason,
+  });
+  refreshSnapshotButton.disabled = !state.ready;
+}
+
+function protocolItemForNotification(params = {}, fallback = null) {
+  const item = params.item && typeof params.item === "object" ? params.item : fallback;
+  if (item) return item;
+  if (params.itemId === undefined || params.itemId === null) return null;
+  return getProtocolItem(state.protocolState, params.itemId);
+}
+
+function agentActivityName(item = {}) {
+  return presentAgentActivity(item).name;
+}
+
+function applyProtocolNotification(message) {
+  if (!message || !message.method) return null;
+  state.protocolState = reduceProtocolState(state.protocolState, message);
+  rememberProtocolEventOrder(message);
+  return protocolItemForNotification(message.params || {});
+}
+
+function activeProtocolItems() {
+  return (Array.isArray(state.protocolState?.items) ? state.protocolState.items : [])
+    .filter((item) => {
+      const status = normalizeToolStatus(item?.status ?? item?.state ?? item?.result ?? item?.kind);
+      return status.isActive || ["pending", "waiting", "pendinginit"].includes(String(item?.status ?? item?.state ?? item?.kind ?? "").toLowerCase());
+    });
+}
+
+function protocolActivityLabel(item) {
+  if (!item) return "Working";
+  const type = item.type || "unknown";
+  if (["collabToolCall", "collabAgentToolCall", "subAgentActivity", "agentStatus"].includes(type)) {
+    return presentAgentActivity(item).label;
+  }
+  if (type === "fileChange") return "Updating files";
+  if (type === "mcpToolCall") return `Running MCP · ${item.tool || "tool"}`;
+  if (type === "dynamicToolCall") return `Running ${item.tool || item.name || "dynamic tool"}`;
+  if (type === "webSearch") return "Searching web...";
+  if (type === "imageView") return "Viewing image";
+  if (type === "imageGeneration") return "Generating image";
+  if (type === "contextCompaction") return "Compacting context";
+  if (type === "commandExecution") {
+    const presentation = presentCommand(item);
+    const detail = presentation.actionSummary || presentation.summary;
+    return detail ? `Running command · ${detail}` : "Running command";
+  }
+  if (["reasoning", "thinking"].includes(type)) return "Thinking";
+  if (type === "plan") return "Planning";
+  return `Working · ${type}`;
+}
+
+const SNAPSHOT_LIFECYCLE_METHODS = new Set([
+  "thread/deleted",
+  "thread/archived",
+  "thread/unarchived",
+  "thread/closed",
+]);
+
+function shouldProcessSnapshotNotification(method) {
+  if (!/^(?:item|turn|thread\/|model\/)/.test(String(method || ""))) return true;
+  return SNAPSHOT_LIFECYCLE_METHODS.has(method);
+}
+
+function syncActivityFromProtocol() {
+  if (isSnapshotMode()) return;
+  if (state.userInputRequest) {
+    setTurnActivityWorking(null, "Waiting for your input");
+    return;
+  }
+  if (state.approvals.length) {
+    setTurnActivityWorking(null, "Approval required");
+    return;
+  }
+  const active = activeProtocolItems();
+  if (!active.length) {
+    if (state.running) setTurnActivityWorking(null, "Working");
+    return;
+  }
+  const priority = (item) => {
+    const type = item?.type;
+    if (type === "agentStatus" || ["collabToolCall", "collabAgentToolCall", "subAgentActivity"].includes(type)) return 80;
+    if (["fileChange", "mcpToolCall", "dynamicToolCall"].includes(type)) return 70;
+    if (type === "commandExecution") return 60;
+    if (type === "webSearch") return 50;
+    return 10;
+  };
+  const current = [...active].sort((a, b) => priority(b) - priority(a)).at(0);
+  setTurnActivityWorking(null, protocolActivityLabel(current));
+}
+
 function renderTurnActivity() {
   if (!turnActivity) return;
+  if (isSnapshotMode()) {
+    stopActivityTimer();
+    turnActivity.className = "turn-activity hidden";
+    turnActivity.replaceChildren();
+    turnActivity.removeAttribute("aria-label");
+    turnActivity.dataset.renderKey = "snapshot";
+    return;
+  }
   const mode = state.activityMode;
   const searching = mode === "working" && String(state.activityLabel || "").startsWith("Searching");
   let labelText = "";
@@ -722,6 +1920,10 @@ function activeSearchActivityLabel() {
 }
 
 function setTurnActivityWorking(startedAt = null, label = null) {
+  if (isSnapshotMode()) {
+    clearTurnActivity();
+    return;
+  }
   const wasWorking = state.activityMode === "working";
   const explicitStart = timestampToMs(startedAt);
   const fallbackStart = wasWorking && Number.isFinite(state.activityStartedAtMs)
@@ -780,6 +1982,10 @@ function completeSearchActivity(item) {
 }
 
 function syncTurnActivityFromThread(thread) {
+  if (isSnapshotMode()) {
+    clearTurnActivity();
+    return;
+  }
   const latestTurn = Array.isArray(thread?.turns) ? thread.turns.at(-1) : null;
   if (!latestTurn) {
     clearTurnActivity();
@@ -894,6 +2100,7 @@ function clearQueuedMessages() {
   releaseQueueDispatch();
   state.queueEntries = [];
   state.steerRequestInputs.clear();
+  state.steerRequestThreads.clear();
   renderQueueShelf();
 }
 
@@ -904,7 +2111,7 @@ function consumeIgnoredQueueResponse(requestId) {
 }
 
 function drainQueue() {
-  if (state.running || state.queueDispatch || !state.threadId) return false;
+  if (state.running || queueDispatchActive(state.threadId) || !state.threadId || !isThreadWritable()) return false;
   const entry = nextQueueEntry(state.queueEntries, state.threadId);
   if (!entry) return false;
   const requestId = queueRequestId();
@@ -929,6 +2136,7 @@ function drainQueue() {
 }
 
 function enqueueFollowUp(input) {
+  if (!requireWritable("queue a follow-up")) return false;
   if (!state.threadId) {
     addSystemMessage("Start or resume a thread first.", "error");
     return false;
@@ -945,12 +2153,14 @@ function enqueueFollowUp(input) {
 }
 
 function steerCurrentTurn(input) {
+  if (!requireWritable("steer the active turn")) return false;
   if (!state.threadId || !state.activeTurnId) {
     addSystemMessage("There is no steerable active turn.", "warning");
     return false;
   }
   const requestId = queueRequestId();
   state.steerRequestInputs.set(requestId, input);
+  state.steerRequestThreads.set(requestId, state.threadId);
   const sent = send({
     type: "steerMessage",
     requestId,
@@ -959,7 +2169,10 @@ function steerCurrentTurn(input) {
     clientUserMessageId: requestId,
     input,
   });
-  if (!sent) state.steerRequestInputs.delete(requestId);
+  if (!sent) {
+    state.steerRequestInputs.delete(requestId);
+    state.steerRequestThreads.delete(requestId);
+  }
   return sent;
 }
 
@@ -975,8 +2188,22 @@ function clearComposerInput() {
 
 function updateControls() {
   const hasThread = Boolean(state.threadId);
-  const canStart = state.ready && !state.running;
-  const canConfigure = canStart;
+  const snapshot = isSnapshotMode();
+  const historyPending = state.historyRestoring;
+  const accessControls = accessControlState({
+    accessMode: state.accessMode,
+    hasThread,
+    running: state.running,
+    awaitingUserInput: Boolean(state.userInputRequest),
+    threadWritable: isThreadWritable(),
+  });
+  // Thread selection and new-thread creation remain available while another
+  // runtime is running; only mutations on the selected thread are gated.
+  const canStart = state.ready;
+  // Configuration changes are thread mutations too. Keep archived/closed
+  // threads consistent with the send/steer/approval guards while still
+  // allowing settings to be chosen before a brand-new thread exists.
+  const canConfigure = canStart && !state.selectionPending && !historyPending && isThreadWritable();
   modelSelect.disabled = !canConfigure;
   effortSelect.disabled = !canConfigure || !modelSelect.value;
   collaborationModeSelect.disabled = !canConfigure || !collaborationModeSelect.options.length || collaborationModeSelect.options[0].value === "";
@@ -985,24 +2212,23 @@ function updateControls() {
   inspectorModelSelect.disabled = !canConfigure;
   inspectorEffortSelect.disabled = !canConfigure || !modelSelect.value;
   inspectorCollaborationModeSelect.disabled = !canConfigure || !collaborationModeSelect.options.length || collaborationModeSelect.options[0].value === "";
-  newThreadButton.disabled = !canStart;
+  newThreadButton.disabled = !canStart || state.selectionPending || historyPending;
   refreshThreadsButton.disabled = !state.ready || state.threadListLoading;
   loadMoreThreadsButton.disabled = !state.ready || state.threadListLoading;
-  resumeButton.disabled = !canStart;
   statusButton.disabled = !state.ready;
   const awaitingUserInput = Boolean(state.userInputRequest);
-  messageInput.disabled = !hasThread || awaitingUserInput;
-  sendButton.disabled = !hasThread || state.running || awaitingUserInput;
-  stopButton.disabled = !state.running;
-  stopButton.classList.toggle("hidden", !state.running);
-  sendButton.classList.toggle("hidden", state.running);
-  steerButton.disabled = !hasThread || !state.running || awaitingUserInput;
-  followUpButton.disabled = !hasThread || !state.running || awaitingUserInput;
-  steerButton.classList.toggle("hidden", !state.running);
-  followUpButton.classList.toggle("hidden", !state.running);
-  if (mentionButton) mentionButton.disabled = !hasThread || awaitingUserInput;
-  if (imageInput) imageInput.disabled = !hasThread || awaitingUserInput;
-  if (attachButton) attachButton.classList.toggle("disabled", !hasThread || awaitingUserInput);
+  messageInput.disabled = !state.ready || state.selectionPending || historyPending || !hasThread || !accessControls.canWrite || awaitingUserInput;
+  sendButton.disabled = !state.ready || state.selectionPending || historyPending || !accessControls.canSend;
+  stopButton.disabled = !state.ready || state.selectionPending || historyPending || !accessControls.canInterrupt;
+  stopButton.classList.toggle("hidden", !accessControls.showInterrupt);
+  sendButton.classList.toggle("hidden", snapshot || state.running);
+  steerButton.disabled = !state.ready || state.selectionPending || historyPending || !accessControls.canSteer;
+  followUpButton.disabled = !state.ready || state.selectionPending || historyPending || !accessControls.canSteer;
+  steerButton.classList.toggle("hidden", snapshot || !state.running);
+  followUpButton.classList.toggle("hidden", snapshot || !state.running);
+  if (mentionButton) mentionButton.disabled = !hasThread || snapshot || awaitingUserInput;
+  if (imageInput) imageInput.disabled = !hasThread || snapshot || awaitingUserInput;
+  if (attachButton) attachButton.classList.toggle("disabled", !hasThread || snapshot || awaitingUserInput);
   renderQueueShelf();
 
   const model = currentModelLabel();
@@ -1013,9 +2239,10 @@ function updateControls() {
     ? `${model} ${effort}${tier !== "default" ? ` / ${tier}` : ""}${mode !== "default" ? ` / ${mode}` : ""}`
     : "No active thread";
   directorySummary.textContent = currentCwd();
-  runStatus.textContent = state.threadStatus || (state.running ? "active" : hasThread ? "idle" : "notLoaded");
-  runStatus.className = `pill status-${String(state.threadStatus || "unknown").replace(/[^a-zA-Z]/g, "").toLowerCase()}`;
+  runStatus.textContent = snapshot ? "snapshot" : state.threadStatus || (state.running ? "active" : hasThread ? "idle" : "notLoaded");
+  runStatus.className = `pill status-${snapshot ? "snapshot" : String(state.threadStatus || "unknown").replace(/[^a-zA-Z]/g, "").toLowerCase()}`;
   renderTurnActivity();
+  renderSnapshotBanner();
 
   const context = contextStats();
   renderContextUsage(context);
@@ -1046,15 +2273,15 @@ function updateControls() {
   const initials = accountLabel().split(/[@\s._-]/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("") || "?";
   $("#accountButton").textContent = initials;
   const navIndex = state.navigation.index;
-  $("#backThreadButton").disabled = navIndex <= 0 || state.running;
-  $("#forwardThreadButton").disabled = navIndex < 0 || navIndex >= state.navigation.items.length - 1 || state.running;
+  const selectionBlocked = !canBeginThreadSelection(state.selectionPending);
+  $("#backThreadButton").disabled = selectionBlocked || navIndex <= 0;
+  $("#forwardThreadButton").disabled = selectionBlocked || navIndex < 0 || navIndex >= state.navigation.items.length - 1;
   syncThreadListControls();
 }
 
 function createThreadUiState() {
   return {
     diffInteractionVersion: 2,
-    rightPanelTab: "outline",
     activeOutlineMessageId: null,
     expandedFileChanges: [],
     expandedDiffFiles: [],
@@ -1073,6 +2300,250 @@ function threadUiStorageKey(threadId) {
 
 function threadToolStorageKey(threadId) {
   return `codexThreadTools:${threadId}`;
+}
+
+function protocolStateStorageKey(threadId) {
+  return `codexProtocolState:${threadId}`;
+}
+
+function readProtocolState(threadId) {
+  if (!threadId) return createProtocolState();
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(protocolStateStorageKey(threadId)) || "null");
+    return createProtocolState(stored || {});
+  } catch {
+    return createProtocolState();
+  }
+}
+
+function saveProtocolState() {
+  if (!state.threadId || !state.protocolState) return;
+  const snapshot = toProtocolSnapshot(state.protocolState);
+  // Keep only protocol metadata and structured plans in browser session state;
+  // command output and MCP payloads remain in the existing short-lived cache.
+  const compact = {
+    sequence: snapshot.sequence,
+    plans: snapshot.plans,
+    orderedEvents: snapshot.orderedEvents.map((entry) => ({
+      key: entry.key,
+      kind: entry.kind,
+      itemId: entry.itemId || null,
+      planKey: entry.planKey || null,
+      sequence: entry.sequence,
+      type: entry.type || null,
+      threadId: entry.threadId || null,
+      turnId: entry.turnId || null,
+      previousKey: entry.previousKey || null,
+    })),
+    counts: snapshot.counts,
+  };
+  try { sessionStorage.setItem(protocolStateStorageKey(state.threadId), JSON.stringify(compact)); } catch {
+    // Session storage is optional; live protocol state remains authoritative.
+  }
+}
+
+function protocolEntryForItem(itemId) {
+  if (itemId === undefined || itemId === null) return null;
+  const id = String(itemId);
+  return [...(state.protocolState?.orderedEvents || [])]
+    .find((entry) => entry.kind === "item" && String(entry.itemId || "") === id) || null;
+}
+
+function protocolEntryForPlan(planKey) {
+  if (!planKey) return null;
+  return [...(state.protocolState?.orderedEvents || [])]
+    .find((entry) => entry.kind === "plan" && entry.planKey === planKey) || null;
+}
+
+function protocolSequenceForItem(itemId) {
+  const historyRank = Number(state.historyOrderRanks.get(`item:${itemId}`));
+  if (Number.isFinite(historyRank)) return historyRank;
+  const entry = protocolEntryForItem(itemId);
+  return optionalConversationSequence(entry?.sequence ?? state.protocolState?.itemSequences?.get?.(String(itemId)));
+}
+
+function protocolSequenceForPlan(planKey) {
+  const historyRank = Number(state.historyOrderRanks.get(`plan:${planKey}`));
+  if (Number.isFinite(historyRank)) return historyRank;
+  const entry = protocolEntryForPlan(planKey);
+  return optionalConversationSequence(entry?.sequence ?? state.protocolState?.planSequences?.get?.(planKey));
+}
+
+function rebuildHistoryOrderRanks() {
+  state.historyOrderRanks.clear();
+  const items = Array.isArray(state.threadView?.items) ? state.threadView.items : [];
+  const orderedKeys = [];
+  const seen = new Set();
+  const aliases = new Map();
+  const addKey = (key) => {
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    orderedKeys.push(key);
+  };
+  for (const item of items) {
+    if (!item?.id) continue;
+    if (item.type === "plan" || item.viewType === "plan") {
+      const planKey = planSnapshotKey(state.threadId, item.turnId || item.id);
+      addKey(`plan:${planKey}`);
+      // The history plan item is rendered by the plan card, but keep its
+      // item key at the same rank for protocol nodes restored from storage.
+      aliases.set(`item:${item.id}`, `plan:${planKey}`);
+      continue;
+    }
+    addKey(`item:${item.id}`);
+  }
+
+  const storedPlans = [...(state.protocolState?.orderedEvents || [])]
+    .filter((entry) => entry.kind === "plan" && entry.planKey)
+    .sort((left, right) => (optionalConversationSequence(left.sequence) ?? Number.POSITIVE_INFINITY)
+      - (optionalConversationSequence(right.sequence) ?? Number.POSITIVE_INFINITY));
+  for (const entry of storedPlans) {
+    const key = `plan:${entry.planKey}`;
+    if (seen.has(key)) continue;
+    const previousIndex = entry.previousKey ? orderedKeys.indexOf(entry.previousKey) : -1;
+    if (previousIndex >= 0) orderedKeys.splice(previousIndex + 1, 0, key);
+    else {
+      const protocolEntries = [...(state.protocolState?.orderedEvents || [])]
+        .filter((candidate) => candidate.key !== entry.key)
+        .sort((left, right) => (optionalConversationSequence(left.sequence) ?? Number.POSITIVE_INFINITY)
+          - (optionalConversationSequence(right.sequence) ?? Number.POSITIVE_INFINITY));
+      const entrySequence = optionalConversationSequence(entry.sequence);
+      const nextIndex = protocolEntries
+        .filter((candidate) => entrySequence !== null
+          && optionalConversationSequence(candidate.sequence) > entrySequence)
+        .map((candidate) => orderedKeys.indexOf(candidate.key))
+        .find((index) => index >= 0);
+      if (nextIndex !== undefined) orderedKeys.splice(nextIndex, 0, key);
+      else {
+        const previousProtocolIndex = protocolEntries
+          .filter((candidate) => entrySequence !== null
+            && optionalConversationSequence(candidate.sequence) < entrySequence)
+          .map((candidate) => orderedKeys.indexOf(candidate.key))
+          .filter((index) => index >= 0)
+          .at(-1);
+        if (previousProtocolIndex === undefined) orderedKeys.push(key);
+        else orderedKeys.splice(previousProtocolIndex + 1, 0, key);
+      }
+    }
+    seen.add(key);
+  }
+  orderedKeys.forEach((key, index) => state.historyOrderRanks.set(key, index + 1));
+  for (const [alias, target] of aliases) {
+    const rank = state.historyOrderRanks.get(target);
+    if (rank !== undefined) state.historyOrderRanks.set(alias, rank);
+  }
+}
+
+function protocolEventKeyForMessage(message = {}) {
+  if (message?.params?.itemId !== undefined && message?.params?.itemId !== null) {
+    return `item:${message.params.itemId}`;
+  }
+  const itemId = message?.params?.item?.id;
+  return itemId === undefined || itemId === null ? null : `item:${itemId}`;
+}
+
+function rememberProtocolEventOrder(message) {
+  const method = String(message?.method || "");
+  const params = message?.params || {};
+  const key = method === "turn/plan/updated"
+    ? `plan:${planSnapshotKey(params.threadId || state.threadId, params.turnId || state.activeTurnId)}`
+    : protocolEventKeyForMessage(message);
+  if (!key) return;
+  const entry = state.protocolState?.orderedEvents?.find((candidate) => candidate.key === key);
+  if (!entry) return;
+  if (entry.previousKey === undefined) {
+    const entrySequence = optionalConversationSequence(entry.sequence);
+    const prior = [...state.protocolState.orderedEvents]
+      .filter((candidate) => candidate.key !== key && entrySequence !== null
+        && optionalConversationSequence(candidate.sequence) < entrySequence)
+      .sort((left, right) => (optionalConversationSequence(left.sequence) ?? Number.POSITIVE_INFINITY)
+        - (optionalConversationSequence(right.sequence) ?? Number.POSITIVE_INFINITY))
+      .at(-1);
+    entry.previousKey = prior?.key || null;
+  }
+  if (entry.threadId === undefined) entry.threadId = params.threadId || state.threadId || null;
+  if (entry.turnId === undefined) {
+    entry.turnId = params.turnId || params.item?.turnId || state.activeTurnId || state.currentTurn?.id || null;
+  }
+}
+
+function optionalConversationSequence(value) {
+  if (value === null || value === undefined || (typeof value === "string" && !value.trim())) return null;
+  const sequence = Number(value);
+  return Number.isFinite(sequence) ? sequence : null;
+}
+
+function nextFallbackConversationSequence(protocolSequence, index) {
+  const anchor = optionalConversationSequence(protocolSequence) ?? 0;
+  const position = Math.max(0, Math.trunc(Number(index) || 0));
+  return anchor + 1 - (1 / (position + 2));
+}
+
+function fallbackConversationSequence() {
+  const anchor = optionalConversationSequence(state.protocolState?.sequence) ?? 0;
+  if (state.conversationFallbackAnchor !== anchor) {
+    state.conversationFallbackAnchor = anchor;
+    state.conversationFallbackIndex = 0;
+  }
+  const sequence = nextFallbackConversationSequence(anchor, state.conversationFallbackIndex);
+  state.conversationFallbackIndex += 1;
+  return sequence;
+}
+
+function conversationNodeCompare(left, right) {
+  const leftSequence = optionalConversationSequence(left.meta?.sequence) ?? Number.POSITIVE_INFINITY;
+  const rightSequence = optionalConversationSequence(right.meta?.sequence) ?? Number.POSITIVE_INFINITY;
+  if (leftSequence !== rightSequence) return leftSequence - rightSequence;
+  return left.meta.ordinal - right.meta.ordinal;
+}
+
+function reconcileConversationNodes() {
+  if (state.historyRestoring) {
+    state.conversationReconcilePending = true;
+    return;
+  }
+  if (!chat || state.conversationNodeMeta.size < 2) return;
+  const children = [...chat.children];
+  const decorated = children.map((node, index) => ({
+    node,
+    index,
+    meta: state.conversationNodeMeta.get(node),
+  }));
+  decorated.sort((left, right) => {
+    if (!left.meta && !right.meta) return left.index - right.index;
+    if (!left.meta) return -1;
+    if (!right.meta) return 1;
+    return conversationNodeCompare(left, right);
+  });
+  for (let index = 0; index < decorated.length; index += 1) {
+    const node = decorated[index].node;
+    const current = chat.children[index];
+    if (current !== node) chat.insertBefore(node, current || null);
+  }
+}
+
+function registerConversationNode(node, { sequence = null, key = null, turnId = null } = {}) {
+  if (!node) return node;
+  const nextSequence = optionalConversationSequence(sequence);
+  const existing = state.conversationNodeMeta.get(node);
+  if (existing) {
+    const existingSequence = optionalConversationSequence(existing.sequence);
+    if (nextSequence !== null && (existingSequence === null || nextSequence < existingSequence)) {
+      existing.sequence = nextSequence;
+    }
+    if (key && !existing.key) existing.key = key;
+    if (turnId !== null && existing.turnId === null) existing.turnId = turnId;
+  } else {
+    state.conversationNodeMeta.set(node, {
+      sequence: nextSequence ?? fallbackConversationSequence(),
+      key,
+      turnId,
+      ordinal: state.conversationNodeOrdinal++,
+    });
+  }
+  if (state.historyRestoring) state.conversationReconcilePending = true;
+  else reconcileConversationNodes();
+  return node;
 }
 
 function readThreadToolCache(threadId) {
@@ -1217,95 +2688,360 @@ function activateThreadUi(threadId) {
   state.expandedCommandOutputs = new Set(state.threadUi.expandedCommandOutputs);
   state.expandedProcesses = new Set(state.threadUi.expandedProcesses);
   state.activeOutlineMessageId = state.threadUi.activeOutlineMessageId || null;
-  setInspectorTab(state.threadUi.rightPanelTab || "outline", false);
 }
 
-function setInspectorTab(tab, persist = true) {
-  const next = tab === "session" ? "session" : "outline";
-  const isOutline = next === "outline";
-  outlinePanel.classList.toggle("hidden", !isOutline);
-  sessionPanel.classList.toggle("hidden", isOutline);
-  outlineTab.classList.toggle("active", isOutline);
-  sessionTab.classList.toggle("active", !isOutline);
-  outlineTab.setAttribute("aria-selected", String(isOutline));
-  sessionTab.setAttribute("aria-selected", String(!isOutline));
-  inspectorTitle.textContent = isOutline ? "对话目录" : "Session";
-  if (state.threadUi) state.threadUi.rightPanelTab = next;
-  if (persist) saveThreadUi();
+const MINIMAP_PREVIEW_HIDE_DELAY = 250;
+const MINIMAP_ACTIVE_LOCK_MS = 1600;
+
+function conversationTargetOffset(element) {
+  if (!element?.isConnected) return null;
+  const chatRect = chat.getBoundingClientRect();
+  const targetRect = element.getBoundingClientRect();
+  return targetRect.top - chatRect.top + chat.scrollTop;
 }
 
-function outlineSummary(text) {
-  const firstLine = String(text || "").split(/\r?\n/, 1)[0].replace(/\s+/g, " ").trim();
-  if (!firstLine) return "Untitled message";
-  return firstLine.length > 64 ? `${firstLine.slice(0, 61).trimEnd()}...` : firstLine;
+function conversationMinimapTurns() {
+  const turns = [];
+  let currentTurn = null;
+
+  for (const record of state.messageNodes.values()) {
+    if (record.role === "user") {
+      currentTurn = { user: record, assistantCandidates: [], assistants: [] };
+      turns.push(currentTurn);
+      continue;
+    }
+    if (record.role === "assistant" && currentTurn && String(record.raw || "").trim()) {
+      currentTurn.assistantCandidates.push(record);
+    }
+  }
+
+  for (const turn of turns) {
+    const visibleAnswers = turn.assistantCandidates.filter((record) => (
+      !record.process || record.streaming || state.historicalProcessAnswerIds.has(record.id)
+    ));
+    turn.assistants = visibleAnswers.length ? visibleAnswers : turn.assistantCandidates.slice(-1);
+  }
+  return turns;
+}
+
+function scrollConversationTarget(element, turnIndex, behavior = "smooth") {
+  const turn = state.outlineTurns[turnIndex];
+  const targetTop = conversationTargetOffset(element);
+  if (!turn || targetTop === null) return;
+  state.outlineActiveLock = { index: turnIndex, until: Date.now() + MINIMAP_ACTIVE_LOCK_MS };
+  setActiveOutlineMessage(turn.user.id);
+  chat.scrollTo({
+    top: Math.max(0, targetTop - chat.clientHeight * 0.3),
+    behavior,
+  });
+}
+
+function cleanPreviewClone(node) {
+  let clone = node.cloneNode(true);
+  if (clone.nodeType === Node.ELEMENT_NODE && ["A", "BUTTON"].includes(clone.tagName)) {
+    const replacement = document.createElement("span");
+    replacement.append(...clone.childNodes);
+    clone = replacement;
+  }
+  const elements = clone.nodeType === Node.ELEMENT_NODE
+    ? [clone, ...clone.querySelectorAll("*")]
+    : [];
+  for (const element of elements) {
+    element.removeAttribute?.("id");
+    if (element !== clone && ["A", "BUTTON"].includes(element.tagName)) {
+      const replacement = document.createElement("span");
+      replacement.append(...element.childNodes);
+      element.replaceWith(replacement);
+    }
+  }
+  return clone;
+}
+
+function appendPreviewContent(target, source, fallback) {
+  if (source?.childNodes?.length) {
+    target.append(...[...source.childNodes].map(cleanPreviewClone));
+    return;
+  }
+  target.textContent = conversationPreviewText(fallback);
+}
+
+function createMinimapButton(className, label, onClick) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.setAttribute("aria-label", label);
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    onClick();
+  });
+  return button;
+}
+
+function appendAssistantPreview(container, turn, assistant, turnIndex, assistantIndex) {
+  const section = document.createElement("section");
+  section.className = "chat-minimap-assistant";
+
+  const jump = createMinimapButton(
+    "chat-minimap-assistant-jump",
+    "Locate assistant message",
+    () => scrollConversationTarget(assistant.article, turnIndex),
+  );
+  jump.textContent = "A";
+  jump.title = "Locate assistant message";
+
+  const outline = document.createElement("div");
+  outline.className = "chat-minimap-assistant-outline";
+  const headings = [...assistant.content.querySelectorAll("h1, h2, h3")];
+
+  if (headings.length) {
+    headings.forEach((heading, headingIndex) => {
+      const level = Number(heading.tagName.slice(1));
+      const button = createMinimapButton(
+        "chat-minimap-heading",
+        `Locate assistant heading ${headingIndex + 1}`,
+        () => scrollConversationTarget(heading, turnIndex),
+      );
+      button.dataset.level = String(level);
+      button.dataset.previewHeadingIndex = String(headingIndex);
+      button.dataset.minimapPreviewHeading = `${turnIndex}-${assistantIndex}-${headingIndex}`;
+      appendPreviewContent(button, heading, heading.textContent || assistant.raw);
+      outline.append(button);
+    });
+  } else {
+    const paragraph = assistant.content.querySelector("p");
+    const button = createMinimapButton(
+      "chat-minimap-paragraph",
+      "Locate assistant message",
+      () => scrollConversationTarget(assistant.article, turnIndex),
+    );
+    appendPreviewContent(button, paragraph, assistant.raw);
+    outline.append(button);
+  }
+
+  section.append(jump, outline);
+  container.append(section);
 }
 
 function setActiveOutlineMessage(messageId, persist = true) {
   const nextId = messageId || null;
-  if (state.activeOutlineMessageId === nextId && state.activeOutlineNode?.isConnected) return;
-  state.activeOutlineNode?.classList.remove("active");
-  state.activeOutlineNode?.setAttribute("aria-current", "false");
+  if (state.activeOutlineMessageId === nextId && state.activeOutlineNode?.preview?.isConnected) return;
+  state.activeOutlineNode?.rail?.classList.remove("active");
+  state.activeOutlineNode?.preview?.classList.remove("active");
+  state.activeOutlineNode?.preview?.removeAttribute("aria-current");
   state.activeOutlineMessageId = nextId;
   state.activeOutlineNode = state.outlineNodes.get(nextId) || null;
-  state.activeOutlineNode?.classList.add("active");
-  state.activeOutlineNode?.setAttribute("aria-current", "true");
+  state.activeOutlineNode?.rail?.classList.add("active");
+  state.activeOutlineNode?.preview?.classList.add("active");
+  state.activeOutlineNode?.preview?.setAttribute("aria-current", "true");
   if (persist) scheduleThreadUiSave();
 }
 
-function observeOutlineMessages() {
-  state.outlineObserver?.disconnect();
-  if (!("IntersectionObserver" in window)) return;
-  state.outlineObserver = new IntersectionObserver((entries) => {
-    const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-    const messageId = visible[0]?.target?.dataset.messageId;
-    if (messageId) setActiveOutlineMessage(messageId);
-  }, {
-    root: chat,
-    rootMargin: "-24px 0px -62% 0px",
-    threshold: [0, 0.15, 0.5, 1],
-  });
-  for (const record of state.messageNodes.values()) {
-    if (record.role === "user") state.outlineObserver.observe(record.article);
+function setLocatedOutlineMessage(messageId) {
+  const nextId = messageId || null;
+  if (state.locatedOutlineMessageId === nextId) return;
+  const previous = state.outlineNodes.get(state.locatedOutlineMessageId);
+  previous?.rail?.classList.remove("located");
+  if (previous?.preview) delete previous.preview.dataset.located;
+  state.locatedOutlineMessageId = nextId;
+  const next = state.outlineNodes.get(nextId);
+  next?.rail?.classList.add("located");
+  if (next?.preview) {
+    next.preview.dataset.located = "true";
+    const targetTop = next.preview.offsetTop
+      - (conversationOutline.clientHeight - next.preview.offsetHeight) / 2;
+    conversationOutline.scrollTop = Math.max(0, targetTop);
   }
 }
 
-function renderConversationOutline() {
-  conversationOutline.replaceChildren();
-  state.outlineNodes.clear();
-  state.activeOutlineNode = null;
-  const messages = [...state.messageNodes.values()].filter((record) => record.role === "user");
-  outlineCount.textContent = `${messages.length} 条`;
-  if (!messages.length) {
-    const empty = document.createElement("div");
-    empty.className = "outline-empty";
-    empty.textContent = "当前 Thread 还没有用户消息。";
-    conversationOutline.append(empty);
-    state.outlineObserver?.disconnect();
+function syncConversationMinimapActive() {
+  if (!state.outlineTurns.length) {
+    setActiveOutlineMessage(null);
     return;
   }
-  messages.forEach((record, index) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "outline-item";
-    button.dataset.messageId = record.id;
-    button.setAttribute("aria-current", "false");
-    const number = document.createElement("span");
-    number.className = "outline-number";
-    number.textContent = String(index + 1);
-    const summary = document.createElement("span");
-    summary.className = "outline-summary";
-    summary.textContent = outlineSummary(record.raw);
-    summary.title = record.raw || "Untitled message";
-    button.append(number, summary);
-    button.addEventListener("click", () => {
-      record.article.scrollIntoView({ behavior: "smooth", block: "start" });
-      setActiveOutlineMessage(record.id);
-    });
-    conversationOutline.append(button);
-    state.outlineNodes.set(record.id, button);
+  const lock = state.outlineActiveLock;
+  if (lock && Date.now() < lock.until && state.outlineTurns[lock.index]) {
+    setActiveOutlineMessage(state.outlineTurns[lock.index].user.id);
+    return;
+  }
+  state.outlineActiveLock = null;
+  const offsets = state.outlineTurns.map((turn) => conversationTargetOffset(turn.user.article));
+  const activeIndex = activeConversationTurnIndex(offsets, chat.scrollTop, chat.clientHeight);
+  setActiveOutlineMessage(state.outlineTurns[activeIndex]?.user.id || null);
+}
+
+function hideConversationMinimap() {
+  chatMinimap.classList.add("hidden");
+  chatMinimap.setAttribute("aria-hidden", "true");
+  chatMinimap.classList.remove("preview-open");
+  conversationView.classList.remove("minimap-visible");
+}
+
+function measureConversationMinimap() {
+  const eligible = window.innerWidth >= 960
+    && state.activeView === "conversation"
+    && state.outlineTurns.length > 0;
+  if (!eligible) {
+    hideConversationMinimap();
+    return;
+  }
+
+  conversationView.classList.add("minimap-visible");
+  chatMinimap.classList.remove("hidden");
+  chatMinimap.setAttribute("aria-hidden", "false");
+  if (chat.scrollHeight - chat.clientHeight <= 20) {
+    hideConversationMinimap();
+    return;
+  }
+
+  const layout = layoutConversationMinimap(state.outlineTurns.length, chatMinimap.clientHeight);
+  state.outlineLayout = layout;
+  chatMinimapLine.style.top = `${layout.lineTop}px`;
+  chatMinimapLine.style.height = `${layout.lineHeight}px`;
+  state.outlineTurns.forEach((turn, index) => {
+    const entry = state.outlineNodes.get(turn.user.id);
+    if (!entry?.rail) return;
+    entry.rail.style.top = `${layout.positions[index]}px`;
+    entry.rail.style.height = `${Math.max(1, layout.gap)}px`;
   });
-  setActiveOutlineMessage(state.activeOutlineMessageId || messages[0].id, false);
-  observeOutlineMessages();
+  syncConversationMinimapActive();
+}
+
+function scheduleConversationOutlineRender() {
+  if (state.historyRestoring || state.historyObserverMuted) {
+    state.conversationReconcilePending = true;
+    return;
+  }
+  if (state.outlineRenderTimer !== null) return;
+  state.outlineRenderTimer = setTimeout(() => {
+    state.outlineRenderTimer = null;
+    renderConversationOutline();
+  }, 120);
+}
+
+function renderConversationOutline() {
+  const locatedId = state.locatedOutlineMessageId;
+  conversationOutline.replaceChildren();
+  chatMinimapRail.replaceChildren(chatMinimapLine);
+  state.outlineNodes.clear();
+  state.activeOutlineNode = null;
+  state.locatedOutlineMessageId = null;
+  state.outlineTurns = conversationMinimapTurns();
+
+  state.outlineTurns.forEach((turn, index) => {
+    const railNode = document.createElement("span");
+    railNode.className = "chat-minimap-node";
+    railNode.dataset.minimapNodeIndex = String(index);
+    railNode.setAttribute("aria-hidden", "true");
+    const marker = document.createElement("span");
+    marker.className = "chat-minimap-node-marker";
+    railNode.append(marker);
+    chatMinimapRail.append(railNode);
+
+    const preview = document.createElement("section");
+    preview.className = "chat-minimap-turn";
+    preview.dataset.minimapPreviewIndex = String(index);
+    preview.dataset.messageId = turn.user.id;
+    const number = document.createElement("span");
+    number.className = "chat-minimap-number";
+    number.textContent = String(index + 1).padStart(2, "0");
+    number.setAttribute("aria-hidden", "true");
+    const content = document.createElement("div");
+    content.className = "chat-minimap-content";
+    const userButton = createMinimapButton(
+      "chat-minimap-user",
+      `Locate user message ${index + 1}`,
+      () => scrollConversationTarget(turn.user.article, index),
+    );
+    userButton.dataset.minimapPreviewUser = String(index);
+    userButton.title = conversationPreviewText(turn.user.raw);
+    const userText = document.createElement("span");
+    userText.className = "chat-minimap-user-text";
+    userText.textContent = String(turn.user.raw || "").trim() || "Untitled message";
+    userButton.append(userText);
+    content.append(userButton);
+    turn.assistants.forEach((assistant, assistantIndex) => {
+      appendAssistantPreview(content, turn, assistant, index, assistantIndex);
+    });
+    preview.append(number, content);
+    conversationOutline.append(preview);
+    state.outlineNodes.set(turn.user.id, { rail: railNode, preview, turn, index });
+  });
+
+  const preferredId = state.outlineNodes.has(state.activeOutlineMessageId)
+    ? state.activeOutlineMessageId
+    : state.outlineTurns[0]?.user.id || null;
+  state.activeOutlineMessageId = null;
+  setActiveOutlineMessage(preferredId, false);
+  if (chatMinimap.classList.contains("preview-open") && state.outlineNodes.has(locatedId)) {
+    setLocatedOutlineMessage(locatedId);
+  }
+  requestAnimationFrame(measureConversationMinimap);
+}
+
+function showConversationMinimapPreview() {
+  if (state.outlinePreviewHideTimer !== null) {
+    clearTimeout(state.outlinePreviewHideTimer);
+    state.outlinePreviewHideTimer = null;
+  }
+  if (!chatMinimap.classList.contains("hidden")) chatMinimap.classList.add("preview-open");
+}
+
+function scheduleConversationMinimapPreviewHide() {
+  if (state.outlinePreviewHideTimer !== null) clearTimeout(state.outlinePreviewHideTimer);
+  state.outlinePreviewHideTimer = setTimeout(() => {
+    state.outlinePreviewHideTimer = null;
+    chatMinimap.classList.remove("preview-open");
+    setLocatedOutlineMessage(null);
+  }, MINIMAP_PREVIEW_HIDE_DELAY);
+}
+
+function minimapPointerIndex(clientY) {
+  if (!state.outlineLayout) return -1;
+  const rect = chatMinimapRail.getBoundingClientRect();
+  return nearestConversationMinimapIndex(state.outlineLayout, clientY - rect.top);
+}
+
+function locateConversationMinimapPointer(clientY) {
+  const index = minimapPointerIndex(clientY);
+  setLocatedOutlineMessage(state.outlineTurns[index]?.user.id || null);
+  return index;
+}
+
+function jumpToConversationMinimapPointer(clientY, behavior) {
+  const index = locateConversationMinimapPointer(clientY);
+  const turn = state.outlineTurns[index];
+  if (turn) scrollConversationTarget(turn.user.article, index, behavior);
+}
+
+function beginConversationMinimapDrag(event) {
+  if (event.button !== 0 || chatMinimap.classList.contains("hidden")) return;
+  event.preventDefault();
+  showConversationMinimapPreview();
+  jumpToConversationMinimapPointer(event.clientY, "smooth");
+  const onMove = (moveEvent) => jumpToConversationMinimapPointer(moveEvent.clientY, "auto");
+  const onUp = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onUp);
+}
+
+function handleConversationMinimapKeydown(event) {
+  if (!state.outlineTurns.length) return;
+  const activeIndex = Math.max(0, state.outlineTurns.findIndex((turn) => turn.user.id === state.activeOutlineMessageId));
+  let nextIndex = activeIndex;
+  if (["ArrowDown", "ArrowRight"].includes(event.key)) nextIndex = Math.min(state.outlineTurns.length - 1, activeIndex + 1);
+  else if (["ArrowUp", "ArrowLeft"].includes(event.key)) nextIndex = Math.max(0, activeIndex - 1);
+  else if (event.key === "Home") nextIndex = 0;
+  else if (event.key === "End") nextIndex = state.outlineTurns.length - 1;
+  else if (!["Enter", " "].includes(event.key)) return;
+  event.preventDefault();
+  const turn = state.outlineTurns[nextIndex];
+  scrollConversationTarget(turn.user.article, nextIndex);
+  setLocatedOutlineMessage(turn.user.id);
 }
 
 function deleteRequestId() {
@@ -1361,9 +3097,11 @@ function removePendingThreadDelete(requestId, threadId = null) {
 function clearDeletedThreadBrowserState(threadId) {
   const id = String(threadId || "").trim();
   if (!id) return;
+  state.threadRuntimes.runtimes.delete(id);
   sessionStorage.removeItem(threadUiStorageKey(id));
   sessionStorage.removeItem(`codexScroll:${id}`);
   sessionStorage.removeItem(threadToolStorageKey(id));
+  sessionStorage.removeItem(protocolStateStorageKey(id));
   localStorage.removeItem(collaborationModeStorageKey(id));
 }
 
@@ -1371,9 +3109,9 @@ function resetActiveThreadAfterDeletion(threadId) {
   const deletedId = String(threadId || state.threadId || "").trim();
   clearDeletedThreadBrowserState(deletedId);
   clearTranscript(false);
-  state.outlineObserver?.disconnect();
-  state.outlineObserver = null;
   state.outlineNodes.clear();
+  state.outlineTurns = [];
+  state.outlineLayout = null;
   state.activeOutlineNode = null;
   state.activeOutlineMessageId = null;
   state.commandItems.clear();
@@ -1382,6 +3120,11 @@ function resetActiveThreadAfterDeletion(threadId) {
   state.threadUi = null;
   state.lastSavedThreadUi = null;
   state.threadId = null;
+  state.selectedThreadId = null;
+  persistSelectedThread(null);
+  state.accessMode = null;
+  state.snapshotAt = null;
+  state.snapshotReason = null;
   state.activeTurnId = null;
   state.running = false;
   state.threadStatus = "notLoaded";
@@ -1395,6 +3138,7 @@ function resetActiveThreadAfterDeletion(threadId) {
   state.turnDiff = "";
   state.latestDiff = "";
   state.approvals = [];
+  state.pendingServerRequests.clear();
   state.navigation = removeThreadFromNavigation(state.navigation, deletedId);
   state.navigatingHistory = false;
   state.expandedFileChanges.clear();
@@ -1405,8 +3149,8 @@ function resetActiveThreadAfterDeletion(threadId) {
   state.expandedCommandOutputs.clear();
   state.expandedProcesses.clear();
   clearQueuedMessages();
+  resetFileWorkspace(state.defaultCwd || "", { keepPanel: false, force: true });
   localStorage.removeItem("codexMathThreadId");
-  threadIdInput.value = "";
   chat.append(chatEmptyState);
   renderConversationOutline();
   renderChangesView();
@@ -1427,11 +3171,109 @@ function handleThreadDeleted(payload) {
   updateControls();
 }
 
-function renderThreadList() {
+function updateCurrentThreadListMetadata(fields = {}) {
+  if (!state.threadId || !fields || typeof fields !== "object") return;
+  const index = state.threads.findIndex((thread) => thread.id === state.threadId);
+  if (index < 0) return;
+  state.threads[index] = { ...state.threads[index], ...fields };
+  renderThreadList();
+}
+
+function setThreadLifecycle(status, fields = {}) {
+  state.threadStatus = status;
+  state.threadMeta = { ...state.threadMeta, ...fields };
+  if (status !== "active") {
+    state.running = false;
+    state.activeTurnId = null;
+    if (state.activityMode === "working") clearTurnActivity();
+  }
+  updateControls();
+  refreshThreadList();
+}
+
+function threadListStructureKey(groups) {
+  return groups.map((group) => `${group.label}:${group.threads.map((thread) => thread.id).join(",")}`).join("|");
+}
+
+function createThreadRow(thread) {
+  const item = document.createElement("div");
+  item.className = "thread-item";
+  item.dataset.threadId = thread.id;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "thread-item-main";
+  const title = document.createElement("span");
+  title.className = "thread-item-title";
+  const time = document.createElement("time");
+  time.className = "thread-item-time";
+  const timeText = document.createTextNode("");
+  const stateMark = document.createElement("span");
+  stateMark.className = "thread-item-runtime";
+  time.append(timeText, stateMark);
+  const cwd = document.createElement("span");
+  cwd.className = "thread-item-cwd";
+  button.append(title, time, cwd);
+  button.addEventListener("click", () => {
+    const id = item.dataset.threadId;
+    if (!canBeginThreadSelection(state.selectionPending)) return;
+    if (id !== state.selectedThreadId || id !== state.threadId) resumeThread(id);
+  });
+
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.className = "thread-item-delete icon-button";
+  deleteButton.title = "Delete conversation";
+  const deleteIcon = document.createElement("i");
+  deleteIcon.dataset.icon = "trash-2";
+  deleteButton.append(deleteIcon);
+  renderIcons(deleteButton);
+  deleteButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const current = state.threads.find((candidate) => candidate.id === item.dataset.threadId);
+    if (current) openDeleteThreadDialog(current);
+  });
+  item.append(button, deleteButton);
+  item._threadParts = { button, title, timeText, stateMark, cwd, deleteButton };
+  return item;
+}
+
+function patchThreadRow(item, thread) {
+  const parts = item._threadParts;
+  if (!parts) return;
+  const active = thread.id === state.selectedThreadId || thread.id === state.threadId;
+  const runtime = getThreadRuntime(state.threadRuntimes, thread.id, false);
+  const indicator = runtimeIndicator(runtime);
+  const itemTitle = `${threadTitle(thread, 500)}\n${thread.cwd || thread.id}`;
+  item.dataset.threadId = thread.id;
+  item.classList.toggle("active", active);
+  item.title = itemTitle;
+  parts.button.disabled = !canBeginThreadSelection(state.selectionPending);
+  parts.button.title = itemTitle;
+  parts.button.setAttribute("aria-current", String(active));
+  parts.title.textContent = threadTitle(thread);
+  parts.timeText.textContent = formatThreadTime(thread);
+  parts.stateMark.className = `thread-item-runtime${indicator.running ? " running" : ""}${indicator.unread ? " unread" : ""}`;
+  parts.stateMark.setAttribute("aria-label", indicator.unread
+    ? `${indicator.label}; ${indicator.unreadCount || 1} unread update${indicator.unreadCount === 1 ? "" : "s"}`
+    : indicator.label);
+  parts.stateMark.title = parts.stateMark.getAttribute("aria-label");
+  parts.cwd.textContent = compactThreadCwd(thread.cwd) || "Unknown directory";
+  parts.cwd.title = thread.cwd || "Working directory unavailable";
+  parts.deleteButton.setAttribute("aria-label", `Delete ${threadTitle(thread)}`);
+  parts.deleteButton.disabled = state.deletingThreadIds.has(thread.id) || isThreadRuntimeBusy(runtime);
+  parts.deleteButton.setAttribute("aria-busy", String(state.deletingThreadIds.has(thread.id)));
+}
+
+function renderThreadListNow() {
   const filtered = filterThreads(state.threads, threadSearchInput.value);
-  threadList.replaceChildren();
+  const groups = groupThreads(filtered);
+  const structureKey = threadListStructureKey(groups);
+  const structureChanged = state.threadListStructureKey !== structureKey;
 
   if (!filtered.length) {
+    state.threadListStructureKey = structureKey;
+    state.threadRowNodes.clear();
+    threadList.replaceChildren();
     const empty = document.createElement("div");
     empty.className = "thread-list-empty";
     empty.textContent = state.threadListError
@@ -1442,64 +3284,30 @@ function renderThreadList() {
           ? "No conversations match this search."
           : "No recent conversations yet.";
     threadList.append(empty);
-  } else {
-    for (const group of groupThreads(filtered)) {
+  } else if (structureChanged || !threadList.children.length) {
+    state.threadListStructureKey = structureKey;
+    const nextRows = new Map();
+    threadList.replaceChildren();
+    for (const group of groups) {
       const section = document.createElement("section");
       section.className = "thread-group";
       const heading = document.createElement("h3");
       heading.className = "thread-group-title";
       heading.textContent = group.label;
       section.append(heading);
-
       for (const thread of group.threads) {
-        const item = document.createElement("div");
-        item.dataset.threadId = thread.id;
-        item.className = `thread-item${thread.id === state.threadId ? " active" : ""}`;
-        item.title = `${threadTitle(thread, 500)}\n${thread.cwd || thread.id}`;
-
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "thread-item-main";
-        button.disabled = state.running;
-        button.title = item.title;
-        button.setAttribute("aria-current", thread.id === state.threadId ? "true" : "false");
-
-        const title = document.createElement("span");
-        title.className = "thread-item-title";
-        title.textContent = threadTitle(thread);
-        const time = document.createElement("time");
-        time.className = "thread-item-time";
-        time.textContent = formatThreadTime(thread);
-        const cwd = document.createElement("span");
-        cwd.className = "thread-item-cwd";
-        cwd.textContent = compactThreadCwd(thread.cwd) || "Unknown directory";
-        cwd.title = thread.cwd || "Working directory unavailable";
-        button.append(title, time, cwd);
-        button.addEventListener("click", () => {
-          if (thread.id !== state.threadId) resumeThread(thread.id);
-        });
-
-        const deleteButton = document.createElement("button");
-        deleteButton.type = "button";
-        deleteButton.className = "thread-item-delete icon-button";
-        deleteButton.setAttribute("aria-label", `Delete ${threadTitle(thread)}`);
-        deleteButton.title = "Delete conversation";
-        deleteButton.disabled = state.deletingThreadIds.has(thread.id)
-          || (state.running && thread.id === state.threadId);
-        deleteButton.setAttribute("aria-busy", String(state.deletingThreadIds.has(thread.id)));
-        const deleteIcon = document.createElement("i");
-        deleteIcon.dataset.icon = "trash-2";
-        deleteButton.append(deleteIcon);
-        renderIcons(deleteButton);
-        deleteButton.addEventListener("click", (event) => {
-          event.stopPropagation();
-          openDeleteThreadDialog(thread);
-        });
-
-        item.append(button, deleteButton);
-        section.append(item);
+        const row = state.threadRowNodes.get(thread.id) || createThreadRow(thread);
+        patchThreadRow(row, thread);
+        nextRows.set(thread.id, row);
+        section.append(row);
       }
       threadList.append(section);
+    }
+    state.threadRowNodes = nextRows;
+  } else {
+    for (const thread of filtered) {
+      const row = state.threadRowNodes.get(thread.id);
+      if (row) patchThreadRow(row, thread);
     }
   }
 
@@ -1511,18 +3319,25 @@ function renderThreadList() {
   loadMoreThreadsButton.classList.toggle("hidden", !state.threadListCursor);
 }
 
+const threadListScheduler = createKeyedFrameScheduler(() => renderThreadListNow());
+
+function renderThreadList(key = "state") {
+  threadListScheduler.schedule(key);
+}
+
 function syncThreadListControls() {
   for (const button of threadList.querySelectorAll(".thread-item-main")) {
     const item = button.closest(".thread-item");
     const threadId = item?.dataset.threadId || "";
-    const active = threadId === state.threadId;
-    button.disabled = state.running;
+    const active = threadId === state.selectedThreadId || threadId === state.threadId;
+    button.disabled = !canBeginThreadSelection(state.selectionPending);
     item?.classList.toggle("active", active);
     button.setAttribute("aria-current", String(active));
     const deleteButton = item?.querySelector(".thread-item-delete");
     if (deleteButton) {
+      const runtime = getThreadRuntime(state.threadRuntimes, threadId, false);
       deleteButton.disabled = state.deletingThreadIds.has(threadId)
-        || (state.running && active);
+        || isThreadRuntimeBusy(runtime);
       deleteButton.setAttribute("aria-busy", String(state.deletingThreadIds.has(threadId)));
     }
   }
@@ -1530,7 +3345,9 @@ function syncThreadListControls() {
 
 function applyThreadList(result, append = false, error = null) {
   state.threadListLoading = false;
-  state.threadListError = error || null;
+  state.threadListError = error
+    ? (typeof error === "string" ? error : error.message || error.error?.message || "Recent sessions are unavailable.")
+    : null;
   if (result) {
     const incoming = Array.isArray(result.data) ? result.data : [];
     state.threads = append ? mergeThreadPages(state.threads, incoming) : mergeThreadPages([], incoming);
@@ -1550,6 +3367,7 @@ function refreshThreadList(cursor = null, searchTerm = threadSearchInput.value.t
 }
 
 function scrollToBottom(force = false) {
+  if (!force && (state.historyRestoring || state.historyObserverMuted)) return;
   if (!force && !state.followOutput) return;
   const apply = () => {
     state.pendingScrollFrame = null;
@@ -1566,20 +3384,29 @@ function scrollToBottom(force = false) {
   }
 }
 
-function addSystemMessage(text, kind = "info") {
+function addSystemMessage(text, kind = "info", options = {}) {
   state.conversationOrder.push({ kind: "barrier", turnId: state.activeTurnId ?? null });
   const node = document.createElement("div");
   node.className = `system-message system-${kind}`;
   node.textContent = text;
   chat.append(node);
+  registerConversationNode(node, {
+    sequence: options.sequence ?? fallbackConversationSequence(),
+    key: options.key || null,
+    turnId: options.turnId ?? state.activeTurnId ?? null,
+  });
   scrollToBottom();
 }
 
 function addProcessError(item, turnId = state.activeTurnId) {
   const message = item?.message || item?.error?.message || item?.errorMessage || item?.text || "Codex error";
-  const process = ensureProcessDetails(turnId);
+  const process = ensureProcessDetails(turnId, chat, {
+    itemId: item?.id,
+    sequence: item?.id ? protocolSequenceForItem(item.id) : null,
+  });
   const node = document.createElement("div");
   node.className = "process-error";
+  if (item?.id) node.dataset.itemId = String(item.id);
   node.textContent = message;
   node.title = message;
   process.body.append(node);
@@ -1587,56 +3414,183 @@ function addProcessError(item, turnId = state.activeTurnId) {
     process.itemIds.add(item.id);
     process.items?.set(item.id, { ...item, type: "error", message });
   }
+  registerConversationNode(node, {
+    sequence: item?.id ? protocolSequenceForItem(item.id) : null,
+    key: item?.id ? `item:${item.id}` : null,
+    turnId,
+  });
   updateProcessSummary(process);
   scrollToBottom();
   return node;
 }
 
-function renderMarkdown(node, raw, { preserveLineBreaks = false } = {}) {
+function renderMarkdown(node, raw, { preserveLineBreaks = false, progressiveMath = false } = {}) {
   const extracted = extractMath(raw || "");
   const html = marked.parse(extracted.markdown, preserveLineBreaks ? { breaks: true } : undefined);
   node.innerHTML = DOMPurify.sanitize(html, {
     USE_PROFILES: { html: true },
     ADD_ATTR: ["data-codex-math"],
   });
-  renderMathSlots(node, extracted.formulas, katex, mathRenderCache);
+  const mathJob = progressiveMath
+    ? scheduleMathSlots(node, extracted.formulas, katex, mathRenderCache, { frameBudgetMs: 6 })
+    : (renderMathSlots(node, extracted.formulas, katex, mathRenderCache), null);
+  for (const codeBlock of enhanceMarkdownCodeBlocks(node)) renderIcons(codeBlock);
+  return mathJob;
 }
 
 function clearStreamingTail(record) {
+  record.mathRenderJob?.cancel?.();
+  record.mathRenderJob = null;
   for (const node of record.streamTailNodes || []) node.remove();
   record.streamTailNodes = [];
 }
 
-function processKey(turnId = state.activeTurnId) {
+function processDetailsShouldExpand({ persisted = false, running = false, snapshot = false, turnId = null, activeTurnId = null } = {}) {
+  if (persisted) return true;
+  if (!running || snapshot) return false;
+  return !turnId || !activeTurnId || turnId === activeTurnId;
+}
+
+function setProcessDetailsExpanded(record, expanded) {
+  if (!record?.body || !record?.summary || !record?.details) return false;
+  const next = Boolean(expanded);
+  const changed = record.body.hidden !== !next;
+  record.body.hidden = !next;
+  record.summary.setAttribute("aria-expanded", String(next));
+  record.details.classList.toggle("expanded", next);
+  return changed;
+}
+
+function processBaseKey(turnId = state.activeTurnId) {
   return `${state.threadId || "thread"}:${turnId || "turn"}`;
+}
+
+function processKey(turnId = state.activeTurnId) {
+  const base = processBaseKey(turnId);
+  const epoch = Number(state.processEpochs.get(base)) || 0;
+  return epoch ? `${base}:segment:${epoch}` : base;
+}
+
+function advanceProcessSegment(turnId = state.activeTurnId) {
+  const base = processBaseKey(turnId);
+  const currentKey = processKey(turnId);
+  const current = state.processNodes.get(currentKey);
+  if (!current || (!current.itemIds?.size && !current.body?.childElementCount)) return currentKey;
+  const nextEpoch = (Number(state.processEpochs.get(base)) || 0) + 1;
+  state.processEpochs.set(base, nextEpoch);
+  return processKey(turnId);
+}
+
+function splitProcessAtSequence(turnId, sequence) {
+  const boundary = optionalConversationSequence(sequence);
+  if (boundary === null) return false;
+  const current = state.processNodes.get(processKey(turnId));
+  if (!current?.body) return false;
+  const trailing = [...current.body.children].filter((node) => {
+    const value = optionalConversationSequence(state.conversationNodeMeta.get(node)?.sequence);
+    return value !== null && value > boundary;
+  });
+  if (!trailing.length) return false;
+
+  advanceProcessSegment(turnId);
+  const next = ensureProcessDetails(turnId, chat, {
+    sequence: optionalConversationSequence(state.conversationNodeMeta.get(trailing[0])?.sequence),
+  });
+  for (const node of trailing) {
+    const itemId = node.dataset?.itemId || node.dataset?.messageId;
+    const record = itemId
+      ? state.toolNodes.get(itemId) || state.activityNodes.get(itemId)
+        || state.searchNodes.get(itemId) || state.messageNodes.get(itemId)
+      : null;
+    current.body.removeChild(node);
+    next.body.append(node);
+    if (!itemId) continue;
+    current.itemIds.delete(itemId);
+    current.items?.delete(itemId);
+    next.itemIds.add(itemId);
+    next.items?.set(itemId, record?.item || { id: itemId });
+    if (record) record.process = next;
+  }
+  updateProcessSummary(current);
+  updateProcessSummary(next);
+  return true;
 }
 
 function updateProcessSummary(record) {
   if (!record) return;
-  let messageCount = 0;
-  let toolCount = 0;
-  for (const id of record.itemIds) {
-    const tool = state.toolNodes.get(id)?.item || record.items?.get(id);
-    if (isToolCallItem(tool)) {
-      toolCount += 1;
-      continue;
+  const items = [...record.itemIds].map((id) => state.toolNodes.get(id)?.item || record.items?.get(id)).filter(Boolean);
+  for (const message of state.messageNodes.values()) {
+    if (message.process === record && !items.some((item) => item.id === message.id)) {
+      items.push({ id: message.id, type: "agentMessage", role: "assistant", text: message.raw });
     }
-    const message = state.messageNodes.get(id);
-    if (message && (message.raw || message.role === "assistant")) {
-      messageCount += 1;
-      continue;
-    }
-    if (isDisplayableProcessItem(record.items?.get(id))) messageCount += 1;
   }
-  const parts = [`Process details`, `${messageCount} message${messageCount === 1 ? "" : "s"}`];
-  if (toolCount) parts.push(`${toolCount} tool call${toolCount === 1 ? "" : "s"}`);
+  const activityCounts = summarizeProcessActivities(items);
+  let messageCount = 0;
+  for (const id of record.itemIds) {
+    const message = state.messageNodes.get(id);
+    if (message && (message.raw || message.role === "assistant")) messageCount += 1;
+    else if (isDisplayableProcessItem(record.items?.get(id))) messageCount += 1;
+  }
+  const parts = [`Process details`];
+  if (messageCount) parts.push(`${messageCount} message${messageCount === 1 ? "" : "s"}`);
+  const labels = [
+    ["commands", "command", "commands"],
+    ["actions", "parsed action", "parsed actions"],
+    ["fileChanges", "file change", "file changes"],
+    ["mcp", "MCP", "MCP"],
+    ["dynamicTools", "dynamic tool", "dynamic tools"],
+    ["agents", "agent", "agents"],
+    ["webSearch", "web search", "web searches"],
+    ["imageViews", "image view", "image views"],
+    ["compactions", "compaction", "compactions"],
+    ["reviews", "review", "reviews"],
+  ];
+  for (const [key, singular, plural] of labels) {
+    const count = Number(activityCounts[key]) || 0;
+    if (count) parts.push(`${count} ${count === 1 ? singular : plural}`);
+  }
+  if (activityCounts.unknown) parts.push(`${activityCounts.unknown} unknown item${activityCounts.unknown === 1 ? "" : "s"}`);
   record.summaryText.textContent = parts.join(" · ");
 }
 
-function ensureProcessDetails(turnId = state.activeTurnId, container = chat) {
+function processSegmentHasContent(record) {
+  return Boolean(record?.itemIds?.size || record?.body?.childElementCount);
+}
+
+function removeEmptyProcessDetails(record) {
+  if (!record || processSegmentHasContent(record)) return false;
+  record.details?.remove();
+  if (state.processNodes.get(record.key) === record) state.processNodes.delete(record.key);
+  state.expandedProcesses.delete(record.key);
+  state.conversationNodeMeta.delete(record.details);
+  reconcileConversationNodes();
+  return true;
+}
+
+function collapseProcessDetailsForTurn(turnId) {
+  let changed = false;
+  let persistenceChanged = false;
+  for (const record of state.processNodes.values()) {
+    if (turnId && record.turnId !== turnId) continue;
+    changed = setProcessDetailsExpanded(record, false) || changed;
+    persistenceChanged = state.expandedProcesses.delete(record.key) || persistenceChanged;
+  }
+  if (persistenceChanged) saveThreadUi();
+  return changed;
+}
+
+function ensureProcessDetails(turnId = state.activeTurnId, container = chat, options = {}) {
   const key = processKey(turnId);
   let record = state.processNodes.get(key);
-  if (record) return record;
+  const sequence = options.sequence ?? (options.itemId ? protocolSequenceForItem(options.itemId) : null);
+  if (record) {
+    registerConversationNode(record.details, {
+      sequence,
+      key: `process:${key}`,
+      turnId,
+    });
+    return record;
+  }
   const details = document.createElement("section");
   details.className = "process-details";
   details.dataset.processKey = key;
@@ -1666,15 +3620,17 @@ function ensureProcessDetails(turnId = state.activeTurnId, container = chat) {
   summary.append(chevron, summaryText);
   details.append(summary, body);
   record = { key, turnId, details, summary, summaryText, body, itemIds: new Set(), items: new Map() };
-  const expanded = state.expandedProcesses.has(key);
-  body.hidden = !expanded;
-  summary.setAttribute("aria-expanded", String(expanded));
-  details.classList.toggle("expanded", expanded);
+  const expanded = processDetailsShouldExpand({
+    persisted: state.expandedProcesses.has(key),
+    running: state.running,
+    snapshot: isSnapshotMode(),
+    turnId,
+    activeTurnId: state.activeTurnId || state.currentTurn?.id,
+  });
+  setProcessDetailsExpanded(record, expanded);
   summary.addEventListener("click", () => {
     const next = body.hidden;
-    body.hidden = !next;
-    summary.setAttribute("aria-expanded", String(next));
-    details.classList.toggle("expanded", next);
+    setProcessDetailsExpanded(record, next);
     if (next) state.expandedProcesses.add(key);
     else state.expandedProcesses.delete(key);
     saveThreadUi();
@@ -1682,13 +3638,21 @@ function ensureProcessDetails(turnId = state.activeTurnId, container = chat) {
   });
   (container || chat).append(details);
   state.processNodes.set(key, record);
+  registerConversationNode(details, {
+    sequence,
+    key: `process:${key}`,
+    turnId,
+  });
   updateProcessSummary(record);
   return record;
 }
 
 function registerProcessItem(item, record = null) {
   if (!item?.id) return record;
-  const process = record || ensureProcessDetails(item.turnId || state.activeTurnId);
+  const process = record || ensureProcessDetails(item.turnId || state.activeTurnId, chat, {
+    itemId: item.id,
+    sequence: protocolSequenceForItem(item.id),
+  });
   process.itemIds.add(item.id);
   process.items?.set(item.id, item);
   updateProcessSummary(process);
@@ -1696,11 +3660,21 @@ function registerProcessItem(item, record = null) {
 }
 
 function promoteAssistantAnswer(record) {
-  if (!record?.article || !record.process) return;
-  if (record.article.parentElement === record.process.body) chat.append(record.article);
-  record.process.itemIds.delete(record.id);
-  updateProcessSummary(record.process);
+  const process = record?.process;
+  if (!record?.article || !process) return;
+  if (record.article.parentElement === process.body) chat.append(record.article);
+  registerConversationNode(record.article, {
+    sequence: protocolSequenceForItem(record.id),
+    key: `item:${record.id}`,
+    turnId: record.turnId,
+  });
+  process.itemIds.delete(record.id);
+  process.items?.delete(record.id);
   record.process = null;
+  updateProcessSummary(process);
+  collapseProcessDetailsForTurn(process.turnId || record.turnId);
+  removeEmptyProcessDetails(process);
+  scheduleConversationOutlineRender();
 }
 
 function promoteLatestAssistantAnswer(turnId = state.currentTurn?.id || state.activeTurnId) {
@@ -1728,29 +3702,72 @@ function renderStreamingMessage(record) {
   if (tail) {
     const node = document.createElement("div");
     node.className = "streaming-tail";
-    node.textContent = tail;
     record.content.append(node);
     record.streamTailNodes = [node];
+    record.mathRenderJob = renderMarkdown(node, tail, { progressiveMath: true });
   }
   record.streamNeedsFinalRender = Boolean(tail);
   record.renderedRaw = raw;
 }
 
-function resetStreamingMessage(record) {
-  clearStreamingTail(record);
+function resetStreamingMessage(record, { preserveRenderedTail = false } = {}) {
+  if (preserveRenderedTail) {
+    record.mathRenderJob = null;
+    for (const node of record.streamTailNodes || []) node.classList.remove("streaming-tail");
+    record.streamTailNodes = [];
+  } else {
+    clearStreamingTail(record);
+  }
   record.streaming = false;
+  record.streamStarted = false;
   record.streamPrefixLength = 0;
   record.streamNeedsFinalRender = false;
 }
 
 function renderCompletedMessage(record, raw) {
-  const needsFullRender = record.renderedRaw !== raw || record.streamNeedsFinalRender;
-  if (needsFullRender) {
-    clearStreamingTail(record);
+  const wasStreaming = record.streaming || record.streamStarted;
+  record.raw = raw;
+  if (wasStreaming) {
+    if (record.renderedRaw !== raw || record.streamNeedsFinalRender) renderStreamingMessage(record);
+    resetStreamingMessage(record, { preserveRenderedTail: true });
+  } else if (record.renderedRaw !== raw) {
     renderMarkdown(record.content, raw);
   }
-  resetStreamingMessage(record);
   record.renderedRaw = raw;
+}
+
+function renderUserMessage(record, input) {
+  const presentation = presentUserInput(Array.isArray(input) ? input : []);
+  record.input = Array.isArray(input) ? input : [];
+  record.raw = presentation.displayText;
+  if (presentation.text) renderMarkdown(record.content, presentation.text, { preserveLineBreaks: true });
+  else record.content.replaceChildren();
+
+  if (presentation.images.length) {
+    const images = document.createElement("div");
+    images.className = "message-images";
+    images.setAttribute("role", "list");
+    for (const image of presentation.images) {
+      if (image.available) {
+        const element = document.createElement("img");
+        element.className = "message-image";
+        element.src = image.src;
+        element.alt = `Attached image ${image.index}`;
+        element.loading = "lazy";
+        element.decoding = "async";
+        element.setAttribute("role", "listitem");
+        images.append(element);
+      } else {
+        const unavailable = document.createElement("span");
+        unavailable.className = "message-image-unavailable";
+        unavailable.textContent = `[Image #${image.index}]`;
+        unavailable.setAttribute("role", "listitem");
+        images.append(unavailable);
+      }
+    }
+    record.content.prepend(images);
+  }
+  record.renderedRaw = record.raw;
 }
 
 function scheduleRender(record) {
@@ -1762,6 +3779,7 @@ function scheduleRender(record) {
       renderMarkdown(record.content, record.raw);
       record.renderedRaw = record.raw;
     }
+    scheduleConversationOutlineRender();
     scrollToBottom();
   }, 80);
   state.renderTimers.set(record.id, timer);
@@ -1788,7 +3806,10 @@ function ensureMessage(id, role, meta = {}) {
       }
     }
     if (role === "assistant" && meta.process === true && !record.process) {
-      const process = ensureProcessDetails(meta.turnId ?? state.activeTurnId ?? record.turnId);
+      const process = ensureProcessDetails(meta.turnId ?? state.activeTurnId ?? record.turnId, chat, {
+        itemId: record.id,
+        sequence: protocolSequenceForItem(record.id),
+      });
       process.body.append(record.article);
       process.itemIds.add(record.id);
       process.items?.set(record.id, { id: record.id, type: "agentMessage", role: "assistant", text: record.raw });
@@ -1803,15 +3824,10 @@ function ensureMessage(id, role, meta = {}) {
   article.className = `message message-${role}`;
   article.dataset.messageId = id;
   article.id = `message-${String(id).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
-  const head = document.createElement("div");
-  head.className = "message-head";
-  const avatar = role === "user" ? document.createElement("span") : null;
-  if (avatar) {
-    avatar.className = "message-avatar";
-    avatar.textContent = "Y";
-  }
-  const label = document.createElement("div");
-  label.className = "message-label";
+  const head = role === "assistant" ? document.createElement("div") : null;
+  if (head) head.className = "message-head";
+  const label = role === "assistant" ? document.createElement("div") : null;
+  if (label) label.className = "message-label";
   const modelInfo = role === "assistant"
     ? resolveModelDisplayName({
         message: meta.item,
@@ -1821,8 +3837,10 @@ function ensureMessage(id, role, meta = {}) {
         modelId: meta.item?.model ?? meta.item?.modelId ?? meta.model,
       })
     : null;
-  label.textContent = role === "user" ? "You" : modelInfo.label;
-  if (modelInfo?.id) label.dataset.modelId = modelInfo.id;
+  if (label) {
+    label.textContent = modelInfo.label;
+    if (modelInfo?.id) label.dataset.modelId = modelInfo.id;
+  }
   const time = role === "user" ? document.createElement("time") : null;
   if (time) {
     time.className = "message-time";
@@ -1840,17 +3858,29 @@ function ensureMessage(id, role, meta = {}) {
   const content = document.createElement("div");
   content.className = "message-content markdown-body";
   copy.addEventListener("click", () => navigator.clipboard.writeText(record?.raw || ""));
-  if (avatar) head.append(avatar);
-  head.append(label);
-  if (time) head.append(time);
-  head.append(copy);
-  article.append(head, content);
+  if (role === "assistant") {
+    head.append(label, copy);
+    article.append(head, content);
+  } else {
+    const metaRow = document.createElement("div");
+    metaRow.className = "message-user-meta";
+    metaRow.append(copy, time);
+    article.append(content, metaRow);
+  }
   const turnId = meta.turnId ?? state.activeTurnId ?? state.currentTurn?.id;
   const process = role === "assistant" && meta.process !== false && (meta.live !== false ? meta.process !== false : meta.process === true)
-    ? ensureProcessDetails(turnId)
+    ? ensureProcessDetails(turnId, chat, {
+      itemId: id,
+      sequence: protocolSequenceForItem(id),
+    })
     : null;
   (process?.body || chat).append(article);
-  renderIcons(head);
+  registerConversationNode(article, {
+    sequence: protocolSequenceForItem(id),
+    key: `item:${id}`,
+    turnId,
+  });
+  renderIcons(role === "assistant" ? head : article.querySelector(".message-user-meta"));
 
   record = {
     id,
@@ -1865,9 +3895,11 @@ function ensureMessage(id, role, meta = {}) {
     modelLabel: modelInfo?.label || "Codex",
     modelResolved: Boolean(modelInfo?.resolved),
     streaming: false,
+    streamStarted: false,
     streamPrefixLength: 0,
     streamNeedsFinalRender: false,
     streamTailNodes: [],
+    mathRenderJob: null,
     process,
     turnId,
   };
@@ -1885,9 +3917,8 @@ function ensureMessage(id, role, meta = {}) {
 function addLocalUserMessage(input) {
   const id = `local-user-${crypto.randomUUID()}`;
   const record = ensureMessage(id, "user");
-  record.raw = Array.isArray(input) ? displayInput(input) : String(input || "");
-  renderMarkdown(record.content, record.raw, { preserveLineBreaks: true });
-  record.renderedRaw = record.raw;
+  const content = Array.isArray(input) ? input : [{ type: "text", text: String(input || "") }];
+  renderUserMessage(record, content);
   renderConversationOutline();
   scrollToBottom(true);
 }
@@ -1903,6 +3934,97 @@ function toolTitle(item) {
     default:
       return item.type || "Tool event";
   }
+}
+
+function activityItemLabel(item) {
+  const type = item?.type || "unknown";
+  if (["collabToolCall", "collabAgentToolCall", "subAgentActivity", "agentStatus"].includes(type)) {
+    return presentAgentActivity(item).label;
+  }
+  if (type === "dynamicToolCall") return item.tool || item.name || "Dynamic tool";
+  if (type === "imageView") return "View image";
+  if (type === "imageGeneration") return "Generate image";
+  if (type === "contextCompaction") return "Context compaction";
+  if (["enteredReviewMode", "exitedReviewMode", "review"].includes(type)) return "Code review";
+  if (["hookPrompt", "sleep"].includes(type)) return type === "sleep" ? "Waiting" : "Hook";
+  if (["reasoning", "thinking"].includes(type)) return "Thinking";
+  return `Unknown App Server item · ${type}`;
+}
+
+function activityItemPreview(item) {
+  if (["reasoning", "thinking"].includes(item?.type)) return "";
+  const reasoningPreview = reasoningText(item, " ");
+  const value = ["collabToolCall", "collabAgentToolCall", "subAgentActivity", "agentStatus"].includes(item?.type)
+    ? agentActivityName(item)
+    : item?.tool || item?.path || item?.url || item?.savedPath || item?.description || item?.result || item?.text || item?.message || reasoningPreview;
+  return typeof value === "string" ? value : toolCopyText(value);
+}
+
+function activityItemBody(item) {
+  const reasoningBody = reasoningText(item);
+  const fields = [
+    ["Type", item?.type],
+    ["Agent", ["collabToolCall", "collabAgentToolCall", "subAgentActivity", "agentStatus"].includes(item?.type) ? agentActivityName(item) : item?.agentName || item?.agent || item?.name],
+    ["Thread", item?.threadId || item?.agentThreadId],
+    ["Status", item?.status || item?.state],
+    ["Kind", item?.kind],
+    ["Agents", item?.agentsStates],
+    ["Input", item?.input || item?.arguments || item?.params],
+    ["Output", item?.output || item?.result || item?.text || item?.message || item?.savedPath || reasoningBody],
+  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
+  return fields.map(([label, value]) => `${label}: ${typeof value === "string" ? value : toolCopyText(value)}`).join("\n\n");
+}
+
+function ensureActivityItem(item, options = {}) {
+  if (!item?.id) return null;
+  let record = state.activityNodes.get(item.id);
+  if (!record) {
+    const process = options.process === true || (options.process !== false && options.live !== false)
+      ? ensureProcessDetails(options.turnId ?? item.turnId ?? state.activeTurnId, chat, {
+        itemId: item.id,
+        sequence: protocolSequenceForItem(item.id),
+      })
+      : null;
+    const shell = createPiToolShell(item, "activity", options.container || process?.body || chat);
+    record = { kind: "activity", ...shell, item, process, body: shell.body };
+    record.copyButton = createPiToolCopyButton(() => activityItemBody(record.item));
+    shell.onToggle = (_shell, open) => {
+      record.open = open;
+      record.body.hidden = !open;
+      if (open) patchActivityItem(record, record.item);
+    };
+    state.activityNodes.set(item.id, record);
+    registerConversationNode(record.details, {
+      sequence: protocolSequenceForItem(item.id),
+      key: `item:${item.id}`,
+      turnId: options.turnId ?? item.turnId ?? state.activeTurnId,
+    });
+    if (process) registerProcessItem(item, process);
+  }
+  patchActivityItem(record, item);
+  return record;
+}
+
+function patchActivityItem(record, item) {
+  if (!record) return;
+  record.item = item;
+  const status = normalizeToolStatus(item?.status || item?.state || item?.result || item?.kind);
+  const waiting = status.kind === "waiting";
+  record.details.dataset.status = waiting ? "running" : status.kind;
+  record.type.textContent = activityItemLabel(item);
+  const preview = activityItemPreview(item);
+  record.preview.textContent = preview;
+  record.preview.title = preview;
+  record.status.textContent = "";
+  record.status.dataset.kind = waiting ? "waiting" : status.kind;
+  record.status.setAttribute("aria-label", waiting ? "Waiting" : status.label);
+  record.duration.textContent = toolDurationLabel(item?.durationMs);
+  record.body.replaceChildren();
+  const body = document.createElement("pre");
+  body.className = "process-activity-body";
+  body.textContent = activityItemBody(item);
+  record.body.append(body, record.copyButton);
+  updateProcessSummary(record.process);
 }
 
 function searchQuery(item) {
@@ -1946,9 +4068,13 @@ function toolCopySection(label, value) {
 function commandCopyText(record) {
   const item = record?.item || {};
   const model = record?.presentation || presentCommand(item);
+  const terminalInput = Array.isArray(item.terminalInteractions)
+    ? item.terminalInteractions.map((entry) => entry?.stdin || "").filter(Boolean).join("\n")
+    : "";
   const sections = [
     toolCopySection("Command", item.command ?? item.commandLine ?? item.rawCommand ?? model.rawCommand),
     toolCopySection("Output", item.aggregatedOutput),
+    toolCopySection("Terminal input", terminalInput),
     toolCopySection("stdout", item.stdout),
     toolCopySection("stderr", item.stderr),
     toolCopySection("Error", item.errorMessage ?? item.error),
@@ -2024,7 +4150,10 @@ function updateSearchStep(item, options = {}) {
   let record = state.searchNodes.get(item.id);
   if (!record) {
     const process = options.process === true || options.live !== false
-      ? ensureProcessDetails(options.turnId || item.turnId || state.activeTurnId)
+      ? ensureProcessDetails(options.turnId || item.turnId || state.activeTurnId, chat, {
+        itemId: item.id,
+        sequence: protocolSequenceForItem(item.id),
+      })
       : null;
     const target = options.container || process?.body || chat;
     const shell = createPiToolShell(item, "search", target);
@@ -2043,6 +4172,11 @@ function updateSearchStep(item, options = {}) {
     record.copyButton = createPiToolCopyButton(() => searchCopyText(record));
     shell.onToggle = () => renderSearchDetails(record);
     state.searchNodes.set(item.id, record);
+    registerConversationNode(record.details, {
+      sequence: protocolSequenceForItem(item.id),
+      key: `item:${item.id}`,
+      turnId: options.turnId || item.turnId || state.activeTurnId,
+    });
     if (process) registerProcessItem(item, process);
   }
   record.item = item;
@@ -2131,10 +4265,11 @@ function ensureCommandDurationTimer() {
 function rememberToolStart(item, record) {
   const status = normalizeToolStatus(item?.status);
   if (status.isActive) {
-    if (!state.commandObservedStartMs.has(item.id)) state.commandObservedStartMs.set(item.id, Date.now());
+    const startedAt = timestampToMs(item?.startedAtMs ?? item?.startedAt);
+    if (!state.commandObservedStartMs.has(item.id)) state.commandObservedStartMs.set(item.id, startedAt ?? Date.now());
     ensureCommandDurationTimer();
   } else if (state.commandObservedStartMs.has(item.id)) {
-    record.finishedAtMs ||= Date.now();
+    record.finishedAtMs ||= timestampToMs(item?.completedAtMs ?? item?.completedAt) ?? Date.now();
     if (!(item.durationMs !== null && item.durationMs !== undefined && item.durationMs !== "" && Number.isFinite(Number(item.durationMs)))) record.observedDurationMs = toolDurationMs(item, record);
   }
 }
@@ -2306,7 +4441,14 @@ function createCommandStep(item, container = chat) {
     fullOutput,
     item,
     presentation: null,
+    linkedFilePath: null,
   };
+  summaryText.addEventListener("click", (event) => {
+    if (!record.linkedFilePath) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openFileInPanel(record.linkedFilePath);
+  });
   record.copyButton = createPiToolCopyButton(() => commandCopyText(record));
   body.append(record.copyButton);
   shell.onToggle = (ignoredShell, open) => {
@@ -2341,15 +4483,20 @@ function patchCommandStep(record, item) {
   record.details.classList.toggle("command-step-failed", model.normalizedStatus.isFailure);
   record.summaryText.textContent = model.inputPreview || model.rawCommand || "";
   record.summaryText.title = model.rawCommand || model.inputPreview || "Tool input";
+  record.linkedFilePath = model.category === "read"
+    ? resolveFileLink(model.inputPreview || "")
+    : null;
+  record.summaryText.classList.toggle("file-path-link", Boolean(record.linkedFilePath));
   const displayToolName = item.type === "commandExecution"
-    ? model.toolName
+    ? (model.explorationEligible ? "Explored" : model.toolName)
     : item.toolName || model.toolName || (item.type === "read" ? "read" : item.type === "webSearch" ? "web_search" : "bash");
   record.environment.textContent = displayToolName;
   record.status.textContent = "";
   record.status.setAttribute("aria-label", model.normalizedStatus.label);
   record.status.dataset.label = model.normalizedStatus.label;
   record.status.dataset.kind = model.normalizedStatus.kind;
-  record.statusDetail.textContent = `Status: ${model.normalizedStatus.label}`;
+  const interactionCount = Array.isArray(item.terminalInteractions) ? item.terminalInteractions.length : 0;
+  record.statusDetail.textContent = `Status: ${model.normalizedStatus.label}${model.actionSummary ? ` · ${model.actionSummary}` : ""}${interactionCount ? ` · ${interactionCount} terminal input${interactionCount === 1 ? "" : "s"}` : ""}`;
   record.duration.textContent = toolDurationLabel(durationMs);
   record.cwd.textContent = item.cwd ? `cwd: ${item.cwd}` : "";
   record.cwd.title = item.cwd || "Working directory unavailable";
@@ -2439,6 +4586,7 @@ function patchMcpStep(record, item) {
     value.textContent = field.text;
     record.body.append(label, value);
   }
+  if (item.progress) appendCommandField(record.body, "Progress", item.progress, "mcp-step-field");
   record.body.append(record.copyButton);
   updateProcessSummary(record.process);
 }
@@ -2446,21 +4594,57 @@ function patchMcpStep(record, item) {
 function registerConversationTool(record, options = {}) {
   if (options.live === false || record.orderEntry) return;
   const previous = state.conversationOrder.at(-1);
+  const protocolSequence = protocolSequenceForItem(record.item?.id);
   record.orderEntry = {
     kind: "tool",
     record,
     turnId: options.turnId ?? state.activeTurnId ?? record.item?.turnId ?? null,
     previousItemId: previous?.record?.item?.id || previous?.id || null,
     sequence: state.toolCacheSequence++,
+    protocolSequence,
   };
   state.conversationOrder.push(record.orderEntry);
+  if (record.process?.details) {
+    registerConversationNode(record.process.details, {
+      sequence: protocolSequence,
+      key: `process:${record.process.key}`,
+      turnId: record.orderEntry.turnId,
+    });
+  }
+}
+
+function attachExplorationGroup(record) {
+  if (!record?.process || record.kind !== "command" || !record.presentation?.explorationEligible) return;
+  const details = record.details;
+  details.classList.add("exploration-command");
+  if (details.parentElement?.classList.contains("exploration-group")) return;
+  const previous = details.previousElementSibling;
+  if (previous?.classList.contains("exploration-group")) {
+    previous.append(details);
+    return;
+  }
+  if (!previous?.classList.contains("exploration-command")) return;
+  if (previous.parentElement?.classList.contains("exploration-group")) {
+    previous.parentElement.append(details);
+    return;
+  }
+  const group = document.createElement("section");
+  group.className = "exploration-group";
+  const heading = document.createElement("div");
+  heading.className = "exploration-group-heading";
+  heading.textContent = "Explored";
+  previous.replaceWith(group);
+  group.append(heading, previous, details);
 }
 
 function ensureTool(item, options = {}) {
   let record = state.toolNodes.get(item.id);
   if (record) return record;
   const process = options.process === true || (options.process !== false && options.live !== false)
-    ? ensureProcessDetails(options.turnId ?? item.turnId ?? state.activeTurnId)
+    ? ensureProcessDetails(options.turnId ?? item.turnId ?? state.activeTurnId, chat, {
+      itemId: item.id,
+      sequence: protocolSequenceForItem(item.id),
+    })
     : null;
   const targetContainer = options.container || process?.body || chat;
   if (item.type === "fileChange") {
@@ -2478,6 +4662,11 @@ function ensureTool(item, options = {}) {
     record.body.hidden = !expanded;
     record.summary.setAttribute("aria-expanded", String(expanded));
     state.toolNodes.set(item.id, record);
+    registerConversationNode(record.details, {
+      sequence: protocolSequenceForItem(item.id),
+      key: `item:${item.id}`,
+      turnId: options.turnId ?? item.turnId ?? state.activeTurnId,
+    });
     if (process) registerProcessItem(item, process);
     registerConversationTool(record, options);
     renderToolFileChange(record, item);
@@ -2487,6 +4676,11 @@ function ensureTool(item, options = {}) {
   else record = createCommandStep(item, targetContainer);
   record.process = process;
   state.toolNodes.set(item.id, record);
+  registerConversationNode(record.details, {
+    sequence: protocolSequenceForItem(item.id),
+    key: `item:${item.id}`,
+    turnId: options.turnId ?? item.turnId ?? state.activeTurnId,
+  });
   if (process) registerProcessItem(item, process);
   registerConversationTool(record, options);
   return record;
@@ -2588,6 +4782,21 @@ function renderToolFileChange(record, item) {
     relative.textContent = path.relative === path.name ? "" : path.relative;
     relative.title = path.full;
     titleWrap.append(name, relative);
+    const linkedPath = resolveFileLink(path.full || path.relative);
+    if (linkedPath) {
+      titleWrap.classList.add("file-path-link");
+      titleWrap.setAttribute("role", "button");
+      titleWrap.setAttribute("tabindex", "0");
+      const openChangedFile = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openFileInPanel(linkedPath);
+      };
+      titleWrap.addEventListener("click", openChangedFile);
+      titleWrap.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") openChangedFile(event);
+      });
+    }
     const stats = document.createElement("span");
     stats.className = "tool-file-stats";
     stats.textContent = `+${file.additions} / -${file.deletions}`;
@@ -2637,6 +4846,7 @@ function updateTool(item, options = {}) {
   if (item.type === "commandExecution") {
     state.commandItems.set(item.id, item);
     patchCommandStep(record, item);
+    attachExplorationGroup(record);
     cacheToolItem(item, record, { ...options, turnId: options.turnId ?? record.orderEntry?.turnId });
     if (state.activeView === "commands") renderCommandsView();
   } else if (item.type === "fileChange") {
@@ -2843,10 +5053,15 @@ function planStepMarker(status) {
   return "?";
 }
 
-function renderPlanCard(snapshot, { text = "", key = null, live = true } = {}) {
+function renderPlanCard(snapshot, { text = "", key = null, live = true, itemId = null, sequence = null } = {}) {
   const resolvedKey = key || planSnapshotKey(snapshot?.threadId || state.threadId, snapshot?.turnId || state.activeTurnId);
+  const planTurnId = snapshot?.turnId || state.activeTurnId || null;
+  const resolvedSequence = sequence ?? protocolSequenceForPlan(resolvedKey) ?? protocolSequenceForItem(itemId);
   let record = state.planNodes.get(resolvedKey);
   if (!record) {
+    // Close the current process segment before placing a plan. Items that
+    // arrive after this update then receive a fresh segment after the card.
+    if (!splitProcessAtSequence(planTurnId, resolvedSequence)) advanceProcessSegment(planTurnId);
     const card = document.createElement("section");
     card.className = "plan-card";
     card.dataset.planKey = resolvedKey;
@@ -2878,11 +5093,40 @@ function renderPlanCard(snapshot, { text = "", key = null, live = true } = {}) {
     implement.addEventListener("click", () => implementPlan(resolvedKey));
     actions.append(implement);
     card.append(head, explanation, body, actions);
+    $("#chatEmptyState")?.remove();
     chat.append(card);
     renderIcons(card);
-    record = { card, turn, explanation, body, actions, implement, text: "", key: resolvedKey, live };
+    record = {
+      card,
+      turn,
+      explanation,
+      body,
+      actions,
+      implement,
+      text: "",
+      key: resolvedKey,
+      live,
+      turnId: planTurnId,
+      orderSequence: resolvedSequence,
+      processBoundaryApplied: true,
+    };
     state.planNodes.set(resolvedKey, record);
-    state.conversationOrder.push({ kind: "barrier", turnId: snapshot?.turnId || state.activeTurnId, planKey: resolvedKey });
+    state.conversationOrder.push({ kind: "barrier", turnId: planTurnId, planKey: resolvedKey });
+    registerConversationNode(card, {
+      sequence: record.orderSequence,
+      key: `plan:${resolvedKey}`,
+      turnId: planTurnId,
+    });
+  } else if (optionalConversationSequence(resolvedSequence) !== null && !record.processBoundaryApplied) {
+    splitProcessAtSequence(record.turnId || planTurnId, resolvedSequence);
+    record.processBoundaryApplied = true;
+  }
+  if (record.card.parentElement === chat) {
+    registerConversationNode(record.card, {
+      sequence: resolvedSequence,
+      key: `plan:${resolvedKey}`,
+      turnId: record.turnId || planTurnId,
+    });
   }
 
   if (live) state.latestPlanKey = resolvedKey;
@@ -2929,6 +5173,11 @@ function renderPlanCard(snapshot, { text = "", key = null, live = true } = {}) {
 }
 
 function upsertPlanSnapshot(params) {
+  state.protocolState = reduceProtocolState(state.protocolState, {
+    method: "turn/plan/updated",
+    params,
+  });
+  saveProtocolState();
   const snapshot = normalizePlanSnapshot(params, {
     threadId: state.threadId,
     turnId: state.activeTurnId,
@@ -2993,6 +5242,7 @@ function renderApprovalQueue() {
 
   current?.remove();
   const { id, method, params = {} } = request;
+  const requestThreadId = request.threadId || params.threadId || state.threadId;
   const card = document.createElement("section");
   card.className = "approval-card";
   card.dataset.requestId = String(id);
@@ -3025,7 +5275,9 @@ function renderApprovalQueue() {
     button.textContent = label;
     if (decision === "decline") button.className = "secondary";
     button.addEventListener("click", () => {
-      if (!send({ type: "approval", requestId: id, decision })) return;
+      if (!requireWritable("approve a tool request")) return;
+      if (!send({ type: "approval", threadId: requestThreadId, requestId: id, decision })) return;
+      state.pendingServerRequests.delete(String(id));
       removeApproval(id);
     });
     actions.append(button);
@@ -3038,13 +5290,18 @@ function renderApprovalQueue() {
 function removeApproval(requestId) {
   state.approvals = removeQueuedApproval(state.approvals, requestId);
   renderApprovalQueue();
+  if (state.running) syncActivityFromProtocol();
 }
 
 function clearUserInputRequest() {
+  if (state.userInputRequest?.requestId !== undefined) {
+    state.pendingServerRequests.delete(String(state.userInputRequest.requestId));
+  }
   state.userInputRequest = resetUserInputRequest(state.userInputRequest);
   approvalArea.querySelector(".user-input-card")?.remove();
   approvalArea.classList.remove("has-user-input");
   renderApprovalQueue();
+  if (state.running) syncActivityFromProtocol();
 }
 
 function currentUserInputQuestion(request) {
@@ -3259,19 +5516,19 @@ function renderUserInputCard() {
 function openUserInputRequest(message) {
   const questions = normalizeUserInputQuestions(message.params?.questions);
   if (!questions.length) {
-    if (send({ type: "serverRequestResponse", requestId: message.id, result: { answers: {} } })) {
+    if (send({ type: "serverRequestResponse", threadId: message.params?.threadId || state.threadId, requestId: message.id, result: { answers: {} } })) {
+      state.pendingServerRequests.delete(String(message.id));
       addSystemMessage("Questions 0/0 answered.");
     }
     return;
   }
   clearUserInputRequest();
-  const wasRunning = state.running;
   if (isNotificationForThread(message.params, state.threadId)) {
     state.activeTurnId = message.params?.turnId || state.activeTurnId;
   }
   state.running = true;
   state.threadStatus = "active";
-  if (!wasRunning) setTurnActivityWorking();
+  setTurnActivityWorking(null, "Waiting for your input");
   state.userInputRequest = {
     requestId: message.id,
     threadId: message.params?.threadId || state.threadId,
@@ -3287,9 +5544,10 @@ function openUserInputRequest(message) {
 function submitUserInputRequest() {
   const request = state.userInputRequest;
   if (!request) return;
+  if (!requireWritable("answer tool questions")) return;
   const result = buildUserInputResult(request.questions, request.answers);
   if (!result) return;
-  if (!send({ type: "serverRequestResponse", requestId: request.requestId, result })) return;
+  if (!send({ type: "serverRequestResponse", threadId: request.threadId || state.threadId, requestId: request.requestId, result })) return;
   const total = request.questions.length;
   clearUserInputRequest();
   addSystemMessage(`Questions ${total}/${total} answered.`);
@@ -3298,6 +5556,7 @@ function submitUserInputRequest() {
 
 function addApproval(message) {
   state.approvals = enqueueApproval(state.approvals, message);
+  if (state.running || state.activeTurnId) setTurnActivityWorking(null, "Approval required");
   renderApprovalQueue();
 }
 
@@ -3313,10 +5572,13 @@ function renderHistoricalBlock(block) {
       process: block.role === "assistant" && !state.historicalProcessAnswerIds.has(item.id),
       turnId: block.turnId,
     });
-    record.raw = block.role === "user" ? displayInput(item.content || []) : item.text || "";
     resetStreamingMessage(record);
-    renderMarkdown(record.content, record.raw, { preserveLineBreaks: block.role === "user" });
-    record.renderedRaw = record.raw;
+    if (block.role === "user") renderUserMessage(record, item.content || []);
+    else {
+      record.raw = item.text || "";
+      renderMarkdown(record.content, record.raw);
+      record.renderedRaw = record.raw;
+    }
     return;
   }
   if (block.type === "command") {
@@ -3325,10 +5587,14 @@ function renderHistoricalBlock(block) {
     updateSearchStep(block.item, { live: false, process: true, turnId: block.turnId });
   } else if (block.type === "fileChange" || block.type === "mcpTool") {
     updateTool(block.item, { live: false, process: true, turnId: block.turnId });
+  } else if (["dynamicTool", "agent", "imageView", "compaction", "review", "reasoning", "unknown"].includes(block.type)) {
+    ensureActivityItem(block.item, { live: false, process: true, turnId: block.turnId });
   } else if (block.type === "error") {
     addProcessError(block.item, block.turnId);
   } else if (block.type === "plan") {
     const item = block.item || {};
+    const key = planSnapshotKey(state.threadId, block.turnId || item.turnId || item.id);
+    const storedSnapshot = state.planSnapshots.get(key);
     const snapshot = {
       threadId: state.threadId,
       turnId: block.turnId,
@@ -3336,17 +5602,190 @@ function renderHistoricalBlock(block) {
       steps: [],
     };
     renderPlanCard(snapshot, {
-      key: planSnapshotKey(state.threadId, block.turnId || item.id),
+      key,
       text: item.planText || item.text || "",
       live: false,
+      itemId: item.id,
     });
+    if (storedSnapshot) {
+      renderPlanCard(storedSnapshot, {
+        key,
+        text: item.planText || item.text || "",
+        live: false,
+        itemId: item.id,
+      });
+    }
   } else if (block.type === "status") {
     const text = block.item.text || block.item.message;
     if (text) addSystemMessage(text);
   }
 }
 
+function protocolEventNode(entry) {
+  if (!entry) return null;
+  if (entry.kind === "plan" && entry.planKey) return state.planNodes.get(entry.planKey)?.card || null;
+  if (!entry.itemId) return null;
+  const record = state.toolNodes.get(entry.itemId) || state.activityNodes.get(entry.itemId);
+  if (record?.details) return record.process?.details || record.details;
+  const message = state.messageNodes.get(entry.itemId);
+  return message?.process?.details || message?.article || null;
+}
+
+function restoreProtocolEventOrder() {
+  const entries = [...(state.protocolState?.orderedEvents || [])]
+    .filter((entry) => optionalConversationSequence(entry.sequence) !== null)
+    .sort((left, right) => optionalConversationSequence(left.sequence) - optionalConversationSequence(right.sequence));
+  for (const entry of entries) {
+    const node = protocolEventNode(entry);
+    if (!node) continue;
+    const historyKey = entry.kind === "plan"
+      ? `plan:${entry.planKey || ""}`
+      : `item:${entry.itemId || ""}`;
+    const sequence = Number(state.historyOrderRanks.get(historyKey));
+    registerConversationNode(node, {
+      sequence: Number.isFinite(sequence) ? sequence : entry.sequence,
+      key: entry.key,
+      turnId: entry.turnId || entry.snapshot?.turnId || null,
+    });
+  }
+}
+
+function buildHistoricalWork(turns) {
+  const blocks = buildConversationBlocks(turns, { cwd: currentCwd() });
+  const representedPlanKeys = new Set(blocks
+    .filter((block) => block.type === "plan")
+    .map((block) => planSnapshotKey(state.threadId, block.turnId || block.item?.turnId || block.item?.id)));
+  const pendingPlans = [...state.planSnapshots]
+    .filter(([key]) => !representedPlanKeys.has(key))
+    .map(([key, snapshot]) => ({ key, snapshot, sequence: protocolSequenceForPlan(key) }))
+    .sort((left, right) => {
+      const leftSequence = optionalConversationSequence(left.sequence) ?? Number.POSITIVE_INFINITY;
+      const rightSequence = optionalConversationSequence(right.sequence) ?? Number.POSITIVE_INFINITY;
+      return leftSequence - rightSequence;
+    });
+  const work = [];
+  let planIndex = 0;
+  for (const block of blocks) {
+    const blockSequence = protocolSequenceForItem(block.item?.id);
+    while (planIndex < pendingPlans.length) {
+      const plan = pendingPlans[planIndex];
+      const planSequence = optionalConversationSequence(plan.sequence);
+      const nextBlockSequence = optionalConversationSequence(blockSequence);
+      if (planSequence === null || (nextBlockSequence !== null && planSequence >= nextBlockSequence)) break;
+      work.push({ type: "plan", plan });
+      planIndex += 1;
+    }
+    work.push({ type: "block", block });
+  }
+  for (; planIndex < pendingPlans.length; planIndex += 1) {
+    const plan = pendingPlans[planIndex];
+    work.push({ type: "plan", plan });
+  }
+  return work;
+}
+
+function renderHistoricalWorkItem(entry) {
+  if (entry?.type === "plan") {
+    renderPlanCard(entry.plan.snapshot, {
+      key: entry.plan.key,
+      live: false,
+      sequence: entry.plan.sequence,
+    });
+  } else if (entry?.type === "block") {
+    renderHistoricalBlock(entry.block);
+  }
+}
+
+function renderHistoricalConversation(turns) {
+  for (const entry of buildHistoricalWork(turns)) renderHistoricalWorkItem(entry);
+}
+
+const HISTORY_SCROLL_DELTA_EPSILON = 0.5;
+
+function hasMeaningfulHistoryScrollDelta(currentTop, baselineTop) {
+  const current = Number(currentTop);
+  const baseline = Number(baselineTop);
+  return Number.isFinite(current)
+    && Number.isFinite(baseline)
+    && Math.abs(current - baseline) > HISTORY_SCROLL_DELTA_EPSILON;
+}
+
+function noteHistoryRestoreScroll() {
+  if (!state.historyRestoring && !state.historyLatestScrollPending) return;
+  if (state.historyRestoreScrollInterrupted) return;
+  if (!hasMeaningfulHistoryScrollDelta(chat.scrollTop, state.historyRestoreScrollBaseline)) return;
+  state.historyRestoreScrollInterrupted = true;
+  state.historyLatestScrollPending = false;
+}
+
+function jumpToLatest() {
+  const historyPending = state.historyRestoring || state.historyLatestScrollPending;
+  if (historyPending) {
+    state.historyRestoreScrollInterrupted = false;
+    state.historyLatestScrollPending = true;
+  }
+  scrollToBottom(true);
+  if (historyPending) state.historyRestoreScrollBaseline = chat.scrollTop;
+}
+
+function cancelHistoryRestore() {
+  state.historyRestoreGeneration += 1;
+  state.historyRestoreJob?.cancel?.();
+  state.historyRestoreJob = null;
+  state.historyRestoring = false;
+  state.historyLatestScrollPending = false;
+  state.historyRestoreScrollBaseline = null;
+  state.historyRestoreScrollInterrupted = false;
+  state.conversationReconcilePending = false;
+  if (state.historyObserverReleaseTimer !== null) {
+    clearTimeout(state.historyObserverReleaseTimer);
+    state.historyObserverReleaseTimer = null;
+  }
+  state.historyObserverMuted = false;
+  delete chat.dataset.historyProgress;
+}
+
+function finishHistoryRestore(thread, generation) {
+  if (generation !== state.historyRestoreGeneration) return;
+  state.historyRestoreJob = null;
+  state.historyObserverMuted = true;
+  restoreProtocolEventOrder();
+  if (state.activeView === "changes") renderChangesView();
+  if (state.activeView === "commands") renderCommandsView();
+  renderConversationOutline();
+  state.historyRestoring = false;
+  state.conversationReconcilePending = false;
+  reconcileConversationNodes();
+  updateControls();
+  state.historyLatestScrollPending = !state.historyRestoreScrollInterrupted;
+  requestAnimationFrame(() => {
+    if (generation !== state.historyRestoreGeneration) return;
+    if (!state.historyLatestScrollPending || state.historyRestoreScrollInterrupted) {
+      messageInput.focus();
+      return;
+    }
+    // A resumed thread opens at its newest message. Persisted scroll positions
+    // are intentionally not used as the initial viewport for an old session.
+    // Keep the pending flag when the conversation view is hidden so switching
+    // back to it can apply the bottom position after layout.
+    if (state.activeView === "conversation" && chat.clientHeight > 0) {
+      scrollToBottom(true);
+      state.historyLatestScrollPending = false;
+    }
+    messageInput.focus();
+  });
+  state.historyObserverReleaseTimer = setTimeout(() => {
+    state.historyObserverReleaseTimer = null;
+    state.historyObserverMuted = false;
+    state.conversationReconcilePending = false;
+  }, 0);
+}
+
 function restoreHistory(thread) {
+  cancelHistoryRestore();
+  const generation = state.historyRestoreGeneration;
+  state.historyRestoreScrollBaseline = chat.scrollTop;
+  state.historyRestoreScrollInterrupted = false;
   const cachedEntries = readThreadToolCache(thread?.id);
   state.toolCacheItems.clear();
   state.toolCacheSequence = 0;
@@ -3359,6 +5798,7 @@ function restoreHistory(thread) {
   state.latestUserInput = state.threadView.latestTurn?.items?.find((item) => item.role === "user")?.text || "";
   syncTurnActivityFromThread(thread);
   state.toolNodes.clear();
+  state.activityNodes.clear();
   state.processNodes.clear();
   state.historicalProcessAnswerIds.clear();
   state.searchNodes.clear();
@@ -3366,25 +5806,47 @@ function restoreHistory(thread) {
   state.planNodes.clear();
   state.planDeltaBuffers.clear();
   state.latestPlanKey = null;
+  state.processEpochs.clear();
+  state.conversationNodeMeta.clear();
+  state.conversationNodeOrdinal = 0;
+  state.conversationFallbackAnchor = null;
+  state.conversationFallbackIndex = 0;
+  state.historyOrderRanks.clear();
+  state.protocolState = readProtocolState(thread?.id);
   state.commandItems.clear();
   state.changeItems.clear();
   state.commandObservedStartMs.clear();
   state.conversationOrder = [];
+  for (const item of state.threadView.items || []) {
+    state.protocolState = reduceProtocolState(state.protocolState, {
+      method: "item/completed",
+      params: { item, threadId: state.threadId, turnId: item.turnId },
+    });
+  }
+  rebuildHistoryOrderRanks();
+  for (const [key, snapshot] of state.protocolState.plans || []) {
+    state.planSnapshots.set(key, snapshot);
+  }
   state.historicalProcessAnswerIds = new Set(buildProcessDetailsForTurns(restoredThread?.turns)
     .map((group) => group.answer?.id)
     .filter(Boolean));
-  for (const block of buildConversationBlocks(restoredThread?.turns, { cwd: currentCwd() })) renderHistoricalBlock(block);
-  if (state.activeView === "changes") renderChangesView();
-  if (state.activeView === "commands") renderCommandsView();
-  renderConversationOutline();
-  requestAnimationFrame(() => {
-    const saved = Number(state.threadUi?.scrollTop || sessionStorage.getItem(`codexScroll:${thread?.id}`));
-    if (Number.isFinite(saved) && saved > 0) {
-      chat.scrollTop = saved;
-      state.followOutput = shouldFollowScroll(chat);
-    } else {
-      scrollToBottom(true);
+  const work = buildHistoricalWork(restoredThread?.turns);
+  state.historyRestoring = true;
+  state.conversationReconcilePending = false;
+  updateControls();
+  state.historyRestoreJob = scheduleTimeSliced(work, renderHistoricalWorkItem, {
+    budgetMs: 8,
+    onProgress: ({ completed, total }) => {
+      chat.dataset.historyProgress = `${completed}/${total}`;
+    },
+  });
+  state.historyRestoreJob.promise.then((result) => {
+    if (result.cancelled || generation !== state.historyRestoreGeneration) return;
+    for (const [key, snapshot] of state.planSnapshots) {
+      if (!state.planNodes.has(key)) renderPlanCard(snapshot, { key, live: false });
     }
+    delete chat.dataset.historyProgress;
+    finishHistoryRestore(thread, generation);
   });
 }
 
@@ -3417,28 +5879,116 @@ function mergeThreadSettings(settings) {
 function handleCodex(message) {
   const method = message.method;
   const params = message.params || {};
+  const eventThreadId = runtimeThreadIdFromNotification(message);
+
+  // Keep background Thread state even when its transcript is not mounted.
+  // Only the selected Thread is allowed to mutate the live DOM renderer.
+  if (eventThreadId && eventThreadId !== state.threadId) {
+    if (message.id !== undefined && message.method !== undefined) rememberPendingRuntimeRequest(message, eventThreadId);
+    else rememberRuntimeNotification(message);
+    return;
+  }
 
   if (message.id !== undefined) {
+    if (!isNotificationForThread(params, state.threadId)) return;
+    if (isSnapshotMode()) {
+      addSystemMessage("A live tool request was ignored because this thread is a read-only snapshot.", "warning");
+      return;
+    }
+    state.pendingServerRequests.set(String(message.id), {
+      method,
+      threadId: params.threadId || state.threadId,
+      turnId: params.turnId || state.activeTurnId,
+      message,
+    });
+    syncRuntimeFromCurrentState();
     if (method === "item/tool/requestUserInput") {
       openUserInputRequest(message);
+      syncRuntimeFromCurrentState();
       return;
     }
     if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
       addApproval(message);
+      syncRuntimeFromCurrentState();
       return;
     }
     addSystemMessage(`Unsupported App Server request declined: ${method}`, "warning");
-    send({ type: "approval", requestId: message.id, decision: "decline" });
+    send({ type: "approval", threadId: params.threadId || state.threadId, requestId: message.id, decision: "decline" });
     return;
   }
 
   // Ultra can run child turns on separate threads. Their lifecycle must not
   // overwrite the active turn state shown for the selected thread.
   if (!isNotificationForThread(params, state.threadId)) return;
+  if (isSnapshotMode() && !shouldProcessSnapshotNotification(method)) return;
+  const protocolItem = applyProtocolNotification(message);
+  saveProtocolState();
 
   switch (method) {
+    case "thread/name/updated":
+      if (params.threadId === state.threadId) {
+        const name = params.threadName ?? "";
+        state.threadMeta = { ...state.threadMeta, name };
+        updateCurrentThreadListMetadata({ name });
+        updateControls();
+      }
+      break;
+
+    case "thread/goal/updated":
+      if (params.threadId === state.threadId) {
+        state.threadMeta = { ...state.threadMeta, goal: params.goal || null };
+        updateControls();
+      }
+      break;
+
+    case "thread/goal/cleared":
+      if (params.threadId === state.threadId) {
+        state.threadMeta = { ...state.threadMeta, goal: null };
+        updateControls();
+      }
+      break;
+
+    case "thread/environment/connected":
+    case "thread/environment/disconnected":
+      if (params.threadId === state.threadId) {
+        state.threadMeta = {
+          ...state.threadMeta,
+          environmentId: params.environmentId || null,
+          environmentStatus: method.endsWith("connected") ? "connected" : "disconnected",
+        };
+        updateControls();
+      }
+      break;
+
+    case "thread/archived":
+      if (params.threadId === state.threadId) {
+        clearQueuedMessages();
+        setThreadLifecycle("archived", { archived: true, closed: false });
+        addSystemMessage("Thread archived by Codex.", "warning");
+      }
+      break;
+
+    case "thread/unarchived":
+      if (params.threadId === state.threadId) {
+        setThreadLifecycle("idle", { archived: false, closed: false });
+        addSystemMessage("Thread unarchived.");
+      }
+      break;
+
+    case "thread/closed":
+      if (params.threadId === state.threadId) {
+        clearQueuedMessages();
+        setThreadLifecycle("closed", { closed: true });
+        addSystemMessage("Thread closed by Codex.", "warning");
+      }
+      break;
+
     case "thread/status/changed":
       if (!params.threadId || params.threadId === state.threadId) {
+        if (state.threadMeta.closed || state.threadMeta.archived) {
+          updateControls();
+          break;
+        }
         const value = params.status;
         state.threadStatus = normalizeThreadStatus(value);
         state.running = state.threadStatus === "active"
@@ -3475,9 +6025,20 @@ function handleCodex(message) {
 
     case "thread/settings/updated":
       if (!params.threadId || params.threadId === state.threadId) {
-        mergeThreadSettings(params.threadSettings || params.settings || params);
+        const threadSettings = params.threadSettings || params.settings || params;
+        if (!settingsResponseIsCurrent(params.threadId || state.threadId, threadSettings)) break;
+        mergeThreadSettings(threadSettings);
         addSystemMessage("Thread settings synchronized.");
       }
+      break;
+
+    case "account/updated":
+      state.account = params.account || params;
+      updateControls();
+      break;
+
+    case "account/rateLimits/updated":
+      state.accountRateLimits = params.rateLimits || params;
       break;
 
     case "thread/deleted":
@@ -3485,6 +6046,7 @@ function handleCodex(message) {
       break;
 
     case "mcpServerStatus/updated":
+    case "mcpServer/startupStatus/updated":
       if (params.name) {
         state.mcpStartupStatuses[params.name] = {
           status: params.status,
@@ -3519,6 +6081,7 @@ function handleCodex(message) {
       break;
 
     case "turn/started":
+      if (isSnapshotMode()) break;
       state.running = true;
       state.threadStatus = "active";
       state.activeTurnId = params.turn?.id || state.activeTurnId;
@@ -3530,6 +6093,7 @@ function handleCodex(message) {
       break;
 
     case "turn/completed": {
+      if (isSnapshotMode()) break;
       clearUserInputRequest();
       const completedTurn = {
         ...(state.currentTurn || {}),
@@ -3557,10 +6121,20 @@ function handleCodex(message) {
     }
 
     case "item/started": {
-      const item = params.item;
-      if (item && ["commandExecution", "fileChange", "mcpToolCall"].includes(item.type)) updateTool(item);
-      if (item?.type === "webSearch") updateSearchStep(item, { active: true });
-      startSearchActivity(item);
+      const item = protocolItem || params.item;
+      const displayItem = item && item.id ? item : item ? {
+        ...item,
+        id: params.itemId || `event-${state.protocolState.sequence}`,
+      } : item;
+      if (displayItem && ["commandExecution", "fileChange", "mcpToolCall"].includes(displayItem.type)) updateTool(displayItem);
+      if (displayItem?.type === "webSearch") updateSearchStep(displayItem, { active: true });
+      if (displayItem && ["dynamicToolCall", "collabToolCall", "collabAgentToolCall", "subAgentActivity", "agentStatus", "imageView", "imageGeneration", "contextCompaction", "enteredReviewMode", "exitedReviewMode", "review", "hookPrompt", "sleep", "reasoning", "thinking"].includes(displayItem.type)) {
+        ensureActivityItem(displayItem);
+      } else if (displayItem && !["commandExecution", "fileChange", "mcpToolCall", "webSearch", "userMessage", "agentMessage", "plan", "reasoning", "thinking"].includes(displayItem.type)) {
+        ensureActivityItem(displayItem);
+      }
+      startSearchActivity(displayItem);
+      syncActivityFromProtocol();
       break;
     }
 
@@ -3575,36 +6149,81 @@ function handleCodex(message) {
         model: params.model || state.currentTurn?.model || state.threadMeta.model,
       });
       record.streaming = true;
+      record.streamStarted = true;
       record.raw += params.delta || "";
       scheduleRender(record);
       break;
     }
 
-    case "item/commandExecution/outputDelta":
-      appendToolOutput(params.itemId, params.delta);
+    case "item/reasoning/summaryTextDelta":
+    case "item/reasoning/summaryPartAdded":
+    case "item/reasoning/textDelta":
+      if (protocolItem?.id) {
+        ensureActivityItem(protocolItem, { live: true, process: true, turnId: params.turnId || state.activeTurnId });
+        syncActivityFromProtocol();
+      }
       break;
 
+    case "item/commandExecution/outputDelta":
+      appendToolOutput(params.itemId, params.delta);
+      syncActivityFromProtocol();
+      break;
+
+    case "item/commandExecution/terminalInteraction":
+    case "item/fileChange/outputDelta":
+      if (protocolItem?.id) {
+        updateTool(protocolItem);
+        syncActivityFromProtocol();
+      }
+      break;
+
+    case "item/mcpToolCall/progress": {
+      const item = protocolItem || (params.itemId ? getProtocolItem(state.protocolState, params.itemId) : null);
+      if (item?.id) {
+        updateTool({ ...item, progress: params.message || item.progress || "" });
+        syncActivityFromProtocol();
+      }
+      break;
+    }
+
+    case "serverRequest/resolved": {
+      const requestId = String(params.requestId ?? "");
+      state.pendingServerRequests.delete(requestId);
+      state.approvals = removeQueuedApproval(state.approvals, params.requestId);
+      if (state.userInputRequest?.requestId !== undefined && String(state.userInputRequest.requestId) === requestId) {
+        clearUserInputRequest();
+      } else {
+        renderApprovalQueue();
+        if (state.running) syncActivityFromProtocol();
+      }
+      break;
+    }
+
     case "item/completed": {
-      const item = params.item;
-      if (!item) break;
-      if (item.type === "agentMessage") {
-        const record = ensureMessage(item.id, "assistant", {
+      const item = protocolItem || params.item;
+      const displayItem = item && item.id ? item : item ? {
+        ...item,
+        id: params.itemId || `event-${state.protocolState.sequence}`,
+      } : item;
+      if (!displayItem) break;
+      if (displayItem.type === "agentMessage") {
+        const record = ensureMessage(displayItem.id, "assistant", {
           process: true,
           live: true,
-          turnId: item.turnId || params.turnId || state.activeTurnId || state.currentTurn?.id,
-          item,
+          turnId: displayItem.turnId || params.turnId || state.activeTurnId || state.currentTurn?.id,
+          item: displayItem,
           turn: state.currentTurn,
-          model: item.model || state.currentTurn?.model || state.threadMeta.model,
+          model: displayItem.model || state.currentTurn?.model || state.threadMeta.model,
         });
-        const pendingRender = state.renderTimers.get(item.id);
+        const pendingRender = state.renderTimers.get(displayItem.id);
         if (pendingRender) {
           clearTimeout(pendingRender);
-          state.renderTimers.delete(item.id);
+          state.renderTimers.delete(displayItem.id);
         }
-        record.raw = item.text || record.raw;
+        record.raw = displayItem.text || record.raw;
         renderCompletedMessage(record, record.raw);
-      } else if (item.type === "plan") {
-        const turnId = item.turnId || params.turnId || state.activeTurnId || state.currentTurn?.id;
+      } else if (displayItem.type === "plan") {
+        const turnId = displayItem.turnId || params.turnId || state.activeTurnId || state.currentTurn?.id;
         const key = planSnapshotKey(state.threadId, turnId);
         if (!state.planSnapshots.has(key)) {
           renderPlanCard({
@@ -3614,17 +6233,25 @@ function handleCodex(message) {
             steps: [],
           }, {
             key,
-            text: item.text || state.planDeltaBuffers.get(item.id) || "",
+            text: displayItem.text || state.planDeltaBuffers.get(displayItem.id) || "",
+            itemId: displayItem.id,
           });
         }
-        state.planDeltaBuffers.delete(item.id);
-      } else if (["commandExecution", "fileChange", "mcpToolCall"].includes(item.type)) {
-        updateTool(item);
-      } else if (item.type === "error") {
-        addProcessError(item, item.turnId || params.turnId || state.activeTurnId);
+        state.planDeltaBuffers.delete(displayItem.id);
+      } else if (["commandExecution", "fileChange", "mcpToolCall"].includes(displayItem.type)) {
+        updateTool(displayItem);
+        if (displayItem.type === "fileChange") scheduleFileWorkspaceRefresh();
+      } else if (displayItem.type === "webSearch") {
+        updateSearchStep(displayItem, { active: false });
+      } else if (["dynamicToolCall", "collabToolCall", "collabAgentToolCall", "subAgentActivity", "agentStatus", "imageView", "imageGeneration", "contextCompaction", "enteredReviewMode", "exitedReviewMode", "review", "hookPrompt", "sleep", "reasoning", "thinking"].includes(displayItem.type)) {
+        ensureActivityItem(displayItem);
+      } else if (displayItem.type === "error") {
+        addProcessError(displayItem, displayItem.turnId || params.turnId || state.activeTurnId);
+      } else if (!["userMessage", "reasoning", "thinking"].includes(displayItem.type)) {
+        ensureActivityItem(displayItem);
       }
-      if (item.type === "webSearch") updateSearchStep(item, { active: false });
-      completeSearchActivity(item);
+      completeSearchActivity(displayItem);
+      if (state.running) syncActivityFromProtocol();
       scrollToBottom();
       break;
     }
@@ -3660,33 +6287,61 @@ function handleCodex(message) {
       break;
 
     default:
+      if (method.startsWith("item/") && protocolItem?.id
+        && !["agentMessage", "commandExecution", "fileChange", "mcpToolCall", "webSearch", "plan"].includes(protocolItem.type)) {
+        ensureActivityItem(protocolItem);
+        syncActivityFromProtocol();
+      }
       break;
   }
+  syncRuntimeFromCurrentState();
+  renderThreadList();
 }
 
 function applyThreadResponse(payload) {
+  const incomingThreadId = String(payload.thread?.id || payload.threadId || "").trim();
+  if (!incomingThreadId) return;
+  if (state.threadId && state.threadId !== incomingThreadId) captureSelectedRuntime();
+  const previousRuntime = getThreadRuntime(state.threadRuntimes, incomingThreadId, false);
   clearQueuedMessages();
-  if (state.threadId && state.threadId !== payload.thread.id) {
+  if (state.threadId && state.threadId !== incomingThreadId) {
     saveThreadUi();
     saveToolCache();
   }
-  state.threadId = payload.thread.id;
+  state.threadId = incomingThreadId;
+  state.selectedThreadId = incomingThreadId;
+  state.selectionPending = false;
+  selectThreadRuntime(state.threadRuntimes, incomingThreadId, { markRead: true });
+  persistSelectedThread(incomingThreadId);
+  const operation = payload.operation || payload.mode;
+  state.accessMode = payload.accessMode || (operation === "snapshot" ? "snapshot" : "live");
+  state.snapshotAt = state.accessMode === "snapshot" ? payload.snapshotAt || new Date().toISOString() : null;
+  state.snapshotReason = state.accessMode === "snapshot" ? payload.snapshotReason || "active_writer" : null;
   activateThreadUi(state.threadId);
+  const runtime = getThreadRuntime(state.threadRuntimes, state.threadId, false);
+  const runtimeTokenUsage = runtime?.tokenUsage || runtime?.latestEvent?.params?.tokenUsage || runtime?.latestEvent?.params?.token_usage;
   if (state.tokenUsageThreadId !== state.threadId) {
-    state.tokenUsage = null;
-    state.tokenUsageThreadId = null;
+    state.tokenUsage = runtimeTokenUsage || null;
+    state.tokenUsageThreadId = runtimeTokenUsage ? state.threadId : null;
   }
-  state.activeTurnId = null;
-  state.running = false;
-  state.threadStatus = normalizeThreadStatus(payload.thread?.status || "idle");
-  clearTurnActivity();
+  state.activeTurnId = payload.activeTurnId || payload.runtime?.activeTurnId || runtime?.activeTurnId || null;
+  state.running = payload.running !== undefined
+    ? Boolean(payload.running)
+    : Boolean(payload.runtime?.running ?? runtime?.running ?? state.activeTurnId);
+  state.threadStatus = normalizeThreadStatus(payload.thread?.status || runtime?.status || (state.running ? "active" : "idle"));
+  if (state.running) setTurnActivityWorking(payload.startedAt || runtime?.latestEvent?.params?.turn?.startedAt);
+  else clearTurnActivity();
   const reasoningEffort = resolveReasoningEffort(payload) || resolveReasoningEffort(payload.thread);
   const storedMode = payload.thread?.id ? localStorage.getItem(collaborationModeStorageKey(payload.thread.id)) : "";
-  const initialMode = payload.mode === "start"
+  const initialMode = operation === "start"
     ? collaborationModeValue(collaborationModeSelect.value)
     : storedMode || "";
   state.threadMeta = {
     name: payload.thread?.name,
+    preview: payload.thread?.preview,
+    cliVersion: payload.thread?.cliVersion,
+    createdAt: payload.thread?.createdAt,
+    updatedAt: payload.thread?.updatedAt,
     model: payload.model || payload.thread?.model,
     modelProvider: payload.modelProvider || payload.thread?.modelProvider,
     serviceTier: payload.serviceTier || payload.thread?.serviceTier,
@@ -3700,13 +6355,31 @@ function applyThreadResponse(payload) {
     collaborationMode: payload.collaborationMode || payload.thread?.collaborationMode || initialMode || null,
     reasoningEffort,
     gitInfo: payload.thread?.gitInfo || null,
+    goal: payload.thread?.goal || null,
+    environmentId: payload.thread?.environmentId || null,
+    environmentStatus: payload.thread?.environmentStatus || null,
+    archived: payload.thread?.archived === true || state.threadStatus === "archived",
+    closed: payload.thread?.closed === true || state.threadStatus === "closed",
   };
+
+  updateThreadRuntime(state.threadRuntimes, state.threadId, {
+    activeTurnId: state.activeTurnId,
+    status: state.threadStatus,
+    running: state.running || isActiveTurnStatus(payload.thread?.turns?.at?.(-1)?.status),
+    accessMode: state.accessMode,
+    snapshotAt: state.snapshotAt,
+    snapshotReason: state.snapshotReason,
+    latestThread: payload.thread,
+    pendingServerRequests: payload.pendingServerRequests
+      ?? payload.pendingRequests
+      ?? previousRuntime?.pendingServerRequests
+      ?? [],
+  }, { markUnread: false });
 
   if (!state.navigatingHistory) state.navigation = pushThreadNavigation(state.navigation, state.threadId);
   state.navigatingHistory = false;
 
   localStorage.setItem("codexMathThreadId", state.threadId);
-  threadIdInput.value = state.threadId;
   if (state.threadMeta.cwd) {
     cwdInput.value = state.threadMeta.cwd;
     localStorage.setItem("codexMathCwd", state.threadMeta.cwd);
@@ -3758,6 +6431,14 @@ function showStatus() {
     ["Approval policy", state.threadMeta.approvalPolicy || "default"],
     ["Collaboration mode", currentCollaborationModeLabel()],
     ["Thread state", state.threadStatus],
+    ["Thread name", state.threadMeta.name || "--"],
+    ["Goal", state.threadMeta.goal?.objective || state.threadMeta.goal || "--"],
+    ["Environment", state.threadMeta.environmentStatus
+      ? `${state.threadMeta.environmentStatus}${state.threadMeta.environmentId ? ` · ${state.threadMeta.environmentId}` : ""}`
+      : "--"],
+    ["Access", state.accessMode || "unknown"],
+    ["Snapshot at", state.snapshotAt ? snapshotTimeLabel(state.snapshotAt) : "--"],
+    ["Snapshot reason", state.snapshotReason || "--"],
     ["Session", state.threadId || "none"],
     ["Account", accountLabel()],
     ["Token usage", context.totalUsed ? `${formatNumber(context.totalUsed)} total (${formatNumber(context.input)} input + ${formatNumber(context.output)} output)` : "--"],
@@ -3788,11 +6469,16 @@ function showStatus() {
     experiments: state.experiments,
     metadataErrors: state.metadataErrors,
     serverInfo: state.serverInfo,
+    accessMode: state.accessMode,
+    snapshotAt: state.snapshotAt,
+    snapshotReason: state.snapshotReason,
+    protocol: toProtocolSnapshot(state.protocolState),
   }, null, 2);
   statusDialog.showModal();
 }
 
 function clearPendingRenderTimers() {
+  cancelHistoryRestore();
   for (const timer of state.renderTimers.values()) clearTimeout(timer);
   for (const timer of state.toolOutputTimers.values()) clearTimeout(timer);
   for (const timer of state.viewRenderTimers.values()) clearTimeout(timer);
@@ -3815,6 +6501,14 @@ function clearPendingRenderTimers() {
     cancelAnimationFrame(state.pendingScrollFrame);
     state.pendingScrollFrame = null;
   }
+  if (state.outlineRenderTimer !== null) {
+    clearTimeout(state.outlineRenderTimer);
+    state.outlineRenderTimer = null;
+  }
+  if (state.outlinePreviewHideTimer !== null) {
+    clearTimeout(state.outlinePreviewHideTimer);
+    state.outlinePreviewHideTimer = null;
+  }
 }
 
 function clearTranscript(showNotice = true) {
@@ -3823,6 +6517,7 @@ function clearTranscript(showNotice = true) {
   chat.replaceChildren();
   state.messageNodes.clear();
   state.toolNodes.clear();
+  state.activityNodes.clear();
   state.processNodes.clear();
   state.historicalProcessAnswerIds.clear();
   state.searchNodes.clear();
@@ -3830,6 +6525,13 @@ function clearTranscript(showNotice = true) {
   state.planNodes.clear();
   state.planDeltaBuffers.clear();
   state.latestPlanKey = null;
+  state.processEpochs.clear();
+  state.conversationNodeMeta.clear();
+  state.conversationNodeOrdinal = 0;
+  state.conversationFallbackAnchor = null;
+  state.conversationFallbackIndex = 0;
+  state.historyOrderRanks.clear();
+  state.protocolState = createProtocolState();
   state.commandObservedStartMs.clear();
   state.conversationOrder = [];
   clearQueuedMessages();
@@ -3837,11 +6539,14 @@ function clearTranscript(showNotice = true) {
   state.toolCacheSequence = 0;
   state.lastSavedToolCache = null;
   if (state.threadId) sessionStorage.removeItem(threadToolStorageKey(state.threadId));
+  if (state.threadId) sessionStorage.removeItem(protocolStateStorageKey(state.threadId));
   state.latestDiff = "";
   if (showNotice) addSystemMessage("Browser transcript cleared. Codex context was not changed.", "warning");
+  renderConversationOutline();
 }
 
 function startNewThread(sessionStartSource = null) {
+  if (!canBeginThreadSelection(state.selectionPending)) return;
   const cwd = cwdInput.value.trim();
   if (!cwd) {
     addSystemMessage("Enter a WSL project directory first.", "error");
@@ -3851,16 +6556,28 @@ function startNewThread(sessionStartSource = null) {
   localStorage.setItem("codexMathCwd", cwd);
   saveControlPreferences();
   const settings = selectedSettings();
-  send({ type: "startThread", cwd, sessionStartSource, ...settings });
+  prepareNewThreadSelection();
+  if (!send({ type: "startThread", cwd, sessionStartSource, ...settings })) {
+    state.selectionPending = false;
+    updateControls();
+  }
 }
 
-function resumeThread(threadId = threadIdInput.value.trim()) {
+function resumeThread(threadId = "") {
+  if (!canBeginThreadSelection(state.selectionPending)) return;
+  threadId = String(threadId || "").trim();
   if (!threadId) {
     addSystemMessage("A thread ID is required.", "error");
     return;
   }
+  prepareThreadSelection(threadId);
+  state.selectionPending = true;
+  updateControls();
   clearUserInputRequest();
-  send({ type: "resumeThread", threadId });
+  if (!send({ type: "resumeThread", threadId })) {
+    state.selectionPending = false;
+    updateControls();
+  }
 }
 
 function updateThreadSettings() {
@@ -3869,7 +6586,18 @@ function updateThreadSettings() {
     updateControls();
     return;
   }
-  send({ type: "updateSettings", ...selectedSettings() });
+  if (!requireWritable("change thread settings")) {
+    updateControls();
+    return;
+  }
+  const settings = selectedSettings();
+  const revision = state.settingsRequestSequence + 1;
+  state.settingsRequestSequence = revision;
+  state.latestSettingsRequests.set(state.threadId, { revision, settings });
+  state.pendingSettingsThreadId = state.threadId;
+  if (!send({ type: "updateSettings", threadId: state.threadId, settingsRevision: revision, ...settings })) {
+    state.latestSettingsRequests.delete(state.threadId);
+  }
 }
 
 function copyLatestAssistant() {
@@ -4155,6 +6883,23 @@ function renderMcpInspector() {
   }
 }
 
+const SNAPSHOT_READABLE_SLASHES = new Set([
+  "/status", "/mcp", "/skills", "/hooks", "/apps", "/plugins", "/usage", "/debug-config",
+  "/ps", "/copy", "/diff", "/resume", "/fork", "/new", "/clear", "/model", "/permissions",
+  "/fast", "/memories", "/goal",
+]);
+
+function snapshotSlashAllowed(command, args = []) {
+  if (!SNAPSHOT_READABLE_SLASHES.has(command)) return false;
+  const mode = String(args[0] || "").toLowerCase();
+  if (command === "/model" || command === "/permissions") return args.length === 0;
+  if (command === "/fast") return mode === "status";
+  if (command === "/memories") return !args.length || mode === "status";
+  if (command === "/goal") return !args.length;
+  if (command === "/mcp") return !args.length || mode === "summary" || mode === "verbose";
+  return true;
+}
+
 function executeSlash(raw) {
   const parts = raw.trim().split(/\s+/);
   const enteredCommand = parts.shift()?.toLowerCase() || "";
@@ -4169,12 +6914,17 @@ function executeSlash(raw) {
     addSystemMessage(`${spec.name} is a Codex CLI/TUI command, but this browser client cannot provide its required terminal or IDE UI.`, "warning");
     return true;
   }
+  if (isSnapshotMode() && !snapshotSlashAllowed(command, args)) {
+    requireWritable(`run ${command}`);
+    return true;
+  }
 
   switch (command) {
     case "/model":
       if (!args.length) {
         showModelChoices();
       } else {
+        if (!requireWritable("change the model")) break;
         setModelAndEffort(args[0], args[1]);
       }
       break;
@@ -4185,6 +6935,7 @@ function executeSlash(raw) {
       if (!args.length) {
         showPermissionChoices();
       } else {
+        if (!requireWritable("change the permission profile")) break;
         const target = args[0];
         const exists = [...permissionSelect.options].some((option) => option.value === target && !option.disabled);
         if (!exists) addSystemMessage(`Unknown or blocked permission profile: ${target}`, "error");
@@ -4215,23 +6966,23 @@ function executeSlash(raw) {
       if (mode === "status") {
         addSystemMessage(`Memory mode: ${state.threadMeta.memoryMode || "unknown"}`);
       } else if (mode === "on" || mode === "off") {
-        send({ type: "setMemoryMode", mode: mode === "on" ? "enabled" : "disabled" });
+        send({ type: "setMemoryMode", threadId: state.threadId, mode: mode === "on" ? "enabled" : "disabled" });
       } else {
         addSystemMessage("Usage: /memories [on|off|status]", "error");
       }
       break;
     }
     case "/review":
-      send({ type: "reviewThread", instructions: args.join(" ") });
+      send({ type: "reviewThread", threadId: state.threadId, instructions: args.join(" ") });
       break;
     case "/rename": {
       const name = args.join(" ").trim();
       if (!name) addSystemMessage("Usage: /rename <name>", "error");
-      else send({ type: "renameThread", name });
+      else send({ type: "renameThread", threadId: state.threadId, name });
       break;
     }
     case "/archive":
-      if (window.confirm("Archive the current Codex thread?")) send({ type: "archiveThread" });
+      if (window.confirm("Archive the current Codex thread?")) send({ type: "archiveThread", threadId: state.threadId });
       break;
     case "/delete": {
       if (!state.threadId) {
@@ -4248,9 +6999,9 @@ function executeSlash(raw) {
     }
     case "/goal": {
       const value = args.join(" ").trim();
-      if (!value) send({ type: "getGoal" });
-      else if (value.toLowerCase() === "clear") send({ type: "clearGoal" });
-      else send({ type: "setGoal", objective: value });
+      if (!value) send({ type: "getGoal", threadId: state.threadId });
+      else if (value.toLowerCase() === "clear") send({ type: "clearGoal", threadId: state.threadId });
+      else send({ type: "setGoal", threadId: state.threadId, objective: value });
       break;
     }
     case "/mcp": {
@@ -4258,11 +7009,12 @@ function executeSlash(raw) {
       if (!["summary", "verbose", "reload"].includes(mode)) {
         addSystemMessage("Usage: /mcp [verbose|reload]", "error");
       } else if (mode === "reload") {
+        if (!requireWritable("reload MCP servers")) break;
         state.mcpDialogRequested = true;
-        send({ type: "reloadMcp", verbose: args[1]?.toLowerCase() === "verbose" });
+        send({ type: "reloadMcp", threadId: state.threadId, verbose: args[1]?.toLowerCase() === "verbose" });
       } else {
         state.mcpDialogRequested = true;
-        send({ type: "listMcp", verbose: mode === "verbose" });
+        send({ type: "listMcp", threadId: state.threadId, verbose: mode === "verbose" });
       }
       break;
     }
@@ -4273,7 +7025,7 @@ function executeSlash(raw) {
       send({ type: "listHooks", cwd: currentCwd() });
       break;
     case "/apps":
-      send({ type: "listApps", forceRefetch: (args[0] || "").toLowerCase() === "reload" });
+      send({ type: "listApps", threadId: state.threadId, forceRefetch: (args[0] || "").toLowerCase() === "reload" });
       break;
     case "/plugins":
       send({ type: "listPlugins" });
@@ -4285,7 +7037,7 @@ function executeSlash(raw) {
       openTextDialog("Config diagnostics", JSON.stringify({ config: state.config, metadataErrors: state.metadataErrors, threadMeta: state.threadMeta }, null, 2));
       break;
     case "/compact":
-      send({ type: "compact" });
+      send({ type: "compact", threadId: state.threadId });
       break;
     case "/plan":
       if (!state.threadId) {
@@ -4301,7 +7053,7 @@ function executeSlash(raw) {
       resumeThread(args[0]);
       break;
     case "/fork":
-      send({ type: "forkThread" });
+      send({ type: "forkThread", threadId: state.threadId });
       break;
     case "/copy":
       copyLatestAssistant();
@@ -4316,7 +7068,7 @@ function executeSlash(raw) {
       if (!state.latestGuardianDenial) {
         addSystemMessage("No recent auto-review denial is available to retry.", "warning");
       } else {
-        send({ type: "approveGuardianDeniedAction", event: state.latestGuardianDenial });
+        send({ type: "approveGuardianDeniedAction", threadId: state.threadId, event: state.latestGuardianDenial });
       }
       break;
     }
@@ -4333,14 +7085,14 @@ function executeSlash(raw) {
       }
       const mode = (args[1] || "toggle").toLowerCase();
       const enabled = mode === "on" ? true : mode === "off" ? false : !Boolean(feature.enabled);
-      send({ type: "setExperiment", name, enabled });
+      send({ type: "setExperiment", threadId: state.threadId, name, enabled });
       break;
     }
     case "/ps":
-      send({ type: "listBackgroundTerminals" });
+      send({ type: "listBackgroundTerminals", threadId: state.threadId });
       break;
     case "/stop":
-      send({ type: "cleanBackgroundTerminals" });
+      send({ type: "cleanBackgroundTerminals", threadId: state.threadId });
       break;
     case "/clear":
       clearTranscript(false);
@@ -4352,14 +7104,14 @@ function executeSlash(raw) {
         showChoicePalette("Select personality", ["none", "friendly", "pragmatic"].map((value) => ({
           label: value,
           detail: value === state.threadMeta.personality ? "Current personality" : "",
-          select: () => send({ type: "updateSettings", personality: value }),
+          select: () => send({ type: "updateSettings", threadId: state.threadId, personality: value }),
         })));
       } else if (!["none", "friendly", "pragmatic"].includes(personality)) {
         addSystemMessage("Usage: /personality <none|friendly|pragmatic>", "error");
       } else if (!state.threadId) {
         addSystemMessage("Start or resume a thread before changing personality.", "error");
       } else {
-        send({ type: "updateSettings", personality });
+        send({ type: "updateSettings", threadId: state.threadId, personality });
       }
       break;
     }
@@ -4419,10 +7171,42 @@ function commitPaletteSelection(command, source = "enter") {
   if (action.kind === "submit") submitMessage();
 }
 
+function measureComposerScrollHeight() {
+  const parent = messageInput.parentElement;
+  const width = messageInput.getBoundingClientRect().width;
+  if (!parent || !width) return messageInput.scrollHeight;
+  const probe = messageInput.cloneNode();
+  probe.removeAttribute("id");
+  probe.value = messageInput.value;
+  Object.assign(probe.style, {
+    position: "absolute",
+    visibility: "hidden",
+    pointerEvents: "none",
+    width: `${width}px`,
+    height: "auto",
+    maxHeight: "none",
+    overflowY: "hidden",
+  });
+  parent.append(probe);
+  const height = probe.scrollHeight;
+  probe.remove();
+  return height;
+}
+
 function autoSizeComposer() {
-  messageInput.style.height = "auto";
-  messageInput.style.height = `${Math.min(200, Math.max(50, messageInput.scrollHeight))}px`;
-  syncApprovalAreaPosition();
+  const wasFollowing = state.followOutput;
+  const previousChatHeight = chat.clientHeight;
+  const currentHeight = messageInput.getBoundingClientRect().height;
+  const nextHeight = Math.min(200, Math.max(24, measureComposerScrollHeight()));
+  const heightChanged = Math.abs(nextHeight - currentHeight) > 0.5;
+
+  if (heightChanged) {
+    messageInput.style.height = `${nextHeight}px`;
+    syncApprovalAreaPosition();
+    if (wasFollowing && chat.clientHeight !== previousChatHeight) chat.scrollTop = chat.scrollHeight;
+  } else {
+    syncApprovalAreaPosition();
+  }
 }
 
 function mentionToken() {
@@ -4571,6 +7355,10 @@ function readImage(file) {
 }
 
 function submitMessage() {
+  if (isSnapshotMode()) {
+    requireWritable("send a message");
+    return;
+  }
   const text = messageInput.value;
   const trimmedText = text.trim();
   if (!trimmedText && !state.mentions.length && !state.images.length) return;
@@ -4600,6 +7388,7 @@ function submitMessage() {
 }
 
 function sendComposedMessage(input, settings) {
+  if (!requireWritable("send a message")) return false;
   if (queueDispatchActive()) {
     enqueueFollowUp(input);
     return;
@@ -4638,6 +7427,7 @@ function composeCurrentInput() {
 }
 
 function submitSteerNow() {
+  if (!requireWritable("steer the active turn")) return;
   const input = composeCurrentInput();
   if (!input) return;
   clearComposerInput();
@@ -4645,29 +7435,38 @@ function submitSteerNow() {
 }
 
 function submitFollowUp() {
+  if (!requireWritable("queue a follow-up")) return;
   const input = composeCurrentInput();
   if (!input) return;
   clearComposerInput();
   enqueueFollowUp(input);
 }
 
-socket.addEventListener("open", () => setConnection("Bridge connected", true));
-socket.addEventListener("close", () => {
-  state.ready = false;
-  state.running = false;
-  releaseQueueDispatch({ fail: true, error: "WebSocket disconnected." });
-  clearUserInputRequest();
-  clearTurnActivity();
-  setConnection("Disconnected", false);
-  updateControls();
-});
-socket.addEventListener("error", () => setConnection("WebSocket error", false));
-
-socket.addEventListener("message", (event) => {
-  const payload = JSON.parse(event.data);
+function handleSocketMessage(event) {
+  let payload;
+  try {
+    payload = JSON.parse(event.data);
+  } catch {
+    addSystemMessage("Invalid bridge message.", "error");
+    return;
+  }
+  payload = canonicalizeThreadReadyPayload(payload);
+  const scopedPayloadThreadId = payloadThreadId(payload);
+  const explicitHistorySwitchTarget = payload.type === "threadReady"
+    && state.historySwitchTargetId === scopedPayloadThreadId;
+  if (scopedPayloadThreadId
+    && state.threadId
+    && scopedPayloadThreadId !== state.threadId
+    && !explicitHistorySwitchTarget
+    && !["runtimeSnapshot", "runtimeUpdate", "threadRuntime", "threadRuntimeSnapshot", "codex"].includes(payload.type)) {
+    handleBackgroundBridgePayload(payload, scopedPayloadThreadId);
+    return;
+  }
   switch (payload.type) {
     case "ready":
       state.ready = true;
+      state.fileAccessToken = payload.fileAccessToken || null;
+      state.defaultCwd = payload.defaultCwd || payload.fileAccessCwd || null;
       state.serverInfo = payload.serverInfo || null;
       state.models = payload.models || [];
       state.config = payload.config;
@@ -4676,23 +7475,46 @@ socket.addEventListener("message", (event) => {
       state.experiments = payload.experiments || [];
       state.collaborationModes = payload.collaborationModes || [];
       state.metadataErrors = payload.metadataErrors || {};
-      applyThreadList(payload.threadList, false, payload.threadListError);
+      applyRuntimeMessage(payload);
+      if (payload.threadList) {
+        applyThreadList(payload.threadList, false, payload.threadListError);
+      } else {
+        state.threadListLoading = payload.threadListPending !== false;
+        state.threadListError = payload.threadListPending === false ? "Recent sessions are unavailable." : null;
+        renderThreadList("ready");
+        if (payload.threadListPending === false) refreshThreadList();
+      }
       cwdInput.value = localStorage.getItem("codexMathCwd") || payload.defaultCwd || "";
-      threadIdInput.value = localStorage.getItem("codexMathThreadId") || "";
+      const savedThreadId = readSelectedThread(sessionStorage, localStorage.getItem("codexMathThreadId"));
+      state.selectedThreadId = savedThreadId;
       populateModels();
       {
+        const savedMode = localStorage.getItem("codexRightPanelMode");
         const savedInspector = localStorage.getItem("codexInspectorOpen");
-        const openInspector = savedInspector === "true" || (savedInspector === null && window.innerWidth >= 1360);
-        inspector.classList.toggle("closed", !openInspector);
-        updateBackdrop();
-        if (openInspector) {
-          state.mcpDialogRequested = false;
-          send({ type: "listMcp", verbose: false });
-        }
+        const initialMode = ["closed", "files", "inspector"].includes(savedMode)
+          ? savedMode
+          : savedInspector === "true"
+            ? "inspector"
+            : "closed";
+        setRightPanelMode(initialMode, { persist: false });
       }
+      resetFileWorkspace(payload.fileAccessCwd || payload.defaultCwd || "", { force: true });
       syncSidebarViewport();
       setConnection("Codex ready", true);
       updateControls();
+      if (savedThreadId) {
+        // A lost socket cannot complete the previous selection transition;
+        // allow the reconnect handshake to retry it once.
+        state.selectionPending = false;
+        resumeThread(savedThreadId);
+      }
+      break;
+
+    case "runtimeSnapshot":
+    case "runtimeUpdate":
+    case "threadRuntime":
+    case "threadRuntimeSnapshot":
+      applyRuntimeMessage(payload);
       break;
 
     case "metadata":
@@ -4703,19 +7525,22 @@ socket.addEventListener("message", (event) => {
       state.experiments = payload.experiments || state.experiments;
       state.collaborationModes = payload.collaborationModes || state.collaborationModes;
       state.metadataErrors = payload.metadataErrors || state.metadataErrors;
+      if (payload.fileAccessCwd) resetFileWorkspace(payload.fileAccessCwd, { force: true });
       populateModels(currentModelLabel());
       updateControls();
       break;
 
     case "threadReady":
+      state.historySwitchTargetId = null;
       clearUserInputRequest();
       applyThreadResponse(payload);
+      resetFileWorkspace(state.threadMeta.cwd || state.defaultCwd || "");
       clearPendingRenderTimers();
       chat.replaceChildren();
       approvalArea.replaceChildren();
-      state.outlineObserver?.disconnect();
       state.messageNodes.clear();
       state.toolNodes.clear();
+      state.activityNodes.clear();
       state.processNodes.clear();
       state.historicalProcessAnswerIds.clear();
       state.searchNodes.clear();
@@ -4723,6 +7548,13 @@ socket.addEventListener("message", (event) => {
       state.planNodes.clear();
       state.planDeltaBuffers.clear();
       state.latestPlanKey = null;
+      state.processEpochs.clear();
+      state.conversationNodeMeta.clear();
+      state.conversationNodeOrdinal = 0;
+      state.conversationFallbackAnchor = null;
+      state.conversationFallbackIndex = 0;
+      state.historyOrderRanks.clear();
+      state.protocolState = createProtocolState();
       state.commandItems.clear();
       state.changeItems.clear();
       state.commandObservedStartMs.clear();
@@ -4734,23 +7566,50 @@ socket.addEventListener("message", (event) => {
       state.latestUserInput = "";
       state.threadView = normalizeThread(payload.thread);
       state.approvals = [];
-      if (payload.mode === "resume" || payload.mode === "fork") restoreHistory(payload.thread);
+      state.pendingServerRequests.clear();
+      restorePendingRuntimeRequests(selectedRuntime());
+      const operation = payload.operation || payload.mode;
+      if (operation === "resume" || operation === "snapshot" || operation === "fork") restoreHistory(payload.thread);
       else {
         clearTurnActivity();
         if (state.activeView === "changes") renderChangesView();
         if (state.activeView === "commands") renderCommandsView();
       }
-      renderConversationOutline();
-      addSystemMessage(payload.mode === "resume" ? "Thread resumed and settings synchronized." : payload.mode === "fork" ? "Thread forked." : "New Codex thread created.");
+      if (!(operation === "resume" || operation === "snapshot" || operation === "fork")) renderConversationOutline();
+      const notice = state.accessMode === "snapshot"
+        ? "Read-only snapshot loaded. Refresh to read the latest persisted history."
+          : operation === "resume"
+          ? "Thread resumed and settings synchronized."
+          : operation === "fork"
+            ? "Thread forked into a live session."
+            : "New Codex thread created.";
+      addSystemMessage(notice, state.accessMode === "snapshot" ? "warning" : "info");
       refreshThreadList();
       updateControls();
-      messageInput.focus();
+      if (!(operation === "resume" || operation === "snapshot" || operation === "fork")) messageInput.focus();
       break;
 
-    case "settingsUpdateAccepted":
+    case "settingsUpdateAccepted": {
+      const settingsThreadId = payload.threadId || state.pendingSettingsThreadId || state.threadId;
+      if (!settingsResponseIsCurrent(settingsThreadId, payload.requested || {}, payload.settingsRevision)) break;
+      retireSettingsRequest(state.latestSettingsRequests, settingsThreadId, payload.requested || {}, payload.settingsRevision);
+      if (payload.threadId && payload.threadId !== state.threadId) {
+        updateThreadRuntime(state.threadRuntimes, payload.threadId, { pendingTurnSettings: payload.requested || {} });
+        renderThreadList();
+        break;
+      }
+      if (state.pendingSettingsThreadId && state.pendingSettingsThreadId !== state.threadId) {
+        updateThreadRuntime(state.threadRuntimes, state.pendingSettingsThreadId, { pendingTurnSettings: payload.requested || {} });
+        state.pendingSettingsThreadId = null;
+        renderThreadList();
+        break;
+      }
+      state.pendingSettingsThreadId = null;
       mergeThreadSettings(payload.requested);
+      if (payload.mode === "thread" && payload.requested?.cwd) resetFileWorkspace(payload.requested.cwd, { force: true });
       addSystemMessage(payload.mode === "thread" ? "Model/settings update accepted by App Server." : `Settings will apply on the next turn. App Server update fallback: ${payload.warning}`, payload.mode === "thread" ? "info" : "warning");
       break;
+    }
 
     case "turnAccepted":
       if (consumeIgnoredQueueResponse(payload.requestId)) break;
@@ -4792,12 +7651,14 @@ socket.addEventListener("message", (event) => {
     case "steerAccepted":
       if (payload.accepted === false) {
         state.steerRequestInputs.delete(payload.requestId);
+        state.steerRequestThreads.delete(payload.requestId);
         addSystemMessage(payload.error?.message || "Steer was not accepted.", "error");
         break;
       }
       {
         const input = state.steerRequestInputs.get(payload.requestId);
         state.steerRequestInputs.delete(payload.requestId);
+        state.steerRequestThreads.delete(payload.requestId);
         if (input) {
           addLocalUserMessage(input);
           state.latestUserInput = displayInput(input);
@@ -4837,7 +7698,12 @@ socket.addEventListener("message", (event) => {
       clearUserInputRequest();
       clearQueuedMessages();
       if (state.threadId) localStorage.removeItem(collaborationModeStorageKey(state.threadId));
+      persistSelectedThread(null);
       state.threadId = null;
+      state.selectedThreadId = null;
+      state.accessMode = null;
+      state.snapshotAt = null;
+      state.snapshotReason = null;
       state.activeTurnId = null;
       state.running = false;
       state.threadStatus = "notLoaded";
@@ -4847,7 +7713,6 @@ socket.addEventListener("message", (event) => {
       state.tokenUsageThreadId = null;
       state.latestGuardianDenial = null;
       localStorage.removeItem("codexMathThreadId");
-      threadIdInput.value = "";
       addSystemMessage("Thread archived.");
       refreshThreadList();
       updateControls();
@@ -4958,6 +7823,19 @@ socket.addEventListener("message", (event) => {
       openTextDialog("Usage and rate limits", JSON.stringify(payload.result, null, 2));
       break;
 
+    case "serverRequestsExpired":
+      for (const requestId of payload.requestIds || []) {
+        state.pendingServerRequests.delete(String(requestId));
+        state.approvals = removeQueuedApproval(state.approvals, requestId);
+      }
+      if (state.userInputRequest && (payload.requestIds || []).some((id) => String(id) === String(state.userInputRequest.requestId))) {
+        clearUserInputRequest();
+      }
+      renderApprovalQueue();
+      addSystemMessage(payload.message || "Pending Codex requests expired because the App Server stopped.", "error");
+      updateControls();
+      break;
+
     case "codex":
       handleCodex(payload.message);
       break;
@@ -4970,6 +7848,7 @@ socket.addEventListener("message", (event) => {
           releaseQueueDispatch({ fail: true, error: payload.message || "Queue request failed." });
         }
       }
+      state.selectionPending = false;
       state.running = false;
       clearTurnActivity();
       addSystemMessage(payload.message, "error");
@@ -4979,7 +7858,48 @@ socket.addEventListener("message", (event) => {
     default:
       break;
   }
-});
+  if (state.threadId) syncRuntimeFromCurrentState();
+}
+
+function handleBridgeOpen() {
+  state.reconnecting = false;
+  setConnection("Bridge connected", true);
+  updateControls();
+}
+
+function handleBridgeClose() {
+  captureSelectedRuntime();
+  state.ready = false;
+  state.reconnecting = bridge.state === "reconnecting";
+  setConnection(state.reconnecting ? "Disconnected; retrying" : "Disconnected", false);
+  updateControls();
+}
+
+function handleBridgeError(event) {
+  const message = event?.message || event?.error?.message || "WebSocket error";
+  setConnection(`${message}; retrying`, false);
+}
+
+function handleBridgeStateChange(event) {
+  if (event?.state === "reconnecting") {
+    state.reconnecting = true;
+    setConnection(`Reconnecting (attempt ${bridge.reconnectAttempt})`, false);
+  } else if (event?.state === "closed" && !state.ready) {
+    setConnection(bridge.reconnectExhausted ? "Disconnected" : "Connecting", false);
+  }
+}
+
+bridge.addEventListener("open", handleBridgeOpen);
+bridge.addEventListener("close", handleBridgeClose);
+bridge.addEventListener("error", handleBridgeError);
+bridge.addEventListener("statechange", handleBridgeStateChange);
+bridge.subscribe(handleSocketMessage);
+try {
+  bridge.start?.();
+} catch (error) {
+  handleBridgeError(error);
+}
+if (bridge.readyState === 1) handleBridgeOpen();
 
 function switchView(view) {
   if (!["conversation", "changes", "commands"].includes(view)) return;
@@ -4992,6 +7912,18 @@ function switchView(view) {
   }
   if (view === "changes") renderChangesView();
   if (view === "commands") renderCommandsView();
+  if (view === "conversation" && state.historyLatestScrollPending) {
+    const generation = state.historyRestoreGeneration;
+    requestAnimationFrame(() => {
+      if (generation !== state.historyRestoreGeneration
+        || state.historyRestoring
+        || !state.historyLatestScrollPending
+        || state.historyRestoreScrollInterrupted) return;
+      scrollToBottom(true);
+      state.historyLatestScrollPending = false;
+    });
+  }
+  requestAnimationFrame(measureConversationMinimap);
 }
 
 function syncSidebarToggle() {
@@ -5008,7 +7940,7 @@ function syncSidebarToggle() {
 function syncSidebarViewport() {
   if (window.innerWidth < 960) {
     sidebar.classList.remove("collapsed");
-    inspector.classList.add("closed");
+    if (state.rightPanelMode !== "closed") setRightPanelMode("closed", { persist: false });
   } else {
     sidebar.classList.remove("open");
     const saved = localStorage.getItem("codexSidebarOpen");
@@ -5038,29 +7970,28 @@ function toggleSidebar() {
 
 function updateBackdrop() {
   const sidebarOpen = sidebar.classList.contains("open");
-  const inspectorOverlayOpen = window.innerWidth < 1360 && !inspector.classList.contains("closed");
-  drawerBackdrop.classList.toggle("hidden", !sidebarOpen && !inspectorOverlayOpen);
+  const rightPanelOverlayOpen = window.innerWidth < 1360 && state.rightPanelMode !== "closed";
+  drawerBackdrop.classList.toggle("hidden", !sidebarOpen && !rightPanelOverlayOpen);
 }
 
 function toggleInspector(force) {
-  const open = force ?? inspector.classList.contains("closed");
-  inspector.classList.toggle("closed", !open);
-  localStorage.setItem("codexInspectorOpen", String(open));
-  updateBackdrop();
-  if (open) {
-    state.mcpDialogRequested = false;
-    send({ type: "listMcp", verbose: false });
-  }
+  const mode = force === true
+    ? "inspector"
+    : force === false
+      ? "closed"
+      : toggleRightPanelMode(state.rightPanelMode, "inspector");
+  setRightPanelMode(mode);
 }
 
 function closeDrawers() {
   sidebar.classList.remove("open");
-  if (window.innerWidth < 1360) inspector.classList.add("closed");
+  if (window.innerWidth < 1360 && state.rightPanelMode !== "closed") setRightPanelMode("closed");
   syncSidebarToggle();
   updateBackdrop();
 }
 
 function navigateHistory(delta) {
+  if (!canBeginThreadSelection(state.selectionPending)) return;
   const next = navigateThread(state.navigation, delta);
   if (!next.threadId || next.threadId === state.threadId) return;
   state.navigation = { items: next.items, index: next.index };
@@ -5105,18 +8036,15 @@ threadSearchInput.addEventListener("input", () => {
   clearTimeout(state.searchTimer);
   state.searchTimer = setTimeout(() => refreshThreadList(null, threadSearchInput.value.trim()), 280);
 });
-resumeButton.addEventListener("click", () => resumeThread());
-threadIdInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") resumeThread();
-});
 statusButton.addEventListener("click", showStatus);
 connectionStatus.addEventListener("click", () => send({ type: "refreshMetadata", cwd: cwdInput.value.trim() }));
 sendButton.addEventListener("click", submitMessage);
 steerButton.addEventListener("click", submitSteerNow);
 followUpButton.addEventListener("click", submitFollowUp);
 function interruptActiveTurn() {
+  if (isSnapshotMode()) return;
   if (!state.running || !state.activeTurnId) return;
-  if (send({ type: "interrupt", turnId: state.activeTurnId })) {
+  if (send({ type: "interrupt", threadId: state.threadId, turnId: state.activeTurnId })) {
     clearUserInputRequest();
     updateControls();
   }
@@ -5223,7 +8151,7 @@ messageInput.addEventListener("keydown", (event) => {
 });
 
 document.addEventListener("click", (event) => {
-  if (!event.target.closest(".composer-shell")) {
+  if (!event.target.closest(".composer")) {
     state.choicePalette = null;
     slashPalette.classList.add("hidden");
     mentionPalette.classList.add("hidden");
@@ -5238,30 +8166,44 @@ document.addEventListener("keydown", (event) => {
 });
 
 for (const button of document.querySelectorAll("[data-view]")) button.addEventListener("click", () => switchView(button.dataset.view));
-outlineTab.addEventListener("click", () => setInspectorTab("outline"));
-sessionTab.addEventListener("click", () => setInspectorTab("session"));
-outlineBottomButton.addEventListener("click", () => {
-  scrollToBottom(true);
-  const messages = [...state.messageNodes.values()].filter((record) => record.role === "user");
-  setActiveOutlineMessage(messages.at(-1)?.id || null);
-});
-$("#railSearchButton").addEventListener("click", () => {
-  setSidebarOpen(true);
-  threadSearchInput.focus();
-});
-$("#railMcpButton").addEventListener("click", () => {
-  toggleInspector(true);
-});
-$("#railSettingsButton").addEventListener("click", () => toggleInspector());
+chatMinimapRail.addEventListener("pointerdown", beginConversationMinimapDrag);
+chatMinimapRail.addEventListener("pointerenter", showConversationMinimapPreview);
+chatMinimapRail.addEventListener("pointerleave", scheduleConversationMinimapPreviewHide);
+chatMinimapRail.addEventListener("pointermove", (event) => locateConversationMinimapPointer(event.clientY));
+chatMinimapRail.addEventListener("keydown", handleConversationMinimapKeydown);
+conversationOutline.addEventListener("pointerenter", showConversationMinimapPreview);
+conversationOutline.addEventListener("pointerleave", scheduleConversationMinimapPreviewHide);
 $("#inspectorButton").addEventListener("click", () => toggleInspector());
+filePanelButton.addEventListener("click", () => toggleFilePanel());
+$("#closeFilePanelButton").addEventListener("click", () => toggleFilePanel(false));
 $("#mobileMoreButton").addEventListener("click", () => toggleInspector(true));
 $("#closeInspectorButton").addEventListener("click", () => toggleInspector(false));
+explorerToggleButton.addEventListener("click", () => {
+  const collapsed = explorerShell.classList.toggle("collapsed");
+  explorerToggleButton.setAttribute("aria-expanded", String(!collapsed));
+  localStorage.setItem("codexExplorerOpen", String(!collapsed));
+});
+refreshExplorerButton.addEventListener("click", () => {
+  refreshExplorer({ refreshActiveFile: true });
+});
+rightPanelResizeHandle.addEventListener("pointerdown", beginFilePanelResize);
+rightPanelResizeHandle.addEventListener("keydown", (event) => {
+  if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+  event.preventDefault();
+  const current = Number(rightPanelResizeHandle.getAttribute("aria-valuenow")) || 480;
+  setFilePanelWidth(current + (event.key === "ArrowLeft" ? 16 : -16), { persist: true });
+});
 sidebarToggleButton.addEventListener("click", toggleSidebar);
 window.addEventListener("resize", syncSidebarViewport);
 drawerBackdrop.addEventListener("click", closeDrawers);
 $("#backThreadButton").addEventListener("click", () => navigateHistory(-1));
 $("#forwardThreadButton").addEventListener("click", () => navigateHistory(1));
-$("#refreshMcpButton").addEventListener("click", () => { state.mcpDialogRequested = false; send({ type: "listMcp", verbose: false }); });
+$("#refreshMcpButton").addEventListener("click", () => { state.mcpDialogRequested = false; send({ type: "listMcp", threadId: state.threadId, verbose: false }); });
+refreshSnapshotButton?.addEventListener("click", () => {
+  if (!state.threadId || !isSnapshotMode()) return;
+  refreshSnapshotButton.disabled = true;
+  send({ type: "refreshThreadSnapshot", threadId: state.threadId });
+});
 function openMentionInput() {
   const separator = messageInput.value && !/\s$/.test(messageInput.value) ? " " : "";
   messageInput.setRangeText(`${separator}@`, messageInput.selectionStart, messageInput.selectionEnd, "end");
@@ -5282,16 +8224,31 @@ imageInput.addEventListener("change", async () => {
   }
 });
 chat.addEventListener("scroll", () => {
+  noteHistoryRestoreScroll();
   state.followOutput = shouldFollowScroll(chat);
   jumpToBottomButton.classList.toggle("hidden", state.followOutput);
+  syncConversationMinimapActive();
   if (state.threadId) scheduleThreadUiSave();
 }, { passive: true });
-jumpToBottomButton.addEventListener("click", () => scrollToBottom(true));
-chat.addEventListener("toggle", () => requestAnimationFrame(() => scrollToBottom()), true);
-new MutationObserver(() => requestAnimationFrame(() => scrollToBottom())).observe(chat, { childList: true });
+jumpToBottomButton.addEventListener("click", jumpToLatest);
+chat.addEventListener("click", openFileLinkFromEvent);
+fileViewer.addEventListener("click", openFileLinkFromEvent);
+chat.addEventListener("toggle", () => {
+  if (state.historyRestoring || state.historyObserverMuted) return;
+  requestAnimationFrame(() => scrollToBottom());
+}, true);
+new MutationObserver(() => {
+  if (state.historyRestoring || state.historyObserverMuted) {
+    state.conversationReconcilePending = true;
+    return;
+  }
+  requestAnimationFrame(() => scrollToBottom());
+  scheduleConversationOutlineRender();
+}).observe(chat, { childList: true, subtree: true, characterData: true });
 window.addEventListener("pagehide", () => {
   saveThreadUi();
   saveToolCache();
+  for (const data of state.fileViewData.values()) revokeFileViewData(data);
 });
 
 workspaceButton.addEventListener("click", () => {
@@ -5305,7 +8262,7 @@ $("#applyCwdButton").addEventListener("click", (event) => {
   if (!cwd) return;
   cwdInput.value = cwd;
   localStorage.setItem("codexMathCwd", cwd);
-  if (state.threadId) send({ type: "updateSettings", cwd });
+  if (state.threadId) send({ type: "updateSettings", threadId: state.threadId, cwd });
   else send({ type: "refreshMetadata", cwd });
   cwdDialog.close();
   updateControls();
@@ -5324,7 +8281,7 @@ cwdInput.addEventListener("change", () => {
   const cwd = cwdInput.value.trim();
   if (!cwd) return;
   localStorage.setItem("codexMathCwd", cwd);
-  if (state.threadId) send({ type: "updateSettings", cwd });
+  if (state.threadId) send({ type: "updateSettings", threadId: state.threadId, cwd });
   updateControls();
 });
 
@@ -5339,10 +8296,14 @@ window.addEventListener("resize", () => {
   updateBackdrop();
   renderContextUsage();
   syncApprovalAreaPosition();
+  measureConversationMinimap();
 });
 
 if (composer && typeof ResizeObserver === "function") {
   new ResizeObserver(syncApprovalAreaPosition).observe(composer);
+}
+if (typeof ResizeObserver === "function") {
+  new ResizeObserver(measureConversationMinimap).observe(chat);
 }
 
 document.addEventListener("keydown", (event) => {
@@ -5353,6 +8314,12 @@ document.addEventListener("keydown", (event) => {
   if (window.innerWidth < 1360) closeDrawers();
 });
 
+setFilePanelWidth(localStorage.getItem("codexFilePanelWidth") || 480);
+{
+  const explorerOpen = localStorage.getItem("codexExplorerOpen") !== "false";
+  explorerShell.classList.toggle("collapsed", !explorerOpen);
+  explorerToggleButton.setAttribute("aria-expanded", String(explorerOpen));
+}
 autoSizeComposer();
 renderChangesView();
 renderCommandsView();

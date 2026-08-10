@@ -1,4 +1,8 @@
-export const CODEX_CLI_VERSION = "0.144.3";
+// The palette is capability-based. The connected App Server's initialize
+// userAgent is the source of truth for the runtime version shown in /status.
+export const CODEX_CLI_CATALOG_BASELINE = "0.144.3";
+/** @deprecated Use the runtime version from status-data.codexVersion(). */
+export const CODEX_CLI_VERSION = CODEX_CLI_CATALOG_BASELINE;
 
 // Linux/WSL release presentation order. /fast is inserted after /model because
 // the TUI exposes it dynamically when the selected model supports a fast tier.

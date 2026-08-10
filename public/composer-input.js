@@ -29,11 +29,41 @@ export function composeUserInput(text, mentions = [], images = []) {
 }
 
 export function displayInput(input = []) {
+  let imageIndex = 0;
   return input.map((part) => {
     if (part.type === "text") return part.text;
     if (part.type === "mention") return `@${part.name}`;
-    if (part.type === "image") return "[Image]";
-    if (part.type === "localImage") return `[Image: ${part.path}]`;
+    if (part.type === "image" || part.type === "localImage") {
+      imageIndex += 1;
+      return `[Image #${imageIndex}]`;
+    }
     return "";
   }).filter(Boolean).join("\n");
+}
+
+export function displayInputText(input = []) {
+  return input.map((part) => {
+    if (part?.type === "text") return String(part.text || "");
+    if (part?.type === "mention") return `@${part.name}`;
+    return "";
+  }).filter(Boolean).join("\n");
+}
+
+export function displayInputImages(input = []) {
+  let imageIndex = 0;
+  return input.flatMap((part) => {
+    if (!part || !["image", "localImage"].includes(part.type)) return [];
+    imageIndex += 1;
+    const url = part.type === "image" ? String(part.url || "") : "";
+    const src = url.startsWith("data:image/") ? url : "";
+    return [{ index: imageIndex, src, available: Boolean(src) }];
+  });
+}
+
+export function presentUserInput(input = []) {
+  return {
+    text: displayInputText(input),
+    displayText: displayInput(input),
+    images: displayInputImages(input),
+  };
 }

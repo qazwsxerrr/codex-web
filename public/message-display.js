@@ -1,8 +1,17 @@
-import { commandToolName, toolPreviewValue } from "./command-presentation.js";
+import { commandToolName, summarizeProcessActivities, toolPreviewValue } from "./command-presentation.js";
+import { reasoningText } from "./protocol-text.js";
 
 const PROCESS_TYPES = new Set([
   "thinking", "reasoning", "plan", "commandExecution", "fileChange", "mcpToolCall",
   "dynamicToolCall", "webSearch", "toolCall", "toolResult", "status", "error",
+  "collabToolCall", "collabAgentToolCall", "subAgentActivity", "agentStatus", "imageView",
+  "imageGeneration", "hookPrompt", "sleep",
+  "contextCompaction", "enteredReviewMode", "exitedReviewMode", "review",
+]);
+
+const TOOL_CALL_TYPES = new Set([
+  "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch",
+  "collabToolCall", "collabAgentToolCall", "subAgentActivity", "imageView", "imageGeneration",
 ]);
 
 function asText(value) {
@@ -20,6 +29,7 @@ function jsonText(value) {
 
 function statusValue(status) {
   if (status && typeof status === "object") {
+    if (Array.isArray(status.activeFlags) && status.activeFlags.length) return "running";
     return status.kind ?? status.status ?? status.state ?? status.type ?? status.result;
   }
   return status;
@@ -27,29 +37,39 @@ function statusValue(status) {
 
 export function normalizeDisplayStatus(status) {
   const value = compactWhitespace(statusValue(status)).replace(/[\s_-]/g, "").toLowerCase();
-  if (["inprogress", "running", "started", "active", "processing", "cancelling", "pending"].includes(value)) {
+  if (["inprogress", "running", "started", "interacted", "active", "processing", "cancelling", "pending"].includes(value)) {
     return { kind: "running", label: "Running", tone: "success", isActive: true, isFailure: false };
+  }
+  if (["pendinginit", "waiting"].includes(value)) {
+    return { kind: "waiting", label: "Waiting", tone: "warning", isActive: true, isFailure: false };
   }
   if (["completed", "complete", "succeeded", "success", "done"].includes(value)) {
     return { kind: "completed", label: "Completed", tone: "success", isActive: false, isFailure: false };
   }
-  if (["denied", "rejected", "forbidden"].includes(value)) {
+  if (["denied", "declined", "rejected", "forbidden"].includes(value)) {
     return { kind: "denied", label: "Denied", tone: "danger", isActive: false, isFailure: true };
   }
   if (["failed", "failure", "error", "errored"].includes(value)) {
     return { kind: "failed", label: "Failed", tone: "danger", isActive: false, isFailure: true };
   }
-  if (["cancelled", "canceled", "aborted", "stopped", "interrupted"].includes(value)) {
+  if (["cancelled", "canceled", "aborted", "stopped", "interrupted", "shutdown"].includes(value)) {
     return { kind: "cancelled", label: "Cancelled", tone: "neutral", isActive: false, isFailure: false };
   }
   return { kind: "unknown", label: "Unknown", tone: "neutral", isActive: false, isFailure: false };
 }
 
 export function toolName(item = {}) {
-  if (item.type === "commandExecution") return commandToolName(item);
+  if (item.type === "commandExecution" || item.viewType === "command") return commandToolName(item);
   if (item.type === "read" || item.viewType === "read") return "read";
   if (item.type === "webSearch" || item.viewType === "search") return "web_search";
   if (item.type === "mcpToolCall") return item.tool || "mcp";
+  if (item.type === "dynamicToolCall") return item.tool || item.name || "dynamic_tool";
+  if (["collabToolCall", "collabAgentToolCall", "subAgentActivity"].includes(item.type)) {
+    return item.agentName || item.agent || item.agentPath || item.agentThreadId || item.name || item.tool || "agent";
+  }
+  if (item.type === "agentStatus") return item.agentName || item.agent || item.agentPath || item.agentThreadId || "agent";
+  if (item.type === "imageView") return "image_view";
+  if (item.type === "imageGeneration") return "image_generation";
   if (item.type === "fileChange" || item.viewType === "change") return "edit";
   return item.name || item.tool || item.type || "tool";
 }
@@ -67,6 +87,14 @@ function inputValue(item = {}) {
   if (item.type === "mcpToolCall") {
     return item.input ?? item.arguments ?? item.params ?? item.parameters ?? item.tool;
   }
+  if (item.type === "dynamicToolCall") {
+    return item.input ?? item.arguments ?? item.params ?? item.parameters ?? item.tool ?? item.name;
+  }
+  if (["collabToolCall", "collabAgentToolCall", "subAgentActivity"].includes(item.type)) {
+    return item.agentName ?? item.agent ?? item.agentPath ?? item.agentThreadId ?? item.name ?? item.tool ?? item.task ?? item.prompt ?? item.input;
+  }
+  if (item.type === "agentStatus") return item.agentName ?? item.agent ?? item.agentPath ?? item.agentThreadId ?? item.message ?? item.input;
+  if (item.type === "imageView") return item.path ?? item.url ?? item.input ?? item.image;
   if (item.type === "fileChange" || item.viewType === "change") {
     return item.changes ?? item.files ?? item.diff ?? item.patch ?? item.input ?? "";
   }
@@ -97,10 +125,29 @@ export function toolType(item = {}) {
   return toolName(item);
 }
 
-const TOOL_CALL_TYPES = new Set(["commandExecution", "fileChange", "mcpToolCall", "webSearch"]);
-
 export function isToolCallItem(item) {
   return Boolean(item && TOOL_CALL_TYPES.has(item.type));
+}
+
+export function activityCategory(item = {}) {
+  const type = item?.type || item?.viewType || "unknown";
+  return {
+    commandExecution: "commands",
+    fileChange: "fileChanges",
+    mcpToolCall: "mcp",
+    dynamicToolCall: "dynamicTools",
+    webSearch: "webSearch",
+    collabToolCall: "agents",
+    collabAgentToolCall: "agents",
+    subAgentActivity: "agents",
+    agentStatus: "agents",
+    imageView: "imageViews",
+    imageGeneration: "imageViews",
+    contextCompaction: "compactions",
+    enteredReviewMode: "reviews",
+    exitedReviewMode: "reviews",
+    review: "reviews",
+  }[type] || null;
 }
 
 function hasDisplayableText(item) {
@@ -111,7 +158,7 @@ function hasDisplayableText(item) {
       return block?.type === "text" || block?.type === "image";
     });
   }
-  return Boolean(asText(item.text ?? item.message ?? item.thinking ?? item.reasoning ?? item.explanation ?? item.planText).trim());
+  return Boolean(asText(item.text ?? item.message ?? item.thinking ?? item.reasoning ?? item.explanation ?? item.planText ?? reasoningText(item)).trim());
 }
 
 /** A process item that contributes to the `N messages` part of the header. */
@@ -160,7 +207,7 @@ export const getModelDisplayName = modelDisplayName;
 export const resolveAssistantModelLabel = modelDisplayName;
 
 export function presentTool(item = {}, options = {}) {
-  const status = normalizeDisplayStatus(item.status ?? item.state ?? item.result);
+  const status = normalizeDisplayStatus(item.status ?? item.state ?? item.result ?? item.kind);
   const rawInput = originalToolInput(item);
   const inputPreview = toolInputPreview(item, options.maxLength);
   return {
@@ -218,20 +265,42 @@ function itemDuration(item) {
   return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
+function dedupeProcessItems(items) {
+  const result = [];
+  const positions = new Map();
+  for (const item of Array.isArray(items) ? items.filter(Boolean) : []) {
+    const id = item?.id;
+    if (id === undefined || id === null || String(id) === "") {
+      result.push(item);
+      continue;
+    }
+    const key = String(id);
+    if (!positions.has(key)) {
+      positions.set(key, result.length);
+      result.push(item);
+    } else {
+      result[positions.get(key)] = item;
+    }
+  }
+  return result;
+}
+
 export function buildProcessDetails(items = [], options = {}) {
-  const list = Array.isArray(items) ? items.filter(Boolean) : [];
+  const list = dedupeProcessItems(items);
   const durations = list.map(itemDuration).filter((value) => value !== null);
   const durationMs = Number.isFinite(Number(options.durationMs))
     ? Number(options.durationMs)
     : durations.length ? durations.reduce((sum, value) => sum + value, 0) : null;
   const toolCount = list.filter(isToolCallItem).length;
   const messageCount = list.filter(isDisplayableProcessItem).length;
+  const activityCounts = summarizeProcessActivities(list);
   return {
     id: options.id ?? list.find((item) => item.id)?.turnId ?? null,
     items: list,
     messageCount,
     toolCount,
-    counts: { messages: messageCount, tools: toolCount },
+    counts: { messages: messageCount, tools: toolCount, ...activityCounts },
+    activityCounts,
     durationMs,
     status: normalizeDisplayStatus(options.status ?? list.at(-1)?.status ?? "completed").kind,
   };

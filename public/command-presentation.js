@@ -1,11 +1,19 @@
 const STATUS_LABELS = {
   running: "Running",
+  waiting: "Waiting",
   completed: "Completed",
   failed: "Failed",
   denied: "Denied",
   cancelled: "Cancelled",
   unknown: "Unknown",
 };
+
+const AGENT_ACTIVITY_TYPES = new Set([
+  "collabToolCall",
+  "collabAgentToolCall",
+  "subAgentActivity",
+  "agentStatus",
+]);
 
 const READONLY_COMMANDS = new Set([
   "cat", "cut", "du", "file", "head", "less", "ls", "more", "nl", "pwd",
@@ -303,27 +311,64 @@ function fallbackSummary(displayCommand, maxLength) {
 
 function commandActionsCategory(actions) {
   if (!Array.isArray(actions)) return "";
-  const types = new Set(actions.map((action) => action?.type));
+  const types = new Set(actions.map(commandActionKind));
   if (types.has("search") || types.has("listFiles")) return "search";
   if (types.has("read")) return "read";
   return "";
 }
 
-function summarizeCommandActions(actions, maxLength) {
+/** App Server calls this best-effort parser output `parsed_cmd`; older bridge
+ * payloads expose the same array as `commandActions`. */
+export function commandActionsFromItem(item = {}) {
+  if (Array.isArray(item?.commandActions)) return item.commandActions;
+  if (Array.isArray(item?.parsed_cmd)) return item.parsed_cmd;
+  if (Array.isArray(item?.parsedCmd)) return item.parsedCmd;
+  return [];
+}
+
+const READONLY_ACTION_KINDS = new Set(["read", "listFiles", "search"]);
+
+function commandActionKind(action) {
+  const value = action && typeof action === "object"
+    ? action.type ?? action.kind ?? action.action ?? action.name
+    : action;
+  const normalized = asText(value).replace(/[\s_-]/g, "").toLowerCase();
+  if (["read", "readfile", "fileread", "readtext", "readbytes"].includes(normalized)) return "read";
+  if (["list", "listfile", "listfiles", "filelist", "glob", "listdirectory", "listdir"].includes(normalized)) return "listFiles";
+  if (["search", "grep", "rg", "ripgrep", "filesearch", "searchfiles", "find"].includes(normalized)) return "search";
+  if (["write", "writefile", "filewrite", "edit", "delete", "deletefile", "modify"].includes(normalized)) return "write";
+  return normalized || "unknown";
+}
+
+function commandActionDetails(actions, maxLength) {
+  const list = Array.isArray(actions) ? actions : [];
+  const actionKinds = [...new Set(list.map(commandActionKind))];
+  const readonlyEligibility = list.length > 0
+    && actionKinds.every((kind) => READONLY_ACTION_KINDS.has(kind));
+  return {
+    actionSummary: summarizeCommandActions(list, maxLength),
+    actionKinds,
+    actionCount: list.length,
+    readonlyEligibility,
+  };
+}
+
+export function summarizeCommandActions(actions, maxLength) {
   if (!Array.isArray(actions)) return "";
-  const search = actions.find((action) => action?.type === "search");
+  const search = actions.find((action) => commandActionKind(action) === "search");
   if (search) {
     const query = search.query || "";
     return query ? truncateText(`搜索 “${query}”`, maxLength) : "搜索项目文件";
   }
-  if (actions.some((action) => action?.type === "listFiles")) return "列出项目文件";
-  const read = actions.find((action) => action?.type === "read");
+  if (actions.some((action) => commandActionKind(action) === "listFiles")) return "列出项目文件";
+  const read = actions.find((action) => commandActionKind(action) === "read");
   return read ? `查看 ${displayPath(read.path)}` : "";
 }
 
 function searchToolText(item) {
-  const actionText = Array.isArray(item?.commandActions)
-    ? item.commandActions.flatMap((action) => [action?.type, action?.query, action?.path])
+  const actions = commandActionsFromItem(item);
+  const actionText = actions.length
+    ? actions.flatMap((action) => [action?.type, action?.query, action?.path, action?.cmd])
     : [];
   return [item?.server, item?.tool, item?.name, item?.command, item?.action?.type, ...actionText]
     .filter(Boolean)
@@ -340,7 +385,7 @@ export function searchActivityLabel(item) {
   if (item.type === "commandExecution") {
     const command = unwrapShellCommand(item.command);
     const names = splitSegments(command).map((segment) => commandBase(segment[0]));
-    if (commandActionsCategory(item.commandActions) === "search"
+    if (commandActionsCategory(commandActionsFromItem(item)) === "search"
       || classifyCommand(command).category === "search"
       || names.some((name) => ["find", "grep", "rg"].includes(name))) {
       return "Searching files...";
@@ -398,6 +443,83 @@ function segmentIsReadonly(segment, source) {
   return false;
 }
 
+// `commandActions` are an App Server best-effort parse of one shell command.
+// They are useful for a secondary detail line, but the raw shell still decides
+// whether a command can be folded into an Explore group.
+function segmentExplorationKind(segment) {
+  const command = commandBase(segment?.[0]);
+  const args = segment?.slice(1) || [];
+  if (!command || !segmentIsReadonly(segment, "")) return "";
+  if (["rg", "grep"].includes(command)) return args.includes("--files") ? "listFiles" : "search";
+  if (command === "find") return "listFiles";
+  if (["ls", "tree"].includes(command)) return "listFiles";
+  // These commands are read-only filters commonly used after rg/find.  They
+  // do not introduce another exploration action of their own.
+  if (["sort", "uniq", "wc", "cut", "tr"].includes(command)) return "filter";
+  if (READ_TOOL_COMMANDS.has(command)
+    || ["pwd", "file", "stat", "du"].includes(command)) return "read";
+  return "";
+}
+
+function commandSource(itemOrCommand) {
+  if (typeof itemOrCommand === "string") return itemOrCommand;
+  return itemOrCommand?.command ?? itemOrCommand?.commandLine ?? itemOrCommand?.rawCommand ?? "";
+}
+
+/**
+ * Whether a commandExecution is safe to present as one collapsed Explore
+ * activity.  This is intentionally stricter than `classifyCommand`: a
+ * command may be read-only while still being a real shell run (for example a
+ * compound command mixing sed, rg and git status).
+ */
+export function isReadonlyExploration(itemOrCommand = {}) {
+  const item = itemOrCommand && typeof itemOrCommand === "object" ? itemOrCommand : null;
+  if (item && item.type && item.type !== "commandExecution" && item.viewType !== "command") return false;
+  if (item && normalizeToolStatus(item.status ?? item.state ?? item.result).isActive) return false;
+  if (item && Number.isFinite(Number(item.durationMs)) && Number(item.durationMs) >= 5000) return false;
+  const raw = asText(commandSource(itemOrCommand)).trim();
+  if (!raw || hasHeredoc(raw)) return false;
+  const displayCommand = unwrapShellCommand(raw);
+  const segments = splitSegments(displayCommand);
+  if (!segments.length) return false;
+  const shellKinds = segments.map(segmentExplorationKind);
+  if (shellKinds.some((kind) => !kind)) return false;
+  const meaningfulShellKinds = shellKinds.filter((kind) => kind !== "filter");
+  if (!meaningfulShellKinds.length || new Set(meaningfulShellKinds).size > 1) return false;
+
+  const rawActions = item ? commandActionsFromItem(item) : [];
+  if (item && (Array.isArray(item.commandActions) || Array.isArray(item.parsed_cmd) || Array.isArray(item.parsedCmd))) {
+    const actions = commandActionDetails(rawActions);
+    if (!actions.readonlyEligibility || actions.actionKinds.length !== 1) return false;
+    if (actions.actionKinds[0] !== meaningfulShellKinds[0]) return false;
+  }
+  return true;
+}
+
+/**
+ * Collapse contiguous read/list/search command items while preserving every
+ * non-exploration item in its original position.
+ */
+export function groupContiguousExploration(items = []) {
+  const groups = [];
+  let current = null;
+  const flush = () => {
+    if (current) groups.push(current);
+    current = null;
+  };
+  for (const item of Array.isArray(items) ? items : []) {
+    if (isReadonlyExploration(item)) {
+      if (!current) current = { type: "explored", viewType: "explored", items: [] };
+      current.items.push(item);
+    } else {
+      flush();
+      groups.push(item);
+    }
+  }
+  flush();
+  return groups;
+}
+
 function hasWriteSignal(source, segments) {
   if (segments.some((segment) => segment.some((value) => [">", ">>", "<<"].includes(value)))) return true;
   if (/(^|\s)(?:tee|rm|mv|cp|mkdir|touch|chmod|chown)(?:\s|$)/.test(source)) return true;
@@ -407,21 +529,86 @@ function hasWriteSignal(source, segments) {
 
 export function normalizeToolStatus(status) {
   const raw = typeof status === "object"
-    ? status?.kind || status?.status || status?.state || status?.type || status?.result
+    ? (Array.isArray(status?.activeFlags) && status.activeFlags.length
+      ? "running"
+      : status?.kind || status?.status || status?.state || status?.type || status?.result)
     : status;
   const value = asText(raw).replace(/[\s_-]/g, "").toLowerCase();
-  const kind = value === "inprogress" || value === "running" || value === "started" || value === "active" || value === "processing" || value === "cancelling" || value === "pending"
+  const kind = value === "inprogress" || value === "running" || value === "started" || value === "interacted" || value === "active" || value === "processing" || value === "cancelling" || value === "pending"
     ? "running"
-    : value === "completed" || value === "complete" || value === "succeeded" || value === "success"
-      ? "completed"
-      : value === "denied" || value === "rejected" || value === "forbidden"
-        ? "denied"
-        : value === "failed" || value === "failure" || value === "error" || value === "errored"
-        ? "failed"
-          : value === "cancelled" || value === "canceled" || value === "aborted" || value === "stopped" || value === "interrupted"
-            ? "cancelled"
-            : "unknown";
-  return { kind, label: STATUS_LABELS[kind], isActive: kind === "running", isFailure: kind === "failed" || kind === "denied" };
+    : value === "waiting" || value === "pendinginit"
+      ? "waiting"
+      : value === "completed" || value === "complete" || value === "succeeded" || value === "success"
+        ? "completed"
+        : value === "denied" || value === "declined" || value === "rejected" || value === "forbidden"
+          ? "denied"
+          : value === "failed" || value === "failure" || value === "error" || value === "errored" || value === "notfound"
+            ? "failed"
+            : value === "cancelled" || value === "canceled" || value === "aborted" || value === "stopped" || value === "interrupted" || value === "shutdown"
+              ? "cancelled"
+              : "unknown";
+  return { kind, label: STATUS_LABELS[kind], isActive: kind === "running" || kind === "waiting", isFailure: kind === "failed" || kind === "denied" };
+}
+
+function agentActivityName(item = {}) {
+  const direct = item.agentName || item.agent || item.agentPath || item.agentThreadId || item.name || item.task;
+  if (direct) return String(direct);
+  if (String(item.tool || "").trim().toLowerCase() === "wait") return "agents";
+  const receiver = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds.find(Boolean) : null;
+  if (receiver) return String(receiver);
+  const states = item.agentsStates && typeof item.agentsStates === "object" ? Object.keys(item.agentsStates) : [];
+  return states[0] || item.tool || "agent";
+}
+
+function agentRawStatus(item = {}) {
+  if (item.status !== undefined && item.status !== null && item.status !== "") return item.status;
+  if (item.state !== undefined && item.state !== null && item.state !== "") return item.state;
+  if (item.kind !== undefined && item.kind !== null && item.kind !== "") return item.kind;
+  const states = item.agentsStates && typeof item.agentsStates === "object"
+    ? Object.values(item.agentsStates).map((value) => value?.status ?? value?.state ?? value?.kind).filter(Boolean)
+    : [];
+  if (states.some((value) => ["running", "inProgress", "started", "interacted"].includes(String(value)))) return "running";
+  if (states.some((value) => ["pendingInit", "pending", "waiting"].includes(String(value)))) return "waiting";
+  return states[0] || "";
+}
+
+/**
+ * Present the App Server's child-agent lifecycle using the CLI vocabulary.
+ * `collabAgentToolCall.tool` carries the operation, while `status` carries
+ * the RPC lifecycle; neither field alone is sufficient for a useful label.
+ */
+export function presentAgentActivity(item = {}) {
+  const type = item?.type ?? item?.viewType ?? "agent";
+  const rawStatus = agentRawStatus(item);
+  const status = normalizeToolStatus(rawStatus);
+  const tool = String(item?.tool || "").trim();
+  const kind = String(item?.kind || "").trim();
+  const operation = tool.toLowerCase();
+  const name = agentActivityName(item);
+  const waiting = operation === "wait" && !status.isFailure;
+  let label;
+  if (waiting || ["waiting", "pending", "pendingInit"].includes(kind)) {
+    label = "Waiting for agents";
+  } else if (kind === "interacted" || operation === "sendinput" || operation === "resumeagent") {
+    label = `Interacted ${name}`;
+  } else if (kind === "interrupted" || operation === "closeagent" || status.kind === "cancelled" || status.kind === "failed" || status.kind === "denied") {
+    label = `Stopped ${name}`;
+  } else if (status.kind === "completed") {
+    label = `Completed ${name}`;
+  } else {
+    label = `Started ${name}`;
+  }
+  return {
+    type,
+    name,
+    tool,
+    kind,
+    rawStatus,
+    status,
+    label,
+    isWaiting: waiting || ["waiting", "pending", "pendingInit"].includes(kind),
+    isAgentActivity: AGENT_ACTIVITY_TYPES.has(type),
+  };
 }
 
 const PREVIEW_KEYS = ["command", "path", "file_path", "pattern", "query"];
@@ -530,7 +717,15 @@ export function classifyCommand(rawCommand, options = {}) {
   else if (["test", "build", "write"].includes(category) || (category === "runner" && !readonly)) standaloneReason = `${category} command`;
   else if (Number.isFinite(durationMs) && durationMs >= 5000) standaloneReason = "long-running command";
   const groupable = readonly && !standaloneReason;
-  return { category, readonly, groupable, standaloneReason };
+  return {
+    category,
+    readonly,
+    groupable,
+    // Keep `groupable` backwards compatible for callers that use it as a
+    // generic read-only hint.  Explore uses the stricter shell/action check.
+    explorationEligible: isReadonlyExploration(rawCommand),
+    standaloneReason,
+  };
 }
 
 export function commandEnvironmentLabel(rawCommand, options = {}) {
@@ -548,12 +743,12 @@ export function commandEnvironmentLabel(rawCommand, options = {}) {
 export function commandToolName(itemOrCommand = {}) {
   if (typeof itemOrCommand === "object" && itemOrCommand !== null) {
     if (itemOrCommand.type === "read" || itemOrCommand.viewType === "read") return "read";
-    if (Array.isArray(itemOrCommand.commandActions)
-      && itemOrCommand.commandActions.some((action) => action?.type === "read")) return "read";
+    // App Server commandExecution is the canonical shell tool.  A
+    // commandActions read entry is only parsed detail and must not rename the
+    // command itself (especially when the shell contains multiple segments).
+    if (itemOrCommand.type === "commandExecution" || itemOrCommand.viewType === "command") return "bash";
   }
-  const rawCommand = typeof itemOrCommand === "string"
-    ? itemOrCommand
-    : itemOrCommand?.command ?? itemOrCommand?.commandLine ?? itemOrCommand?.rawCommand ?? "";
+  const rawCommand = commandSource(itemOrCommand);
   const names = splitSegments(unwrapShellCommand(rawCommand)).map((segment) => commandBase(segment[0]));
   return names.some((name) => READ_TOOL_COMMANDS.has(name)) ? "read" : "bash";
 }
@@ -615,18 +810,110 @@ export function presentCommand(itemOrCommand, options = {}) {
   const displayCommand = unwrapShellCommand(raw);
   const normalizedStatus = normalizeToolStatus(item.status ?? item.state ?? item.result);
   const classification = classifyCommand(raw, { durationMs: item.durationMs ?? options.durationMs });
-  const actionCategory = commandActionsCategory(item.commandActions);
-  const actionSummary = summarizeCommandActions(item.commandActions, options.maxLength);
+  const actionDetails = commandActionDetails(commandActionsFromItem(item), options.maxLength);
+  const explorationEligible = item.type === "commandExecution" || item.viewType === "command"
+    ? isReadonlyExploration(item)
+    : classification.explorationEligible;
   return {
     rawCommand: raw,
     displayCommand,
     ...classification,
-    summary: actionSummary || summarizeCommand(raw, options),
-    category: actionCategory || classification.category,
+    summary: actionDetails.actionSummary || summarizeCommand(raw, options),
+    category: classification.category,
     toolName: commandToolName(item),
+    actionSummary: actionDetails.actionSummary,
+    actionKinds: actionDetails.actionKinds,
+    actionCount: actionDetails.actionCount,
+    readonlyEligibility: (Array.isArray(item.commandActions) || Array.isArray(item.parsed_cmd) || Array.isArray(item.parsedCmd))
+      ? actionDetails.readonlyEligibility && explorationEligible
+      : explorationEligible,
+    explorationEligible,
     environmentLabel: commandEnvironmentLabel(raw, options),
     normalizedStatus,
     rawInput: raw,
     inputPreview: toolInputPreview(item, options),
   };
+}
+
+function protocolItemType(item) {
+  return asText(item?.type ?? item?.viewType).replace(/[\s_-]/g, "").toLowerCase();
+}
+
+/**
+ * Produce the active-row model used by status presentations.  This helper
+ * deliberately exposes protocol type and status without inventing a tool name
+ * from command text for non-command items.
+ */
+export function presentActiveItem(item = {}, options = {}) {
+  const type = item?.type ?? item?.viewType ?? "tool";
+  const normalizedStatus = normalizeToolStatus(item?.status ?? item?.state ?? item?.result ?? options.status);
+  if (type === "commandExecution" || item?.viewType === "command") {
+    return {
+      id: item?.id ?? null,
+      type: "commandExecution",
+      ...presentCommand(item, options),
+      isActive: normalizedStatus.isActive,
+    };
+  }
+  const rawInput = toolInputText(item);
+  return {
+    id: item?.id ?? null,
+    type,
+    name: item?.toolName || item?.tool || item?.name || type,
+    rawInput,
+    inputPreview: toolInputPreview(item, options),
+    normalizedStatus,
+    isActive: normalizedStatus.isActive,
+  };
+}
+
+function uniqueActivityItems(items) {
+  const list = Array.isArray(items) ? items.filter(Boolean) : [];
+  const positions = new Map();
+  const result = [];
+  for (const item of list) {
+    const id = item?.id;
+    if (!id || !positions.has(id)) {
+      positions.set(id, result.length);
+      result.push(item);
+    } else {
+      result[positions.get(id)] = item;
+    }
+  }
+  return result;
+}
+
+/**
+ * Count process activity by protocol category.  `commandActions` are parser
+ * output and therefore counted separately from command executions.
+ */
+export function summarizeProcessActivities(items = [], options = {}) {
+  const list = options.dedupe === false ? (Array.isArray(items) ? items.filter(Boolean) : []) : uniqueActivityItems(items);
+  const counts = {
+    commands: 0,
+    actions: 0,
+    fileChanges: 0,
+    mcp: 0,
+    webSearch: 0,
+    agents: 0,
+    dynamicTools: 0,
+    imageViews: 0,
+    compactions: 0,
+    reviews: 0,
+  };
+  for (const item of list) {
+    const type = protocolItemType(item);
+    if (type === "commandexecution") {
+      counts.commands += 1;
+      counts.actions += commandActionsFromItem(item).length;
+    } else if (type === "filechange") counts.fileChanges += 1;
+    else if (type === "mcptoolcall") counts.mcp += 1;
+    else if (type === "websearch") counts.webSearch += 1;
+    else if (["collabtoolcall", "collabagenttoolcall", "subagentactivity", "agentstatus"].includes(type)) counts.agents += 1;
+    else if (type === "dynamictoolcall") counts.dynamicTools += 1;
+    else if (type === "imageview" || type === "imagegeneration") counts.imageViews += 1;
+    else if (type === "contextcompaction") counts.compactions += 1;
+    else if (["enteredreviewmode", "exitedreviewmode", "review"].includes(type)) counts.reviews += 1;
+  }
+  return counts;
 }

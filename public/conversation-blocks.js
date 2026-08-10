@@ -49,14 +49,28 @@ export function buildConversationBlocks(turns, options = {}) {
         blocks.push({ type: "fileChange", turnId, item });
       } else if (item.type === "mcpToolCall" || item.viewType === "mcp") {
         blocks.push({ type: "mcpTool", turnId, item });
+      } else if (item.type === "dynamicToolCall" || item.viewType === "dynamicTool") {
+        blocks.push({ type: "dynamicTool", turnId, item });
+      } else if (["collabToolCall", "collabAgentToolCall", "subAgentActivity", "agentStatus"].includes(item.type) || item.viewType === "agent") {
+        blocks.push({ type: "agent", turnId, item });
+      } else if (["imageView", "imageGeneration"].includes(item.type) || item.viewType === "imageView") {
+        blocks.push({ type: "imageView", turnId, item });
+      } else if (["hookPrompt", "sleep"].includes(item.type)) {
+        blocks.push({ type: "status", turnId, item });
+      } else if (item.type === "contextCompaction" || item.viewType === "compaction") {
+        blocks.push({ type: "compaction", turnId, item });
+      } else if (["enteredReviewMode", "exitedReviewMode", "review"].includes(item.type) || item.viewType === "review") {
+        blocks.push({ type: "review", turnId, item });
       } else if (item.type === "webSearch" || item.viewType === "search") {
         blocks.push({ type: "search", turnId, item });
       } else if (item.type === "plan" || item.viewType === "plan") {
         blocks.push({ type: "plan", turnId, item });
+      } else if (["reasoning", "thinking"].includes(item.type) || item.viewType === "reasoning") {
+        blocks.push({ type: "reasoning", turnId, item });
       } else if (item.type === "error" || item.viewType === "error") {
         blocks.push({ type: "error", turnId, item });
       } else {
-        blocks.push({ type: "status", turnId, item });
+        blocks.push({ type: "unknown", turnId, item });
       }
     }
   }

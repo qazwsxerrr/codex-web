@@ -1,8 +1,9 @@
 # Codex Web Workspace
 
 A lightweight local browser client for `codex app-server` with Markdown/KaTeX,
-model and reasoning controls, live thread status, and a Codex CLI 0.144.3-aware
-slash-command palette for Linux/WSL.
+model and reasoning controls, live thread status, and a capability-based
+slash-command palette for Linux/WSL. The connected App Server reports the
+actual CLI version at runtime.
 
 ## Workspace views
 
@@ -31,10 +32,17 @@ support `thread/list`, the sidebar reports that limitation and keeps manual
 resume available instead of presenting a synthetic history list.
 
 If another Codex client currently owns the Thread rollout writer, the web client
-falls back to `thread/read` to restore the existing conversation. History,
-Markdown/KaTeX, tool output, diffs, and status remain available. The composer and
-other controls keep their normal appearance; App Server reports the original
-`already has an active writer` error if a write is attempted.
+falls back to `thread/read` to restore the existing conversation as an explicit
+read-only snapshot. History, Markdown/KaTeX, tool output, diffs, and status
+remain available; the banner shows the snapshot timestamp and owning-client
+reason, while send, steer, approval, and thread settings are disabled. Use
+Refresh snapshot to read the latest persisted history, or Fork to create a live
+thread. The browser does not claim to mirror events that it never received from
+the CLI-owned writer.
+
+This client targets desktop browsers that can reach a local Codex CLI/App Server.
+Mobile layout and mobile invocation are intentionally outside the supported
+scope.
 
 ## What v4 fixes
 
@@ -44,7 +52,8 @@ other controls keep their normal appearance; App Server reports the original
 - Tab completes a command without executing it.
 - Commands that require arguments, such as `/rename`, complete to `/rename `
   instead of executing an empty command.
-- The palette follows the Codex CLI 0.144.3 Linux/WSL command order and accepts
+- The palette follows the Linux/WSL command order used by the catalog baseline
+  and accepts
   the native aliases `/clean` -> `/stop` and `/pet` -> `/pets`.
 - `/fast` is retained as the model service-tier command exposed dynamically by
   the Codex TUI.
@@ -86,10 +95,11 @@ Commands that require the Codex terminal TUI or an IDE host remain visible but
 are greyed out and explicitly report that they are unavailable. They are not
 silently treated as successful empty commands.
 
-The command-name catalog is complete for a release build of Codex CLI 0.144.3
-running on Linux/WSL, plus the dynamic `/fast` service-tier command. Platform-
-hidden commands such as `/app` and `/sandbox-add-read-dir`, and debug-build-only
-commands such as `/rollout` and `/test-approval`, are intentionally not shown.
+The command-name catalog records the Linux/WSL capability baseline used by this
+client, plus the dynamic `/fast` service-tier command. The `/status` dialog
+shows the connected runtime's actual CLI version. Platform-hidden commands such
+as `/app` and `/sandbox-add-read-dir`, and debug-build-only commands such as
+`/rollout` and `/test-approval`, are intentionally not shown.
 
 ## Install
 

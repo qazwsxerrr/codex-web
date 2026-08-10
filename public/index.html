@@ -5,29 +5,23 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light" />
     <title>Codex Workspace</title>
+    <link rel="preload" href="/vendor/katex/dist/fonts/KaTeX_Main-Regular.woff2" as="font" type="font/woff2" crossorigin="anonymous" />
+    <link rel="preload" href="/vendor/katex/dist/fonts/KaTeX_Math-Italic.woff2" as="font" type="font/woff2" crossorigin="anonymous" />
     <link rel="stylesheet" href="/vendor/katex/dist/katex.min.css" />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
     <div class="app-shell">
       <nav class="activity-rail" aria-label="Workspace views">
-        <div class="codex-mark" aria-label="Codex">C</div>
         <button class="rail-button active" type="button" data-view="conversation" aria-label="Conversation" title="Conversation"><i data-icon="message-square"></i></button>
         <button class="rail-button" type="button" data-view="changes" aria-label="Changes" title="Changes"><i data-icon="git-compare"></i></button>
         <button class="rail-button" type="button" data-view="commands" aria-label="Commands" title="Commands"><i data-icon="terminal-square"></i></button>
-        <div class="rail-spacer"></div>
-        <button id="railSearchButton" class="rail-button" type="button" aria-label="Search conversations" title="Search"><i data-icon="search"></i></button>
-        <button id="railMcpButton" class="rail-button" type="button" aria-label="MCP servers" title="MCP servers"><i data-icon="blocks"></i></button>
-        <button id="railSettingsButton" class="rail-button" type="button" aria-label="Session inspector" title="Session inspector"><i data-icon="sliders-horizontal"></i></button>
       </nav>
 
       <aside id="sidebar" class="sidebar" aria-label="Conversations">
         <div class="sidebar-head">
-          <div class="sidebar-heading">
-            <span class="eyebrow">WORKSPACE</span>
-            <h1>Codex</h1>
-          </div>
-          <button id="newThreadButton" class="icon-button primary-icon" type="button" aria-label="New conversation" title="New conversation" disabled><i data-icon="square-pen"></i></button>
+          <h1 class="sidebar-brand">Codex</h1>
+          <button id="newThreadButton" class="sidebar-new-button" type="button" aria-label="New conversation" title="New conversation" disabled><i data-icon="plus"></i><span>New</span></button>
         </div>
         <div class="thread-search-wrap">
           <i data-icon="search"></i>
@@ -39,13 +33,17 @@
           <button id="loadMoreThreadsButton" class="text-button hidden" type="button">Load more</button>
         </div>
         <nav id="threadList" class="thread-list" aria-label="Recent threads"></nav>
-        <details class="manual-resume">
-          <summary>Resume by Thread ID</summary>
-          <div class="manual-resume-form">
-            <input id="threadIdInput" spellcheck="false" placeholder="019f..." aria-label="Thread ID" />
-            <button id="resumeButton" type="button" disabled>Resume</button>
+        <section id="explorerShell" class="explorer-shell" aria-label="Workspace files">
+          <div class="explorer-head">
+            <button id="explorerToggleButton" class="explorer-title" type="button" aria-expanded="true" aria-controls="explorerTree">
+              <i data-icon="chevron-down"></i><span>EXPLORER</span>
+            </button>
+            <button id="refreshExplorerButton" class="inline-icon" type="button" aria-label="Refresh files" title="Refresh files"><i data-icon="refresh-cw"></i></button>
           </div>
-        </details>
+          <div id="explorerTree" class="explorer-tree" role="tree" aria-label="Files in the current workspace">
+            <div class="explorer-empty">Connect to load workspace files.</div>
+          </div>
+        </section>
       </aside>
 
       <section class="workspace">
@@ -74,9 +72,18 @@
           <div class="topbar-actions">
             <button id="connectionStatus" class="connection-badge status-offline" type="button"><span></span>Connecting</button>
             <button id="accountButton" class="avatar-button" type="button" aria-label="Account" title="Account">?</button>
-            <button id="inspectorButton" class="icon-button" type="button" aria-label="Toggle session inspector" title="Session inspector"><i data-icon="panel-right"></i></button>
+            <button id="filePanelButton" class="icon-button" type="button" aria-controls="rightPanel" aria-expanded="false" aria-label="Show file panel" title="Show file panel"><i data-icon="panel-right-open"></i></button>
+            <button id="inspectorButton" class="icon-button" type="button" aria-controls="rightPanel" aria-expanded="false" aria-label="Toggle session inspector" title="Session inspector"><i data-icon="sliders-horizontal"></i></button>
           </div>
         </header>
+
+        <div id="snapshotBanner" class="snapshot-banner hidden" role="status" aria-live="polite">
+          <div class="snapshot-banner-copy">
+            <i data-icon="eye"></i>
+            <span id="snapshotBannerText"></span>
+          </div>
+          <button id="refreshSnapshotButton" class="inline-icon" type="button" aria-label="Refresh snapshot" title="Refresh snapshot"><i data-icon="refresh-cw"></i></button>
+        </div>
 
         <div class="mobile-view-tabs" role="tablist" aria-label="Thread views">
           <button class="view-tab active" type="button" data-view="conversation">Conversation</button>
@@ -87,13 +94,19 @@
         <div class="work-area">
           <main class="main-stage">
             <section id="conversationView" class="thread-view active" data-view-panel="conversation">
-              <div id="chat" class="chat" aria-live="polite">
+              <div id="chat" class="chat" role="log" aria-label="Conversation messages" aria-live="polite" aria-relevant="additions text">
                 <div class="empty-state" id="chatEmptyState">
                   <div class="empty-mark">C</div>
                   <h2>Start building with Codex</h2>
                   <p>Open a conversation or create a new thread in this workspace.</p>
                 </div>
               </div>
+              <aside id="chatMinimap" class="chat-minimap hidden" aria-label="Conversation minimap">
+                <nav id="conversationOutline" class="chat-minimap-preview" aria-label="Conversation outline"></nav>
+                <div id="chatMinimapRail" class="chat-minimap-rail" role="navigation" tabindex="0" aria-label="Navigate conversation turns">
+                  <span id="chatMinimapLine" class="chat-minimap-line" aria-hidden="true"></span>
+                </div>
+              </aside>
               <button id="jumpToBottomButton" class="jump-bottom hidden" type="button" aria-label="Jump to latest message"><i data-icon="arrow-down"></i></button>
             </section>
 
@@ -120,38 +133,43 @@
                 <textarea id="messageInput" rows="1" placeholder="Ask Codex anything, use @ for files, / for commands" disabled></textarea>
                 <div id="slashPalette" class="floating-palette hidden" role="listbox"></div>
                 <div id="mentionPalette" class="floating-palette hidden" role="listbox"></div>
-                <div class="composer-toolbar">
-                  <div class="composer-tools">
-                    <label class="icon-button attach-button" aria-label="Attach images" title="Attach images"><i data-icon="paperclip"></i><input id="imageInput" type="file" accept="image/*" multiple hidden /></label>
-                    <button id="mentionButton" class="icon-button" type="button" aria-label="Mention a file" title="Mention a file"><i data-icon="at-sign"></i></button>
-                    <span id="threadLabel" class="thread-label">No active thread</span>
-                  </div>
-                  <div class="composer-config">
-                    <button id="mobileMoreButton" class="icon-button composer-more" type="button" aria-label="More session settings" title="Session settings"><i data-icon="sliders-horizontal"></i></button>
-                    <label><span class="sr-only">Collaboration mode</span><select id="collaborationModeSelect" disabled></select></label>
-                    <label><span class="sr-only">Model</span><select id="modelSelect" disabled></select></label>
-                    <label><span class="sr-only">Reasoning effort</span><select id="effortSelect" disabled></select></label>
-                    <button id="steerButton" class="queue-action steer hidden" type="button" disabled aria-label="Steer now" title="Steer now"><i data-icon="arrow-up"></i><span>Steer now</span></button>
-                    <button id="followUpButton" class="queue-action follow hidden" type="button" disabled aria-label="Follow up" title="Follow up"><i data-icon="arrow-down"></i><span>Follow up</span></button>
-                    <button id="stopButton" class="send-button stop hidden" type="button" disabled aria-label="Stop"><i data-icon="square"></i></button>
-                    <button id="sendButton" class="send-button" type="button" disabled aria-label="Send"><i data-icon="arrow-up"></i></button>
-                  </div>
+                <div class="composer-primary-actions">
+                  <button id="steerButton" class="queue-action steer hidden" type="button" disabled aria-label="Steer now" title="Steer now"><i data-icon="arrow-up"></i><span>Steer now</span></button>
+                  <button id="followUpButton" class="queue-action follow hidden" type="button" disabled aria-label="Follow up" title="Follow up"><i data-icon="arrow-down"></i><span>Follow up</span></button>
+                  <button id="sendButton" class="send-button" type="button" disabled aria-label="Send"><i data-icon="arrow-up"></i><span>Send</span></button>
+                </div>
+              </div>
+              <div class="composer-bottom-bar">
+                <div class="composer-tools">
+                  <label class="icon-button attach-button" aria-label="Attach images" title="Attach images"><i data-icon="paperclip"></i><input id="imageInput" type="file" accept="image/*" multiple hidden /></label>
+                  <button id="mentionButton" class="icon-button" type="button" aria-label="Mention a file" title="Mention a file"><i data-icon="at-sign"></i></button>
+                  <span id="threadLabel" class="thread-label">No active thread</span>
+                </div>
+                <div class="composer-config">
+                  <button id="mobileMoreButton" class="icon-button composer-more" type="button" aria-label="More session settings" title="Session settings"><i data-icon="sliders-horizontal"></i></button>
+                  <label><span class="sr-only">Collaboration mode</span><select id="collaborationModeSelect" disabled></select></label>
+                  <label><span class="sr-only">Model</span><select id="modelSelect" disabled></select></label>
+                  <label><span class="sr-only">Reasoning effort</span><select id="effortSelect" disabled></select></label>
+                  <button id="stopButton" class="send-button stop hidden" type="button" disabled aria-label="Stop"><i data-icon="square"></i></button>
                 </div>
               </div>
             </footer>
           </main>
 
-          <aside id="inspector" class="inspector closed" aria-label="Session inspector">
-            <div class="inspector-head"><div><span class="eyebrow">CURRENT THREAD</span><h2 id="inspectorTitle">对话目录</h2></div><button id="closeInspectorButton" class="icon-button" type="button" aria-label="Close inspector"><i data-icon="x"></i></button></div>
-            <div class="inspector-tabs" role="tablist" aria-label="Thread details">
-              <button id="outlineTab" class="inspector-tab active" type="button" role="tab" aria-selected="true" data-inspector-tab="outline">对话目录</button>
-              <button id="sessionTab" class="inspector-tab" type="button" role="tab" aria-selected="false" data-inspector-tab="session">Session</button>
-            </div>
-            <section id="outlinePanel" class="inspector-panel outline-panel" role="tabpanel" aria-labelledby="outlineTab">
-              <div class="outline-meta"><span id="outlineCount">0 条</span><button id="outlineBottomButton" class="text-button" type="button">回到底部</button></div>
-              <nav id="conversationOutline" class="conversation-outline" aria-label="Conversation outline"></nav>
+          <aside id="rightPanel" class="right-panel closed" data-mode="closed" aria-label="Workspace side panel">
+            <div id="rightPanelResizeHandle" class="right-panel-resize-handle" role="separator" aria-label="Resize file panel" aria-orientation="vertical" tabindex="0"></div>
+            <section id="filePanel" class="file-panel" aria-label="File panel">
+              <header class="file-panel-tabs-row">
+                <div id="fileTabs" class="file-tabs" role="tablist" aria-label="Open files"></div>
+                <button id="closeFilePanelButton" class="icon-button file-panel-close" type="button" aria-label="Close file panel" title="Close file panel"><i data-icon="x"></i></button>
+              </header>
+              <div id="fileViewer" class="file-viewer">
+                <div class="file-viewer-empty"><i data-icon="file"></i><span>Open a file from Explorer or a message link.</span></div>
+              </div>
             </section>
-            <div id="sessionPanel" class="inspector-panel hidden" role="tabpanel" aria-labelledby="sessionTab">
+            <section id="inspector" class="inspector" aria-label="Session inspector">
+            <div class="inspector-head"><div><span class="eyebrow">CURRENT THREAD</span><h2>Session</h2></div><button id="closeInspectorButton" class="icon-button" type="button" aria-label="Close inspector"><i data-icon="x"></i></button></div>
+            <div id="sessionPanel" class="inspector-panel" role="region" aria-label="Session settings">
             <section class="inspector-section">
               <h3>Configuration</h3>
               <label class="setting-row"><span>Model</span><select id="inspectorModelSelect" disabled></select></label>
@@ -181,6 +199,7 @@
             </section>
             <button id="statusButton" class="secondary-button" type="button" disabled>View raw status</button>
             </div>
+            </section>
           </aside>
         </div>
       </section>
@@ -208,6 +227,6 @@
     <dialog id="textDialog" class="modal">
       <form method="dialog" class="modal-card wide"><div class="modal-head"><h2 id="textDialogTitle">Details</h2><button class="icon-button" value="cancel" aria-label="Close"><i data-icon="x"></i></button></div><pre id="textDialogBody" class="dialog-pre"></pre></form>
     </dialog>
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="/bootstrap.js"></script>
   </body>
 </html>

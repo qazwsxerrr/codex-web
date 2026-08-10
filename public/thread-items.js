@@ -1,5 +1,6 @@
 import { displayInput } from "./composer-input.js";
 import { normalizeFileChanges } from "./diff-data.js";
+import { reasoningText } from "./protocol-text.js";
 
 export function normalizeThreadItem(item, turn = {}) {
   if (!item || typeof item !== "object") return null;
@@ -9,10 +10,22 @@ export function normalizeThreadItem(item, turn = {}) {
   if (item.type === "commandExecution") return { ...base, viewType: "command" };
   if (item.type === "fileChange") return { ...base, viewType: "change", files: normalizeFileChanges(item) };
   if (item.type === "mcpToolCall") return { ...base, viewType: "mcp" };
+  if (item.type === "dynamicToolCall") return { ...base, viewType: "dynamicTool" };
+  if (["collabToolCall", "collabAgentToolCall", "subAgentActivity", "agentStatus"].includes(item.type)) return { ...base, viewType: "agent" };
+  if (["imageView", "imageGeneration"].includes(item.type)) return { ...base, viewType: "imageView" };
+  if (["hookPrompt", "sleep"].includes(item.type)) {
+    const hookText = Array.isArray(item.fragments)
+      ? item.fragments.map((fragment) => fragment?.text || "").filter(Boolean).join("\n\n")
+      : "";
+    return { ...base, viewType: "status", text: item.text || item.message || hookText || item.type };
+  }
+  if (item.type === "contextCompaction") return { ...base, viewType: "compaction" };
+  if (["enteredReviewMode", "exitedReviewMode", "review"].includes(item.type)) return { ...base, viewType: "review" };
   if (item.type === "webSearch") return { ...base, viewType: "search" };
   if (item.type === "plan") return { ...base, viewType: "plan", planText: item.text || "" };
+  if (["reasoning", "thinking"].includes(item.type)) return { ...base, viewType: "reasoning", text: reasoningText(item) };
   if (item.type === "error") return { ...base, viewType: "error", text: item.message || item.error?.message || "Codex error" };
-  return { ...base, viewType: "status" };
+  return { ...base, viewType: "unknown", unknownType: item.type || "unknown" };
 }
 
 export function normalizeThread(thread) {
