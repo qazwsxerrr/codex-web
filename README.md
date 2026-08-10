@@ -7,6 +7,9 @@ actual CLI version at runtime.
 
 ## UI preview
 
+The previews below use synthetic English demo data. They contain no personal
+conversation text, paths, identifiers, or local session history.
+
 ### Conversation workspace
 
 The main workspace keeps the conversation, process details, tool output,
